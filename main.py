@@ -1,6 +1,5 @@
-def main():
-    print("Hello from op3-analysis!")
+from op3_analysis.retrieval.cli import main
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
