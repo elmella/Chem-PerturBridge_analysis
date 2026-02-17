@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .config import DEFAULT_DATASET_PATHS, resolve_dataset_paths
-from .engine import run_cross_dataset_retrieval
+from .config import DEFAULT_DATASET_PATHS, RetrievalSettings, resolve_dataset_paths
+from .engine import ALL_METRICS, DERIVED_SIGNED_REP, DERIVED_Z_REP, run_cross_dataset_retrieval
 
 
 def _split_csv(raw: str) -> list[str]:
@@ -27,6 +27,63 @@ def _parse_dataset_overrides(values: list[str]) -> dict[str, Path]:
             )
         overrides[name] = Path(raw_path)
     return overrides
+
+
+def _parse_metrics(raw: str) -> frozenset[str]:
+    value = raw.strip().lower()
+    if value == "all":
+        return frozenset(ALL_METRICS)
+    metrics = frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
+    if not metrics:
+        raise ValueError("No metrics selected. Use --metrics all or a comma-separated list.")
+    unknown = sorted(set(metrics) - set(ALL_METRICS))
+    if unknown:
+        raise ValueError(f"Unknown metrics: {unknown}. Allowed: {list(ALL_METRICS)}")
+    return metrics
+
+
+def _parse_representations(raw: str) -> frozenset[str]:
+    value = raw.strip().lower()
+    if value == "all":
+        return frozenset()
+    alias_map = {
+        "signed": DERIVED_SIGNED_REP,
+        "signed_-log10(p)*sign(logfc)": DERIVED_SIGNED_REP,
+        "z": DERIVED_Z_REP,
+        "z=sign(logfc)*phi^-1(1-p/2)": DERIVED_Z_REP,
+    }
+    reps = []
+    for part in raw.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        mapped = alias_map.get(p.lower(), p)
+        reps.append(mapped)
+    selected = frozenset(reps)
+    if not selected:
+        raise ValueError(
+            "No representations selected. Use --representations all or a comma-separated list."
+        )
+    return selected
+
+
+def _parse_skip_representations(raw: str) -> frozenset[str]:
+    if raw.strip().lower() in {"", "none"}:
+        return frozenset()
+    alias_map = {
+        "signed": DERIVED_SIGNED_REP,
+        "signed_-log10(p)*sign(logfc)": DERIVED_SIGNED_REP,
+        "z": DERIVED_Z_REP,
+        "z=sign(logfc)*phi^-1(1-p/2)": DERIVED_Z_REP,
+    }
+    reps = []
+    for part in raw.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        mapped = alias_map.get(p.lower(), p)
+        reps.append(mapped)
+    return frozenset(reps)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,6 +111,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--cell-types",
         default=None,
         help="Optional comma-separated list of cell types to evaluate.",
+    )
+    parser.add_argument(
+        "--representations",
+        default="all",
+        help=(
+            "Comma-separated representations to evaluate, or 'all'. "
+            "Can include layer names plus aliases: 'signed', 'z'."
+        ),
+    )
+    parser.add_argument(
+        "--metrics",
+        default="all",
+        help="Comma-separated metrics to evaluate, or 'all'. Allowed: cosine,pearson,spearman,mrrmse.",
+    )
+    parser.add_argument(
+        "--skip-representations",
+        default="",
+        help=(
+            "Comma-separated representations to skip (layer names or aliases 'signed','z'). "
+            "Use 'none' to skip nothing."
+        ),
     )
     parser.add_argument(
         "--include-self-dataset",
@@ -103,11 +181,17 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     cell_type_filter = set(_split_csv(args.cell_types)) if args.cell_types else None
+    settings = RetrievalSettings(
+        include_metrics=_parse_metrics(args.metrics),
+        include_representations=_parse_representations(args.representations),
+        skip_representations=_parse_skip_representations(args.skip_representations),
+    )
 
     detail_df, summary_by_cell_df, summary_overall_df = run_cross_dataset_retrieval(
         dataset_paths=dataset_paths,
         query_datasets=query_datasets,
         db_datasets=db_datasets,
+        settings=settings,
         include_self_dataset=args.include_self_dataset,
         cell_type_filter=cell_type_filter,
         cache_cell_types=not args.no_cache,
@@ -132,4 +216,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

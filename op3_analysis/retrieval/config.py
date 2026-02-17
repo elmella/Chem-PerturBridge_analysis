@@ -33,8 +33,19 @@ FALLBACK_DATASET_PATHS: dict[str, Path] = {
 
 @dataclass(frozen=True)
 class RetrievalSettings:
+    include_metrics: frozenset[str] = frozenset({"cosine", "pearson", "spearman", "mrrmse"})
+    include_representations: frozenset[str] = frozenset()
+    skip_representations: frozenset[str] = frozenset()
     excluded_layers: frozenset[str] = frozenset(
-        {"CI.L", "CI.R", "stdev.scaled", "stdev.unscaled", "AveExpr"}
+        {
+            "CI.L",
+            "CI.R",
+            "stdev.scaled",
+            "stdev.unscaled",
+            "AveExpr",
+            "adj.P.Value.across_all_contrasts",
+            "adj.P.Value.within_one_contrast",
+        }
     )
     logfc_layer: str = "logFC"
     pvalue_layer: str = "P.Value"
@@ -62,4 +73,3 @@ def resolve_dataset_paths(overrides: Mapping[str, Path] | None = None) -> dict[s
             + (f" (fallback checked: {fallback})" if fallback else "")
         )
     return resolved
-

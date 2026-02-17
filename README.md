@@ -10,6 +10,7 @@ Cross-dataset retrieval benchmark for perturbation-response signatures.
 - Ground-truth matching based on exact `cell_type` + `perturbagen`, with nearest `pert_time_h` and `pert_dose_uM`.
 - Layer-wise scoring over all shared layers except:
   - `CI.L`, `CI.R`, `stdev.scaled`, `stdev.unscaled`, `AveExpr`
+  - `adj.P.Value.across_all_contrasts`, `adj.P.Value.within_one_contrast`
 - Additional derived representations:
   - `-log10(p) * sign(logFC)`
   - `sign(logFC) * Phi^-1(1 - p/2)`
@@ -38,8 +39,19 @@ python -m op3_analysis.retrieval.cli \
   --query-datasets sciplex,tahoe \
   --db-datasets l1000_phase1,l1000_phase2 \
   --cell-types CVCL_0002,CVCL_0063 \
+  --representations logFC,P.Value,signed,z \
+  --metrics cosine,mrrmse \
+  --skip-representations P.Value \
   --output-prefix my_run \
   --verbose
+```
+
+Limit compute for faster runs:
+
+```bash
+python -m op3_analysis.retrieval.cli \
+  --representations logFC,signed \
+  --metrics cosine
 ```
 
 Override data paths:
@@ -49,3 +61,7 @@ python -m op3_analysis.retrieval.cli \
   --dataset-path sciplex=/my/sciplex/results \
   --dataset-path l1000_phase1=/my/l1000_phase1/results
 ```
+
+## Visualization
+
+Use `notebooks/visualize_retrieval_results.ipynb` to visualize retrieval outputs (`*_detail.csv`, `*_summary_by_cell_type.csv`, `*_summary_overall.csv`) for any run prefix (default in notebook: `my_run_fast`).
