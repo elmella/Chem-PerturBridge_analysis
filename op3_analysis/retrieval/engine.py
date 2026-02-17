@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from os import PathLike
 from typing import Iterable, Optional
@@ -110,14 +111,6 @@ def _materialize_representation(
     raise ValueError(f"Unknown representation: {representation}")
 
 
-def _compute_ranks(metric: str, all_scores: np.ndarray, gt_score: float) -> float:
-    if metric in SIMILARITY_METRICS:
-        return float(1 + int(np.sum(all_scores > gt_score)))
-    if metric in DISTANCE_METRICS:
-        return float(1 + int(np.sum(all_scores < gt_score)))
-    raise ValueError(f"Unexpected metric: {metric}")
-
-
 def _score_candidates_for_query(
     x: np.ndarray,
     y: np.ndarray,
@@ -193,14 +186,27 @@ def evaluate_query_cell_type(
     db_cell_types: Iterable[str],
     cache: dict[tuple[str, str], Optional[CellTypeData]],
     settings: RetrievalSettings,
+    verbose: bool = False,
+    log_prefix: str = "",
 ) -> list[dict]:
     contexts = _build_pair_contexts(query_data, db_store, db_cell_types, cache, settings)
     if not contexts:
+        if verbose:
+            print(
+                f"{log_prefix} no pair contexts for query_cell_type={query_data.cell_type}; skipping",
+                flush=True,
+            )
         return []
+
+    # Ground-truth comes from the matching DB cell type; process it first so
+    # rank counting can run in one pass over candidate contexts.
+    ordered_contexts = sorted(contexts, key=lambda ctx: ctx.db_cell_type != query_data.cell_type)
 
     selected_metrics = tuple(metric for metric in ALL_METRICS if metric in settings.include_metrics)
     needs_spearman = "spearman" in selected_metrics
     if not selected_metrics:
+        if verbose:
+            print(f"{log_prefix} no metrics selected; skipping query_cell_type={query_data.cell_type}", flush=True)
         return []
 
     all_representations = sorted({rep for ctx in contexts for rep in ctx.representations})
@@ -213,29 +219,65 @@ def evaluate_query_cell_type(
             rep for rep in all_representations if rep not in settings.skip_representations
         ]
     if not all_representations:
+        if verbose:
+            print(
+                f"{log_prefix} no representations left after filtering for query_cell_type={query_data.cell_type}",
+                flush=True,
+            )
         return []
 
     n_queries = query_data.adata.n_obs
-    query_perts = query_data.obs["perturbagen"].to_numpy(dtype=object)
-    query_pert_valid = query_data.obs["perturbagen"].notna().to_numpy(dtype=bool)
+    query_pubchem_cids = query_data.obs["pubchem_cid"].astype("string").fillna("").to_numpy(dtype=str)
+    query_cid_valid = query_data.obs["pubchem_cid"].notna().to_numpy(dtype=bool)
     query_times = query_data.obs["pert_time_h"].to_numpy(dtype=np.float64)
     query_doses = query_data.obs["pert_dose_uM"].to_numpy(dtype=np.float64)
     query_index = query_data.adata.obs_names.astype(str).to_numpy()
+    valid_query_mask = query_cid_valid & np.isfinite(query_times) & np.isfinite(query_doses)
+    valid_query_rows = np.flatnonzero(valid_query_mask)
+
+    # GT row index depends only on (query cell type, matching DB cell type, time, dose, CID),
+    # so precompute it once instead of recomputing per representation/context.
+    gt_rows = np.full(n_queries, -1, dtype=np.int32)
+    gt_context = next((ctx for ctx in ordered_contexts if ctx.db_cell_type == query_data.cell_type), None)
+    if gt_context is not None and valid_query_rows.size:
+        gt_groups = gt_context.db_data.pubchem_cid_groups
+        for q_idx in valid_query_rows:
+            group = gt_groups.get(query_pubchem_cids[q_idx])
+            if group is None:
+                continue
+            gt_rows[q_idx] = best_row_for_group(
+                group,
+                time_h=float(query_times[q_idx]),
+                dose_um=float(query_doses[q_idx]),
+            )
 
     out_rows: list[dict] = []
-    for representation in all_representations:
-        all_scores: dict[str, list[list[float]]] = {
-            metric: [[] for _ in range(n_queries)] for metric in selected_metrics
+    for rep_idx, representation in enumerate(all_representations, start=1):
+        rep_start_rows = len(out_rows)
+        rep_t0 = time.perf_counter()
+        if verbose:
+            print(
+                f"{log_prefix} representation {rep_idx}/{len(all_representations)} "
+                f"start rep={representation}",
+                flush=True,
+            )
+
+        candidate_counts = {
+            metric: np.zeros(n_queries, dtype=np.int64) for metric in selected_metrics
+        }
+        better_counts = {
+            metric: np.zeros(n_queries, dtype=np.int64) for metric in selected_metrics
         }
         gt_scores = {
             metric: np.full(n_queries, np.nan, dtype=np.float64) for metric in selected_metrics
         }
         gt_genes = np.full(n_queries, np.nan, dtype=np.float64)
 
-        for context in contexts:
+        for context in ordered_contexts:
             if representation not in context.representations:
                 continue
 
+            is_gt_context = context.db_cell_type == query_data.cell_type
             x_query, x_db = _materialize_representation(query_data, context, representation, settings)
             q_finite = np.isfinite(x_query).all(axis=1)
             d_finite = np.isfinite(x_db).all(axis=1)
@@ -245,13 +287,24 @@ def evaluate_query_cell_type(
             if valid_db_rows.size == 0:
                 continue
 
-            y_all = x_db[valid_db_rows]
+            context_query_rows = valid_query_rows[q_finite[valid_query_rows]]
+            if context_query_rows.size == 0:
+                continue
+
+            x_query64 = np.asarray(x_query, dtype=np.float64)
+            y_all = np.asarray(x_db[valid_db_rows], dtype=np.float64)
+
+            if is_gt_context:
+                row_to_valid_pos = np.full(x_db.shape[0], -1, dtype=np.int32)
+                row_to_valid_pos[valid_db_rows] = np.arange(valid_db_rows.size, dtype=np.int32)
+            else:
+                row_to_valid_pos = None
 
             if needs_spearman:
                 q_ranked, q_rank_norm, q_rank_valid = rank_center_norm_rows(x_query)
                 d_ranked, d_rank_norm, _ = rank_center_norm_rows(x_db)
-                y_all_ranked = d_ranked[valid_db_rows]
-                y_all_rank_norm = d_rank_norm[valid_db_rows]
+                y_all_ranked = np.asarray(d_ranked[valid_db_rows], dtype=np.float64)
+                y_all_rank_norm = np.asarray(d_rank_norm[valid_db_rows], dtype=np.float64)
             else:
                 q_ranked = None
                 q_rank_norm = None
@@ -261,15 +314,8 @@ def evaluate_query_cell_type(
                 y_all_ranked = None
                 y_all_rank_norm = None
 
-            for q_idx in range(n_queries):
-                if not q_finite[q_idx]:
-                    continue
-                if not query_pert_valid[q_idx]:
-                    continue
-                if not (np.isfinite(query_times[q_idx]) and np.isfinite(query_doses[q_idx])):
-                    continue
-
-                x = x_query[q_idx]
+            for q_idx in context_query_rows:
+                x = x_query64[q_idx]
 
                 # Score query against ALL valid DB rows in this cell-type context.
                 metric_scores = _score_candidates_for_query(
@@ -284,58 +330,45 @@ def evaluate_query_cell_type(
                     y_rank_norm=y_all_rank_norm if needs_spearman else None,
                 )
 
+                # Ground-truth: same cell type + same pubchem_cid, closest time/dose.
+                if is_gt_context and row_to_valid_pos is not None:
+                    gt_row = int(gt_rows[q_idx])
+                    if gt_row >= 0 and gt_row < d_finite.size and d_finite[gt_row]:
+                        gt_pos = int(row_to_valid_pos[gt_row])
+                        if gt_pos >= 0:
+                            gt_genes[q_idx] = context.n_genes
+                            for metric_name, values in metric_scores.items():
+                                value = float(values[gt_pos])
+                                if np.isfinite(value):
+                                    gt_scores[metric_name][q_idx] = value
+
                 for metric_name, values in metric_scores.items():
-                    finite_values = values[np.isfinite(values)]
-                    if finite_values.size:
-                        all_scores[metric_name][q_idx].extend(finite_values.tolist())
+                    finite_mask = np.isfinite(values)
+                    finite_count = int(np.count_nonzero(finite_mask))
+                    if finite_count == 0:
+                        continue
 
-                # Ground-truth: same cell type + same perturbagen, closest time/dose.
-                if context.db_cell_type != query_data.cell_type:
-                    continue
+                    candidate_counts[metric_name][q_idx] += finite_count
+                    gt_score = float(gt_scores[metric_name][q_idx])
+                    if not np.isfinite(gt_score):
+                        continue
 
-                pert = str(query_perts[q_idx])
-                group = context.db_data.perturbagen_groups.get(pert)
-                if group is None:
-                    continue
-
-                gt_row = best_row_for_group(
-                    group, time_h=float(query_times[q_idx]), dose_um=float(query_doses[q_idx])
-                )
-                if gt_row < 0 or not d_finite[gt_row]:
-                    continue
-
-                gt_y = x_db[[gt_row]]
-                gt_metrics = _score_candidates_for_query(
-                    x=x,
-                    y=gt_y,
-                    selected_metrics=selected_metrics,
-                    x_ranked=q_ranked[q_idx] if needs_spearman else None,
-                    x_rank_norm=(
-                        float(q_rank_norm[q_idx]) if (needs_spearman and q_rank_valid[q_idx]) else np.nan
-                    ),
-                    y_ranked=d_ranked[[gt_row]] if needs_spearman else None,
-                    y_rank_norm=d_rank_norm[[gt_row]] if needs_spearman else None,
-                )
-
-                for metric_name, value_arr in gt_metrics.items():
-                    value = float(value_arr[0])
-                    if np.isfinite(value):
-                        gt_scores[metric_name][q_idx] = value
-                        gt_genes[q_idx] = context.n_genes
+                    compare_values = values if finite_count == values.size else values[finite_mask]
+                    if metric_name in SIMILARITY_METRICS:
+                        better_counts[metric_name][q_idx] += int(np.sum(compare_values > gt_score))
+                    elif metric_name in DISTANCE_METRICS:
+                        better_counts[metric_name][q_idx] += int(np.sum(compare_values < gt_score))
+                    else:
+                        raise ValueError(f"Unexpected metric: {metric_name}")
 
         for metric_name in selected_metrics:
-            for q_idx in range(n_queries):
-                metric_scores = np.asarray(all_scores[metric_name][q_idx], dtype=np.float64)
-                gt_score = float(gt_scores[metric_name][q_idx])
-                if metric_scores.size == 0 or not np.isfinite(gt_score):
-                    continue
-
-                metric_scores = metric_scores[np.isfinite(metric_scores)]
-                if metric_scores.size == 0:
-                    continue
-
-                rank = _compute_ranks(metric_name, metric_scores, gt_score)
-                n_candidates = int(metric_scores.size)
+            metric_gt_scores = gt_scores[metric_name]
+            metric_candidates = candidate_counts[metric_name]
+            metric_better = better_counts[metric_name]
+            output_query_rows = np.flatnonzero(np.isfinite(metric_gt_scores) & (metric_candidates > 0))
+            for q_idx in output_query_rows:
+                n_candidates = int(metric_candidates[q_idx])
+                rank = float(1 + int(metric_better[q_idx]))
 
                 if n_candidates <= 1:
                     rank_normalized = 0.0
@@ -350,7 +383,7 @@ def evaluate_query_cell_type(
                         "db_dataset": db_store.dataset_name,
                         "query_cell_type": query_data.cell_type,
                         "query_obs_id": query_index[q_idx],
-                        "perturbagen": str(query_perts[q_idx]),
+                        "pubchem_cid": query_pubchem_cids[q_idx],
                         "pert_time_h": float(query_times[q_idx]),
                         "pert_dose_uM": float(query_doses[q_idx]),
                         "representation": representation,
@@ -364,6 +397,15 @@ def evaluate_query_cell_type(
                     }
                 )
 
+        if verbose:
+            elapsed = time.perf_counter() - rep_t0
+            print(
+                f"{log_prefix} representation {rep_idx}/{len(all_representations)} "
+                f"done rep={representation} rows_added={len(out_rows) - rep_start_rows} "
+                f"elapsed_s={elapsed:.1f}",
+                flush=True,
+            )
+
     return out_rows
 
 
@@ -375,6 +417,7 @@ def evaluate_dataset_pair(
     cache: Optional[dict[tuple[str, str], Optional[CellTypeData]]] = None,
     verbose: bool = False,
 ) -> list[dict]:
+    pair_t0 = time.perf_counter()
     shared_cache: dict[tuple[str, str], Optional[CellTypeData]] = cache if cache is not None else {}
     query_cell_types = query_store.list_cell_types()
     if cell_type_filter is not None:
@@ -393,22 +436,45 @@ def evaluate_dataset_pair(
             )
         return []
 
+    if verbose:
+        print(
+            f"[{query_store.dataset_name}->{db_store.dataset_name}] "
+            f"start pair: eligible_query_cell_types={len(eligible_query_cell_types)} "
+            f"db_cell_types={len(all_db_cell_types)}",
+            flush=True,
+        )
+
     detail_rows: list[dict] = []
     for idx, query_cell_type in enumerate(eligible_query_cell_types, start=1):
+        cell_t0 = time.perf_counter()
         query_data = load_cell_type_data(query_store, query_cell_type, shared_cache)
         if query_data is None or query_data.adata.n_obs == 0:
-            continue
-
-        # Ensure the matching db cell type exists and has overlapping perturbagens.
-        matching_db_data = load_cell_type_data(db_store, query_cell_type, shared_cache)
-        if matching_db_data is None or matching_db_data.adata.n_obs == 0:
-            continue
-        shared_perturbagens = set(query_data.perturbagen_groups) & set(matching_db_data.perturbagen_groups)
-        if not shared_perturbagens:
             if verbose:
                 print(
                     f"[{query_store.dataset_name}->{db_store.dataset_name}] "
-                    f"cell_type={query_cell_type} has no overlapping perturbagens; skipping"
+                    f"{idx}/{len(eligible_query_cell_types)} cell_type={query_cell_type} "
+                    "query data missing or empty; skipping",
+                    flush=True,
+                )
+            continue
+
+        # Ensure the matching db cell type exists and has overlapping pubchem_cids.
+        matching_db_data = load_cell_type_data(db_store, query_cell_type, shared_cache)
+        if matching_db_data is None or matching_db_data.adata.n_obs == 0:
+            if verbose:
+                print(
+                    f"[{query_store.dataset_name}->{db_store.dataset_name}] "
+                    f"{idx}/{len(eligible_query_cell_types)} cell_type={query_cell_type} "
+                    "matching db data missing or empty; skipping",
+                    flush=True,
+                )
+            continue
+        shared_pubchem_cids = set(query_data.pubchem_cid_groups) & set(matching_db_data.pubchem_cid_groups)
+        if not shared_pubchem_cids:
+            if verbose:
+                print(
+                    f"[{query_store.dataset_name}->{db_store.dataset_name}] "
+                    f"cell_type={query_cell_type} has no overlapping pubchem_cids; skipping"
                 )
             continue
 
@@ -419,14 +485,30 @@ def evaluate_dataset_pair(
             db_cell_types=all_db_cell_types,
             cache=shared_cache,
             settings=settings,
+            verbose=verbose,
+            log_prefix=(
+                f"[{query_store.dataset_name}->{db_store.dataset_name}] "
+                f"{idx}/{len(eligible_query_cell_types)} cell_type={query_cell_type}"
+            ),
         )
         detail_rows.extend(rows)
 
         if verbose:
+            cell_elapsed = time.perf_counter() - cell_t0
             print(
                 f"[{query_store.dataset_name}->{db_store.dataset_name}] "
-                f"{idx}/{len(eligible_query_cell_types)} cell_type={query_cell_type} rows={len(rows)}"
+                f"{idx}/{len(eligible_query_cell_types)} cell_type={query_cell_type} "
+                f"rows={len(rows)} cumulative_rows={len(detail_rows)} elapsed_s={cell_elapsed:.1f}",
+                flush=True,
             )
+
+    if verbose:
+        pair_elapsed = time.perf_counter() - pair_t0
+        print(
+            f"[{query_store.dataset_name}->{db_store.dataset_name}] "
+            f"done pair rows={len(detail_rows)} elapsed_s={pair_elapsed:.1f}",
+            flush=True,
+        )
     return detail_rows
 
 
@@ -480,6 +562,7 @@ def run_cross_dataset_retrieval(
     cache_cell_types: bool = True,
     verbose: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    run_t0 = time.perf_counter()
     settings = settings or RetrievalSettings()
     unknown_metrics = sorted(set(settings.include_metrics) - set(ALL_METRICS))
     if unknown_metrics:
@@ -505,8 +588,9 @@ def run_cross_dataset_retrieval(
                 raise KeyError(f"Unknown db dataset: {db_dataset}")
 
             if verbose:
-                print(f"Running pair: {query_dataset} -> {db_dataset}")
+                print(f"[run] start pair {query_dataset}->{db_dataset}", flush=True)
 
+            pair_t0 = time.perf_counter()
             pair_rows = evaluate_dataset_pair(
                 query_store=stores[query_dataset],
                 db_store=stores[db_dataset],
@@ -516,6 +600,12 @@ def run_cross_dataset_retrieval(
                 verbose=verbose,
             )
             detail_rows.extend(pair_rows)
+            if verbose:
+                print(
+                    f"[run] done pair {query_dataset}->{db_dataset} rows={len(pair_rows)} "
+                    f"cumulative_rows={len(detail_rows)} elapsed_s={time.perf_counter() - pair_t0:.1f}",
+                    flush=True,
+                )
 
     detail_df = pd.DataFrame(detail_rows)
     if not detail_df.empty:
@@ -531,4 +621,10 @@ def run_cross_dataset_retrieval(
         ).reset_index(drop=True)
 
     summary_by_cell, summary_overall = summarize_retrieval(detail_df)
+    if verbose:
+        print(
+            f"[run] done retrieval total_rows={len(detail_df)} "
+            f"elapsed_s={time.perf_counter() - run_t0:.1f}",
+            flush=True,
+        )
     return detail_df, summary_by_cell, summary_overall

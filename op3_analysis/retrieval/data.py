@@ -9,11 +9,11 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 
-REQUIRED_OBS_COLUMNS = ("cell_type", "perturbagen", "pert_time_h", "pert_dose_uM")
+REQUIRED_OBS_COLUMNS = ("cell_type", "pubchem_cid", "pert_time_h", "pert_dose_uM")
 
 
 @dataclass
-class PerturbagenGroup:
+class PubchemCIDGroup:
     rows: np.ndarray
     times: np.ndarray
     doses: np.ndarray
@@ -25,7 +25,7 @@ class CellTypeData:
     cell_type: str
     adata: ad.AnnData
     obs: pd.DataFrame
-    perturbagen_groups: dict[str, PerturbagenGroup]
+    pubchem_cid_groups: dict[str, PubchemCIDGroup]
 
 
 class DatasetStore:
@@ -122,21 +122,21 @@ def build_obs_table(adata: ad.AnnData, dataset_name: str, cell_type: str) -> pd.
     obs = adata.obs.copy()
     obs["_row"] = np.arange(adata.n_obs, dtype=np.int32)
     obs["cell_type"] = obs["cell_type"].astype(str)
-    obs["perturbagen"] = obs["perturbagen"].astype("string")
+    obs["pubchem_cid"] = obs["pubchem_cid"].astype("string")
     obs["pert_time_h"] = pd.to_numeric(obs["pert_time_h"], errors="coerce")
     obs["pert_dose_uM"] = pd.to_numeric(obs["pert_dose_uM"], errors="coerce")
     return obs
 
 
-def build_perturbagen_groups(obs: pd.DataFrame) -> dict[str, PerturbagenGroup]:
+def build_pubchem_cid_groups(obs: pd.DataFrame) -> dict[str, PubchemCIDGroup]:
     valid = (
-        obs["perturbagen"].notna()
+        obs["pubchem_cid"].notna()
         & np.isfinite(obs["pert_time_h"].to_numpy(dtype=float))
         & np.isfinite(obs["pert_dose_uM"].to_numpy(dtype=float))
     )
-    grouped: dict[str, PerturbagenGroup] = {}
-    for perturbagen, grp in obs.loc[valid].groupby("perturbagen", sort=False):
-        grouped[str(perturbagen)] = PerturbagenGroup(
+    grouped: dict[str, PubchemCIDGroup] = {}
+    for pubchem_cid, grp in obs.loc[valid].groupby("pubchem_cid", sort=False):
+        grouped[str(pubchem_cid)] = PubchemCIDGroup(
             rows=grp["_row"].to_numpy(dtype=np.int32),
             times=grp["pert_time_h"].to_numpy(dtype=np.float64),
             doses=grp["pert_dose_uM"].to_numpy(dtype=np.float64),
@@ -157,19 +157,19 @@ def load_cell_type_data(
         return None
 
     obs = build_obs_table(adata, store.dataset_name, cell_type)
-    grouped = build_perturbagen_groups(obs)
+    grouped = build_pubchem_cid_groups(obs)
     cell_data = CellTypeData(
         dataset_name=store.dataset_name,
         cell_type=cell_type,
         adata=adata,
         obs=obs,
-        perturbagen_groups=grouped,
+        pubchem_cid_groups=grouped,
     )
     cache[cache_key] = cell_data
     return cell_data
 
 
-def best_row_for_group(group: PerturbagenGroup, time_h: float, dose_um: float) -> int:
+def best_row_for_group(group: PubchemCIDGroup, time_h: float, dose_um: float) -> int:
     dt = np.abs(group.times - time_h)
     min_dt = np.min(dt)
     time_ties = np.flatnonzero(dt == min_dt)
@@ -181,24 +181,24 @@ def best_row_for_group(group: PerturbagenGroup, time_h: float, dose_um: float) -
 
 
 def candidate_rows_for_queries(
-    perturbagen_groups: dict[str, PerturbagenGroup],
+    pubchem_cid_groups: dict[str, PubchemCIDGroup],
     query_times: np.ndarray,
     query_doses: np.ndarray,
 ) -> tuple[list[str], np.ndarray]:
     """
-    Returns perturbagen order + candidate row matrix with shape [n_query, n_perturbagens].
+    Returns pubchem_cid order + candidate row matrix with shape [n_query, n_pubchem_cids].
     Missing query time/dose rows are marked as -1.
     """
-    perturbagens = sorted(perturbagen_groups.keys())
+    pubchem_cids = sorted(pubchem_cid_groups.keys())
     n_queries = query_times.shape[0]
-    n_perturbagens = len(perturbagens)
-    out = np.full((n_queries, n_perturbagens), -1, dtype=np.int32)
+    n_pubchem_cids = len(pubchem_cids)
+    out = np.full((n_queries, n_pubchem_cids), -1, dtype=np.int32)
 
-    if n_perturbagens == 0:
-        return perturbagens, out
+    if n_pubchem_cids == 0:
+        return pubchem_cids, out
 
-    for j, pert in enumerate(perturbagens):
-        group = perturbagen_groups[pert]
+    for j, cid in enumerate(pubchem_cids):
+        group = pubchem_cid_groups[cid]
         for i in range(n_queries):
             t = float(query_times[i])
             d = float(query_doses[i])
@@ -206,4 +206,4 @@ def candidate_rows_for_queries(
                 continue
             out[i, j] = best_row_for_group(group, time_h=t, dose_um=d)
 
-    return perturbagens, out
+    return pubchem_cids, out

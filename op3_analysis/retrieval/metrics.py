@@ -73,8 +73,8 @@ def spearman_scores_precomputed(
     if not np.isfinite(x_norm) or x_norm <= 1e-12:
         return np.full(y_ranked.shape[0], np.nan, dtype=np.float64)
 
-    dots = y_ranked.astype(np.float64) @ x_ranked.astype(np.float64)
-    denom = y_norms.astype(np.float64) * float(x_norm)
+    dots = np.asarray(y_ranked) @ np.asarray(x_ranked)
+    denom = np.asarray(y_norms, dtype=np.float64) * float(x_norm)
     out = np.full(y_ranked.shape[0], np.nan, dtype=np.float64)
     valid = denom > 1e-12
     out[valid] = dots[valid] / denom[valid]
@@ -94,4 +94,3 @@ def compute_signed_and_z(
     signed = -np.log10(p) * np.sign(l)
     z_score = np.sign(l) * norm.ppf(1.0 - p / 2.0)
     return signed.astype(np.float32, copy=False), z_score.astype(np.float32, copy=False)
-

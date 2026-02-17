@@ -7,7 +7,7 @@ Cross-dataset retrieval benchmark for perturbation-response signatures.
 - Dataset loading for `sciplex`, `tahoe`, `l1000_phase1`, `l1000_phase2` using paths from `notebooks/load_data.ipynb`.
 - Per-cell-type retrieval with gene-overlap alignment for each query/db cell-type pair.
 - Global ranking against all db cell types (including non-matching cell types) for each query sample.
-- Ground-truth matching based on exact `cell_type` + `perturbagen`, with nearest `pert_time_h` and `pert_dose_uM`.
+- Ground-truth matching based on exact `cell_type` + `pubchem_cid`, with nearest `pert_time_h` and `pert_dose_uM`.
 - Layer-wise scoring over all shared layers except:
   - `CI.L`, `CI.R`, `stdev.scaled`, `stdev.unscaled`, `AveExpr`
   - `adj.P.Value.across_all_contrasts`, `adj.P.Value.within_one_contrast`
@@ -31,6 +31,8 @@ Outputs are written to:
 - `results/cross_dataset_retrieval_detail.csv`
 - `results/cross_dataset_retrieval_summary_by_cell_type.csv`
 - `results/cross_dataset_retrieval_summary_overall.csv`
+
+Verbose mode now logs progress at pair, cell-type, and representation levels (including elapsed time and rows produced).
 
 ## Useful Options
 
@@ -65,3 +67,66 @@ python -m op3_analysis.retrieval.cli \
 ## Visualization
 
 Use `notebooks/visualize_retrieval_results.ipynb` to visualize retrieval outputs (`*_detail.csv`, `*_summary_by_cell_type.csv`, `*_summary_overall.csv`) for any run prefix (default in notebook: `my_run_fast`).
+
+## Parallel Slurm Workflow
+
+For large runs, use the parallel pipeline:
+
+1. Precompute true cell line-drug matches and generate task matrix (`pair x representation`).
+2. Run one task per row of the matrix (ideal for Slurm array jobs).
+3. Merge all task outputs into the final CSVs.
+
+### Python CLI Stages
+
+```bash
+# Stage 1: precompute truth matches + task matrix
+python -m op3_analysis.retrieval.parallel_cli precompute \
+  --output-dir results/full \
+  --output-prefix my_run_fast \
+  --query-datasets all \
+  --db-datasets all \
+  --representations all \
+  --verbose
+
+# Stage 2: run one task (task_id usually from Slurm array index)
+python -m op3_analysis.retrieval.parallel_cli run-task \
+  --task-file results/full/my_run_fast_tasks.csv \
+  --task-id 1 \
+  --output-dir results/full/tasks \
+  --output-prefix my_run_fast \
+  --metrics all \
+  --verbose
+
+# Stage 3: merge all task outputs
+python -m op3_analysis.retrieval.parallel_cli merge \
+  --task-file results/full/my_run_fast_tasks.csv \
+  --task-output-dir results/full/tasks \
+  --output-dir results/full \
+  --output-prefix my_run_fast \
+  --verbose
+```
+
+### Slurm Launcher
+
+`scripts/slurm/run_retrieval_parallel.sh` orchestrates all three stages with `sbatch -W` and an array for stage 2.
+
+Example:
+
+```bash
+QOS=cpu_normal \
+PARTITION=cpu_p \
+UV_BIN=uv \
+OUTPUT_PREFIX=my_run_fast \
+bash scripts/slurm/run_retrieval_parallel.sh
+```
+
+Useful environment variables:
+
+- `QUERY_DATASETS`, `DB_DATASETS` (comma-separated names or `all`)
+- `REPRESENTATIONS`, `SKIP_REPRESENTATIONS`
+- `METRICS`
+- `CELL_TYPES`
+- `INCLUDE_SELF_DATASET` (`0`/`1`)
+- `UV_BIN` (default: `uv`)
+- `DATASET_PATH_ARGS` (e.g. `--dataset-path sciplex=/path --dataset-path tahoe=/path`)
+- `TASK_MEM`, `PREP_MEM`, `MERGE_MEM` (defaults set to `200G`)
