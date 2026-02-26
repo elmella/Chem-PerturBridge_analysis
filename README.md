@@ -76,6 +76,12 @@ For large runs, use the parallel pipeline:
 2. Run one task per row of the matrix (ideal for Slurm array jobs).
 3. Merge all task outputs into the final CSVs.
 
+Precompute now also writes one AnnData per dataset pair with matches:
+
+- `results/<run_dir>/<prefix>_pair_matches/<dataset_a>__<dataset_b>_matches.h5ad`
+- each file contains matched samples from both datasets on shared genes and includes
+  directional obs columns `<dataset_a>_<dataset_b>_match_id` and `<dataset_b>_<dataset_a>_match_id`.
+
 ### Python CLI Stages
 
 ```bash

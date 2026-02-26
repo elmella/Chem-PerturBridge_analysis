@@ -6,6 +6,7 @@ from os import PathLike
 from pathlib import Path
 from typing import Optional
 
+import anndata as ad
 import numpy as np
 import pandas as pd
 
@@ -439,6 +440,247 @@ def write_precompute_outputs(
     truth_summary_df.to_csv(truth_summary_path, index=False)
     tasks_df.to_csv(tasks_path, index=False)
     return truth_path, truth_summary_path, tasks_path
+
+
+def _append_match_id(
+    mapping: dict[tuple[str, str, str], list[str]],
+    sample_key: tuple[str, str, str],
+    match_id: str,
+) -> None:
+    if sample_key not in mapping:
+        mapping[sample_key] = [match_id]
+    else:
+        mapping[sample_key].append(match_id)
+
+
+def write_pair_match_anndatas(
+    truth_df: pd.DataFrame,
+    dataset_paths: dict[str, str | PathLike[str]],
+    output_dir: Path,
+    output_prefix: str,
+    cache_cell_types: bool = True,
+    verbose: bool = False,
+) -> list[Path]:
+    required_columns = {
+        "query_dataset",
+        "db_dataset",
+        "query_cell_type",
+        "query_obs_id",
+        "gt_db_obs_id",
+    }
+    missing_columns = sorted(required_columns - set(truth_df.columns))
+    if missing_columns:
+        raise KeyError(
+            "Truth dataframe is missing required columns for pair-match AnnData export: "
+            f"{missing_columns}"
+        )
+    if truth_df.empty:
+        return []
+
+    stores = {
+        name: DatasetStore(dataset_name=name, dataset_path=Path(path), cache_enabled=cache_cell_types)
+        for name, path in dataset_paths.items()
+    }
+    cache: dict[tuple[str, str], object] = {}
+
+    pair_dir = output_dir / f"{output_prefix}_pair_matches"
+    pair_dir.mkdir(parents=True, exist_ok=True)
+
+    local_truth = truth_df[
+        ["query_dataset", "db_dataset", "query_cell_type", "query_obs_id", "gt_db_obs_id"]
+    ].copy()
+    query_ds = local_truth["query_dataset"].astype(str).to_numpy()
+    db_ds = local_truth["db_dataset"].astype(str).to_numpy()
+    local_truth["_pair_a"] = np.where(query_ds <= db_ds, query_ds, db_ds)
+    local_truth["_pair_b"] = np.where(query_ds <= db_ds, db_ds, query_ds)
+
+    pair_keys = (
+        local_truth[["_pair_a", "_pair_b"]]
+        .drop_duplicates()
+        .sort_values(["_pair_a", "_pair_b"])
+        .itertuples(index=False, name=None)
+    )
+
+    output_paths: list[Path] = []
+    for dataset_a, dataset_b in pair_keys:
+        pair_truth = local_truth.loc[
+            (local_truth["_pair_a"] == dataset_a) & (local_truth["_pair_b"] == dataset_b),
+            ["query_dataset", "db_dataset", "query_cell_type", "query_obs_id", "gt_db_obs_id"],
+        ].copy()
+        if pair_truth.empty:
+            continue
+        if dataset_a not in stores or dataset_b not in stores:
+            raise KeyError(
+                f"Cannot build pair-match AnnData for {dataset_a}/{dataset_b}: "
+                "dataset path is missing."
+            )
+
+        pair_truth = pair_truth.sort_values(
+            ["query_dataset", "db_dataset", "query_cell_type", "query_obs_id", "gt_db_obs_id"]
+        ).reset_index(drop=True)
+        pair_truth["direction_idx"] = (
+            pair_truth.groupby(["query_dataset", "db_dataset"]).cumcount() + 1
+        )
+        pair_truth["match_id"] = (
+            pair_truth["query_dataset"].astype(str)
+            + "_to_"
+            + pair_truth["db_dataset"].astype(str)
+            + "_"
+            + pair_truth["direction_idx"].astype(str).str.zfill(6)
+        )
+
+        forward_col = f"{dataset_a}_{dataset_b}_match_id"
+        reverse_col = f"{dataset_b}_{dataset_a}_match_id"
+        pair_match_columns = [forward_col]
+        if reverse_col != forward_col:
+            pair_match_columns.append(reverse_col)
+
+        match_ids_by_col: dict[str, dict[tuple[str, str, str], list[str]]] = {
+            column: {} for column in pair_match_columns
+        }
+        sample_keys: set[tuple[str, str, str]] = set()
+        for row in pair_truth.itertuples(index=False):
+            direction_col = f"{row.query_dataset}_{row.db_dataset}_match_id"
+            direction_map = match_ids_by_col.setdefault(direction_col, {})
+            query_key = (str(row.query_dataset), str(row.query_cell_type), str(row.query_obs_id))
+            db_key = (str(row.db_dataset), str(row.query_cell_type), str(row.gt_db_obs_id))
+            _append_match_id(direction_map, query_key, str(row.match_id))
+            _append_match_id(direction_map, db_key, str(row.match_id))
+            sample_keys.add(query_key)
+            sample_keys.add(db_key)
+
+        pair_shared_genes: Optional[np.ndarray] = None
+        for cell_type in sorted(pair_truth["query_cell_type"].astype(str).unique()):
+            left_data = load_cell_type_data(stores[dataset_a], cell_type, cache)
+            right_data = load_cell_type_data(stores[dataset_b], cell_type, cache)
+            if left_data is None or right_data is None:
+                continue
+            shared_genes = np.intersect1d(
+                left_data.adata.var_names.values,
+                right_data.adata.var_names.values,
+                assume_unique=False,
+            )
+            if shared_genes.size == 0:
+                continue
+            if pair_shared_genes is None:
+                pair_shared_genes = shared_genes
+            else:
+                pair_shared_genes = np.intersect1d(
+                    pair_shared_genes,
+                    shared_genes,
+                    assume_unique=False,
+                )
+            if pair_shared_genes.size == 0:
+                break
+
+        if pair_shared_genes is None or pair_shared_genes.size == 0:
+            _log(
+                verbose,
+                f"[precompute] pair-match {dataset_a}<->{dataset_b}: "
+                "no shared genes after intersection; skipping",
+            )
+            continue
+
+        grouped_keys: dict[tuple[str, str], list[str]] = {}
+        for dataset_name, cell_type, obs_id in sorted(sample_keys):
+            grouped_keys.setdefault((dataset_name, cell_type), []).append(obs_id)
+
+        blocks: list[ad.AnnData] = []
+        common_layers: Optional[set[str]] = None
+        for (dataset_name, cell_type), obs_ids in grouped_keys.items():
+            if dataset_name not in stores:
+                continue
+            cell_data = load_cell_type_data(stores[dataset_name], cell_type, cache)
+            if cell_data is None or cell_data.adata.n_obs == 0:
+                continue
+
+            var_idx = cell_data.adata.var_names.get_indexer(pair_shared_genes)
+            if np.any(var_idx < 0):
+                continue
+
+            obs_index = pd.Index(cell_data.adata.obs_names.astype(str))
+            row_idx = obs_index.get_indexer(obs_ids)
+            valid_mask = row_idx >= 0
+            if not np.any(valid_mask):
+                continue
+
+            selected_rows = row_idx[valid_mask].astype(np.int64, copy=False)
+            selected_obs_ids = [obs_ids[i] for i, keep in enumerate(valid_mask) if keep]
+            block = cell_data.adata[selected_rows, var_idx].copy()
+
+            block.obs = block.obs.copy()
+            block.obs["dataset_name"] = dataset_name
+            block.obs["source_cell_type"] = cell_type
+            block.obs["original_obs_id"] = selected_obs_ids
+
+            sample_keys_for_rows = [
+                (dataset_name, cell_type, obs_id) for obs_id in selected_obs_ids
+            ]
+            for match_column in pair_match_columns:
+                col_map = match_ids_by_col.get(match_column, {})
+                block.obs[match_column] = [
+                    ",".join(col_map.get(sample_key, [])) for sample_key in sample_keys_for_rows
+                ]
+
+            block.obs_names = pd.Index(
+                [f"{dataset_name}::{cell_type}::{obs_id}" for obs_id in selected_obs_ids],
+                dtype=object,
+            )
+            block.raw = None
+            for key in list(block.uns.keys()):
+                del block.uns[key]
+            for key in list(block.obsm.keys()):
+                del block.obsm[key]
+            for key in list(block.varm.keys()):
+                del block.varm[key]
+            for key in list(block.obsp.keys()):
+                del block.obsp[key]
+            for key in list(block.varp.keys()):
+                del block.varp[key]
+
+            layer_keys = set(block.layers.keys())
+            if common_layers is None:
+                common_layers = layer_keys
+            else:
+                common_layers &= layer_keys
+            blocks.append(block)
+
+        if not blocks:
+            _log(
+                verbose,
+                f"[precompute] pair-match {dataset_a}<->{dataset_b}: "
+                "no sample blocks after filtering; skipping",
+            )
+            continue
+
+        if common_layers is not None:
+            for block in blocks:
+                for layer_name in list(block.layers.keys()):
+                    if layer_name not in common_layers:
+                        del block.layers[layer_name]
+
+        pair_adata = ad.concat(
+            blocks,
+            axis=0,
+            join="inner",
+            merge="first",
+            uns_merge="first",
+        )
+        pair_adata.uns["datasets"] = [dataset_a, dataset_b]
+        pair_adata.uns["match_id_columns"] = pair_match_columns
+        pair_adata.uns["n_truth_matches"] = int(len(pair_truth))
+        pair_adata.uns["n_unique_samples"] = int(pair_adata.n_obs)
+
+        pair_path = pair_dir / f"{dataset_a}__{dataset_b}_matches.h5ad"
+        pair_adata.write_h5ad(pair_path)
+        output_paths.append(pair_path)
+        _log(
+            verbose,
+            f"[precompute] pair-match {dataset_a}<->{dataset_b}: "
+            f"samples={pair_adata.n_obs} genes={pair_adata.n_vars} -> {pair_path}",
+        )
+
+    return output_paths
 
 
 def load_task_row(task_file: Path, task_id: int) -> pd.Series:

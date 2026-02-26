@@ -15,6 +15,7 @@ from .parallel import (
     build_truth_matches_and_tasks,
     merge_task_outputs,
     run_single_task,
+    write_pair_match_anndatas,
     write_precompute_outputs,
 )
 
@@ -237,9 +238,24 @@ def _run_precompute(args: argparse.Namespace) -> int:
         output_dir=output_dir,
         output_prefix=args.output_prefix,
     )
+    pair_paths = write_pair_match_anndatas(
+        truth_df=truth_df,
+        dataset_paths=dataset_paths,
+        output_dir=output_dir,
+        output_prefix=args.output_prefix,
+        cache_cell_types=not args.no_cache,
+        verbose=args.verbose,
+    )
     print(f"Saved truth matches rows={len(truth_df)} -> {truth_path}")
     print(f"Saved truth summary rows={len(truth_summary_df)} -> {truth_summary_path}")
     print(f"Saved tasks rows={len(tasks_df)} -> {tasks_path}")
+    if pair_paths:
+        print(
+            f"Saved pair-match AnnData files={len(pair_paths)} "
+            f"-> {pair_paths[0].parent}"
+        )
+    else:
+        print("Saved pair-match AnnData files=0")
     return 0
 
 
