@@ -175,7 +175,15 @@ def best_row_for_group(group: PubchemCIDGroup, time_h: float, dose_um: float) ->
     time_ties = np.flatnonzero(dt == min_dt)
     if time_ties.size == 1:
         return int(group.rows[time_ties[0]])
-    dd = np.abs(group.doses[time_ties] - dose_um)
+    tied_doses = group.doses[time_ties]
+    dd = np.abs(tied_doses - dose_um)
+    if np.isfinite(dose_um) and dose_um > 0.0:
+        positive_mask = np.isfinite(tied_doses) & (tied_doses > 0.0)
+        if np.any(positive_mask):
+            # Prefer log-dose distance because dose-response effects are typically scale-based.
+            dd[positive_mask] = np.abs(
+                np.log(tied_doses[positive_mask]) - np.log(dose_um)
+            )
     winner = time_ties[int(np.argmin(dd))]
     return int(group.rows[winner])
 

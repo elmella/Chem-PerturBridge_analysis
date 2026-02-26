@@ -7,7 +7,7 @@ Cross-dataset retrieval benchmark for perturbation-response signatures.
 - Dataset loading for `sciplex`, `tahoe`, `l1000_phase1`, `l1000_phase2` using paths from `notebooks/load_data.ipynb`.
 - Per-cell-type retrieval with gene-overlap alignment for each query/db cell-type pair.
 - Global ranking against all db cell types (including non-matching cell types) for each query sample.
-- Ground-truth matching based on exact `cell_type` + `pubchem_cid`, with nearest `pert_time_h` and `pert_dose_uM`.
+- Ground-truth matching based on exact `cell_type` + `pubchem_cid`, with nearest `pert_time_h` and nearest `log(pert_dose_uM)` (falling back to linear dose distance for non-positive doses).
 - Layer-wise scoring over all shared layers except:
   - `CI.L`, `CI.R`, `stdev.scaled`, `stdev.unscaled`, `AveExpr`
   - `adj.P.Value.across_all_contrasts`, `adj.P.Value.within_one_contrast`
