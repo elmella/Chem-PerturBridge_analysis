@@ -211,3 +211,4 @@ logs/
 results/
 .DS_Store
 .vscode
+.codex
