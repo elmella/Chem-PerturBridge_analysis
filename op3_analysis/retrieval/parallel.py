@@ -442,9 +442,15 @@ def write_precompute_outputs(
     return truth_path, truth_summary_path, tasks_path
 
 
+def _normalize_optional_row(value: object) -> int | None:
+    if pd.isna(value):
+        return None
+    return int(value)
+
+
 def _append_match_id(
-    mapping: dict[tuple[str, str, str], list[str]],
-    sample_key: tuple[str, str, str],
+    mapping: dict[tuple[str, str, str, int | None], list[str]],
+    sample_key: tuple[str, str, str, int | None],
     match_id: str,
 ) -> None:
     if sample_key not in mapping:
@@ -466,7 +472,9 @@ def write_pair_match_anndatas(
         "db_dataset",
         "query_cell_type",
         "query_obs_id",
+        "query_row",
         "gt_db_obs_id",
+        "gt_db_row",
     }
     missing_columns = sorted(required_columns - set(truth_df.columns))
     if missing_columns:
@@ -487,7 +495,15 @@ def write_pair_match_anndatas(
     pair_dir.mkdir(parents=True, exist_ok=True)
 
     local_truth = truth_df[
-        ["query_dataset", "db_dataset", "query_cell_type", "query_obs_id", "gt_db_obs_id"]
+        [
+            "query_dataset",
+            "db_dataset",
+            "query_cell_type",
+            "query_obs_id",
+            "query_row",
+            "gt_db_obs_id",
+            "gt_db_row",
+        ]
     ].copy()
     query_ds = local_truth["query_dataset"].astype(str).to_numpy()
     db_ds = local_truth["db_dataset"].astype(str).to_numpy()
@@ -505,7 +521,15 @@ def write_pair_match_anndatas(
     for dataset_a, dataset_b in pair_keys:
         pair_truth = local_truth.loc[
             (local_truth["_pair_a"] == dataset_a) & (local_truth["_pair_b"] == dataset_b),
-            ["query_dataset", "db_dataset", "query_cell_type", "query_obs_id", "gt_db_obs_id"],
+            [
+                "query_dataset",
+                "db_dataset",
+                "query_cell_type",
+                "query_obs_id",
+                "query_row",
+                "gt_db_obs_id",
+                "gt_db_row",
+            ],
         ].copy()
         if pair_truth.empty:
             continue
@@ -516,7 +540,15 @@ def write_pair_match_anndatas(
             )
 
         pair_truth = pair_truth.sort_values(
-            ["query_dataset", "db_dataset", "query_cell_type", "query_obs_id", "gt_db_obs_id"]
+            [
+                "query_dataset",
+                "db_dataset",
+                "query_cell_type",
+                "query_row",
+                "query_obs_id",
+                "gt_db_row",
+                "gt_db_obs_id",
+            ]
         ).reset_index(drop=True)
         pair_truth["direction_idx"] = (
             pair_truth.groupby(["query_dataset", "db_dataset"]).cumcount() + 1
@@ -535,15 +567,25 @@ def write_pair_match_anndatas(
         if reverse_col != forward_col:
             pair_match_columns.append(reverse_col)
 
-        match_ids_by_col: dict[str, dict[tuple[str, str, str], list[str]]] = {
+        match_ids_by_col: dict[str, dict[tuple[str, str, str, int | None], list[str]]] = {
             column: {} for column in pair_match_columns
         }
-        sample_keys: set[tuple[str, str, str]] = set()
+        sample_keys: set[tuple[str, str, str, int | None]] = set()
         for row in pair_truth.itertuples(index=False):
             direction_col = f"{row.query_dataset}_{row.db_dataset}_match_id"
             direction_map = match_ids_by_col.setdefault(direction_col, {})
-            query_key = (str(row.query_dataset), str(row.query_cell_type), str(row.query_obs_id))
-            db_key = (str(row.db_dataset), str(row.query_cell_type), str(row.gt_db_obs_id))
+            query_key = (
+                str(row.query_dataset),
+                str(row.query_cell_type),
+                str(row.query_obs_id),
+                _normalize_optional_row(row.query_row),
+            )
+            db_key = (
+                str(row.db_dataset),
+                str(row.query_cell_type),
+                str(row.gt_db_obs_id),
+                _normalize_optional_row(row.gt_db_row),
+            )
             _append_match_id(direction_map, query_key, str(row.match_id))
             _append_match_id(direction_map, db_key, str(row.match_id))
             sample_keys.add(query_key)
@@ -581,13 +623,13 @@ def write_pair_match_anndatas(
             )
             continue
 
-        grouped_keys: dict[tuple[str, str], list[str]] = {}
-        for dataset_name, cell_type, obs_id in sorted(sample_keys):
-            grouped_keys.setdefault((dataset_name, cell_type), []).append(obs_id)
+        grouped_keys: dict[tuple[str, str], list[tuple[str, int | None]]] = {}
+        for dataset_name, cell_type, obs_id, row_idx in sorted(sample_keys):
+            grouped_keys.setdefault((dataset_name, cell_type), []).append((obs_id, row_idx))
 
         blocks: list[ad.AnnData] = []
         common_layers: Optional[set[str]] = None
-        for (dataset_name, cell_type), obs_ids in grouped_keys.items():
+        for (dataset_name, cell_type), sample_entries in grouped_keys.items():
             if dataset_name not in stores:
                 continue
             cell_data = load_cell_type_data(stores[dataset_name], cell_type, cache)
@@ -598,24 +640,47 @@ def write_pair_match_anndatas(
             if np.any(var_idx < 0):
                 continue
 
+            resolved_rows: list[int] = []
+            selected_obs_ids: list[str] = []
+            selected_truth_rows: list[int] = []
+            sample_keys_for_rows: list[tuple[str, str, str, int | None]] = []
+
             obs_index = pd.Index(cell_data.adata.obs_names.astype(str))
-            row_idx = obs_index.get_indexer(obs_ids)
-            valid_mask = row_idx >= 0
-            if not np.any(valid_mask):
+            obs_names = obs_index.to_numpy(dtype=object)
+            for obs_id, truth_row in sample_entries:
+                resolved_row: int | None = None
+                if truth_row is not None and 0 <= int(truth_row) < int(cell_data.adata.n_obs):
+                    resolved_row = int(truth_row)
+                elif obs_index.is_unique:
+                    lookup = obs_index.get_indexer([obs_id])[0]
+                    if lookup >= 0:
+                        resolved_row = int(lookup)
+                else:
+                    matches = np.flatnonzero(obs_names == obs_id)
+                    if matches.size:
+                        resolved_row = int(matches[0])
+
+                if resolved_row is None:
+                    continue
+
+                resolved_rows.append(resolved_row)
+                selected_obs_ids.append(str(obs_id))
+                selected_truth_rows.append(int(truth_row) if truth_row is not None else resolved_row)
+                sample_keys_for_rows.append(
+                    (dataset_name, cell_type, str(obs_id), int(truth_row) if truth_row is not None else resolved_row)
+                )
+
+            if not resolved_rows:
                 continue
 
-            selected_rows = row_idx[valid_mask].astype(np.int64, copy=False)
-            selected_obs_ids = [obs_ids[i] for i, keep in enumerate(valid_mask) if keep]
+            selected_rows = np.asarray(resolved_rows, dtype=np.int64)
             block = cell_data.adata[selected_rows, var_idx].copy()
 
             block.obs = block.obs.copy()
             block.obs["dataset_name"] = dataset_name
             block.obs["source_cell_type"] = cell_type
             block.obs["original_obs_id"] = selected_obs_ids
-
-            sample_keys_for_rows = [
-                (dataset_name, cell_type, obs_id) for obs_id in selected_obs_ids
-            ]
+            block.obs["original_row"] = selected_truth_rows
             for match_column in pair_match_columns:
                 col_map = match_ids_by_col.get(match_column, {})
                 block.obs[match_column] = [
@@ -623,7 +688,10 @@ def write_pair_match_anndatas(
                 ]
 
             block.obs_names = pd.Index(
-                [f"{dataset_name}::{cell_type}::{obs_id}" for obs_id in selected_obs_ids],
+                [
+                    f"{dataset_name}::{cell_type}::{row_idx}::{obs_id}"
+                    for row_idx, obs_id in zip(selected_truth_rows, selected_obs_ids)
+                ],
                 dtype=object,
             )
             block.raw = None

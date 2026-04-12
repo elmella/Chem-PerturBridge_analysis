@@ -64,6 +64,46 @@ python -m op3_analysis.retrieval.cli \
   --dataset-path l1000_phase1=/my/l1000_phase1/results
 ```
 
+## Compound Overlaps
+
+Export the shared Tahoe compounds as one CSV per comparison dataset:
+
+```bash
+python -m op3_analysis.compound_overlaps \
+  --output-dir results/compound_overlaps \
+  --verbose
+```
+
+By default this writes:
+
+- `results/compound_overlaps/tahoe__sciplex_compound_overlap.csv`
+- `results/compound_overlaps/tahoe__l1000_phase1_compound_overlap.csv`
+- `results/compound_overlaps/tahoe__l1000_phase2_compound_overlap.csv`
+
+Use `--dataset-path NAME=/path/to/data` to override input datasets, and
+`--compare-datasets` to restrict which Tahoe comparisons are exported.
+
+## Tahoe-Filtered L1000 Exports
+
+Write Tahoe-overlap-filtered L1000 datasets to a new output directory. Each output
+dataset is a single `.h5ad`, but cell lines with fewer than `10` unique Tahoe-shared
+compounds are dropped before writing:
+
+```bash
+python -m op3_analysis.filter_l1000_to_tahoe \
+  --output-dir results/l1000_tahoe_filtered \
+  --min-shared-compounds 10 \
+  --verbose
+```
+
+This writes:
+
+- `results/l1000_tahoe_filtered/l1000_phase1.h5ad`
+- `results/l1000_tahoe_filtered/l1000_phase2.h5ad`
+- `results/l1000_tahoe_filtered/l1000_phase1_level5.h5ad`
+- `results/l1000_tahoe_filtered/l1000_phase2_level5.h5ad`
+- `results/l1000_tahoe_filtered/filter_summary.csv`
+
 ## Visualization
 
 Use `notebooks/visualize_retrieval_results.ipynb` to visualize retrieval outputs (`*_detail.csv`, `*_summary_by_cell_type.csv`, `*_summary_overall.csv`) for any run prefix (default in notebook: `my_run_fast`).
