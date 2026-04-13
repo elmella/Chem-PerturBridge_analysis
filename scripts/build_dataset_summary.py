@@ -99,6 +99,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Log progress to stderr.",
     )
+    parser.add_argument(
+        "--no-chem-perturbridge-row",
+        action="store_true",
+        help="Do not append the aggregate overlap row. Useful when sharding by dataset across nodes.",
+    )
     return parser.parse_args()
 
 
@@ -199,6 +204,51 @@ def summarize_dataset(
     return record
 
 
+def load_bridge_obs(dataset_name: str, data_root: Path, verbose: bool = False) -> pd.DataFrame:
+    h5ad_path = resolve_processed_h5ad(data_root, dataset_name)
+    log(f"[{dataset_name}] loading bridge metadata from {h5ad_path}", verbose=verbose)
+    adata = ad.read_h5ad(h5ad_path, backed="r")
+    try:
+        obs = adata.obs[
+            ["cell_type", "pubchem_cid", "pert_time_h", "pert_dose_uM", "is_control"]
+        ].copy()
+    finally:
+        adata.file.close()
+
+    obs = obs.loc[~to_boolean_series(obs["is_control"])].copy()
+    obs["dataset_name"] = dataset_name
+    obs["cell_type"] = obs["cell_type"].astype(str).str.strip()
+    obs["pubchem_cid"] = obs["pubchem_cid"].astype(str).str.strip()
+    return obs[["dataset_name", "cell_type", "pubchem_cid", "pert_time_h", "pert_dose_uM"]]
+
+
+def summarize_chem_perturbridge(
+    dataset_names: list[str],
+    data_root: Path,
+    dataset_rows: list[dict[str, object]],
+    verbose: bool = False,
+) -> dict[str, object]:
+    bridge_frames = [load_bridge_obs(name, data_root=data_root, verbose=verbose) for name in dataset_names]
+    combined_bridge = pd.concat(bridge_frames, ignore_index=True)
+    systems = sorted({str(row["system"]) for row in dataset_rows if str(row["system"]).strip()})
+
+    context_values = normalize_string_series(combined_bridge["cell_type"])
+    compound_values = normalize_string_series(combined_bridge["pubchem_cid"])
+    valid_compounds = compound_values[~compound_values.str.lower().isin({"nan", "none", "<na>"})]
+
+    return {
+        "dataset_name": "Chem-PerturBridge",
+        "system": "; ".join(systems),
+        "technology": "union across selected datasets",
+        "n_compounds": int(valid_compounds.nunique()),
+        "n_contexts": int(context_values.nunique()),
+        "n_samples": int(len(combined_bridge)),
+        "timepoints_h": "; ".join(unique_sorted_numeric_strings(combined_bridge["pert_time_h"])),
+        "doses_uM": "; ".join(unique_sorted_numeric_strings(combined_bridge["pert_dose_uM"])),
+        "source_url": "NA",
+    }
+
+
 def find_source_url_in_repo(dataset_name: str, repo_root: Path) -> str:
     aliases = {alias.lower() for alias in SOURCE_ALIASES.get(dataset_name, {dataset_name})}
     for path in iter_repo_text_files(repo_root):
@@ -239,6 +289,7 @@ def build_summary(
     repo_root: Path,
     jobs: int,
     verbose: bool,
+    include_chem_perturbridge_row: bool,
 ) -> pd.DataFrame:
     if jobs <= 1 or len(dataset_names) == 1:
         rows = [
@@ -260,11 +311,21 @@ def build_summary(
             ]
             rows = [future.result() for future in futures]
 
+    if include_chem_perturbridge_row:
+        rows.append(
+            summarize_chem_perturbridge(
+                dataset_names=dataset_names,
+                data_root=data_root,
+                dataset_rows=rows,
+                verbose=verbose,
+            )
+        )
+
     frame = pd.DataFrame(rows)
     order = {name: index for index, name in enumerate(DATASET_ORDER)}
     return frame.sort_values(
         by="dataset_name",
-        key=lambda series: series.map(order),
+        key=lambda series: series.map(lambda value: order.get(value, len(order))),
     ).reset_index(drop=True)
 
 
@@ -282,6 +343,7 @@ def main() -> None:
         repo_root=args.repo_root,
         jobs=args.jobs,
         verbose=args.verbose,
+        include_chem_perturbridge_row=not args.no_chem_perturbridge_row,
     )
     write_summary(summary, args.output)
 
