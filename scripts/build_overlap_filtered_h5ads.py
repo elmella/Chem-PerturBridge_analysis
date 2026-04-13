@@ -25,6 +25,7 @@ DATASET_ORDER_RANK = {
     dataset_name: index for index, dataset_name in enumerate(DATASET_ORDER)
 }
 DEFAULT_MAX_LOG10_DOSE_DIFF = 1.0
+DEFAULT_MIN_CONTEXT_OVERLAP_COMPOUNDS = 10
 NUMERIC_SIG_FIGS = 12
 INVALID_STRING_VALUES = {"", "nan", "none", "<na>"}
 PHASE12_ONLY_DATASETS = frozenset({"l1000_phase1", "l1000_phase2"})
@@ -59,8 +60,9 @@ class MatchEdge:
 
 
 @dataclass
-class ForcedBridgeLine:
-    bridge_name: str
+class QualifiedContextMatch:
+    dataset_a: str
+    dataset_b: str
     context_key: str
     n_matching_compounds: int
     n_matching_conditions: int
@@ -153,6 +155,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Maximum allowed absolute difference in log10 dose for a matched pair "
             f"(default: {DEFAULT_MAX_LOG10_DOSE_DIFF})."
+        ),
+    )
+    parser.add_argument(
+        "--min-context-overlap-compounds",
+        type=int,
+        default=DEFAULT_MIN_CONTEXT_OVERLAP_COMPOUNDS,
+        help=(
+            "Minimum number of overlapping normalized pubchem_cid values required "
+            "to retain a non-phase12 shared cell_type context for a dataset pair "
+            f"(default: {DEFAULT_MIN_CONTEXT_OVERLAP_COMPOUNDS})."
         ),
     )
     parser.add_argument(
@@ -522,153 +534,100 @@ def filter_match_edges(
     return retained
 
 
-def rank_bridge_line_candidates(
-    source: DatasetMetadata,
-    targets: list[DatasetMetadata],
-    max_log10_dose_diff: float,
-    excluded_context_keys: set[str],
-) -> list[ForcedBridgeLine]:
-    candidate_contexts = sorted(
-        set(source.frame["harmonized_context_key"].astype(str))
-        - set(excluded_context_keys)
-    )
-    ranked: list[ForcedBridgeLine] = []
-
-    for context_key in candidate_contexts:
-        compounds: set[str] = set()
-        conditions: set[tuple[str, str, str]] = set()
-        edge_count = 0
-        for target in targets:
-            edges, _ = collect_pair_match_edges(
-                left=source,
-                right=target,
-                max_log10_dose_diff=max_log10_dose_diff,
-                groups_attr="normalized_groups",
-                pubchem_column="normalized_pubchem_cid",
-                allowed_context_keys={context_key},
-            )
-            if not edges:
-                continue
-            edge_count += len(edges)
-            for edge in edges:
-                compounds.add(edge.pubchem_cid)
-                conditions.add((edge.pubchem_cid, edge.time_key, edge.dataset_b))
-
-        if not compounds:
-            continue
-
-        ranked.append(
-            ForcedBridgeLine(
-                bridge_name="",
-                context_key=context_key,
-                n_matching_compounds=int(len(compounds)),
-                n_matching_conditions=int(len(conditions)),
-                n_matching_edges=int(edge_count),
-            )
-        )
-
-    return sorted(
-        ranked,
-        key=lambda line: (
-            -line.n_matching_compounds,
-            -line.n_matching_conditions,
-            -line.n_matching_edges,
-            line.context_key,
-        ),
-    )
-
-
-def select_forced_bridge_lines(
+def find_qualifying_context_matches(
+    dataset_names: list[str],
     metadata_by_dataset: dict[str, DatasetMetadata],
-    retained_context_keys: set[str],
     max_log10_dose_diff: float,
+    min_context_overlap_compounds: int,
     verbose: bool = False,
-) -> list[ForcedBridgeLine]:
-    selected: list[ForcedBridgeLine] = []
+) -> list[QualifiedContextMatch]:
+    selected: list[QualifiedContextMatch] = []
 
-    bridge_specs = [
-        (
-            "sciplex_l1000",
-            "sciplex",
-            ["l1000_phase1", "l1000_phase2"],
-        ),
-        (
-            "tahoe_l1000",
-            "tahoe",
-            ["l1000_phase1", "l1000_phase2"],
-        ),
-    ]
+    for idx, dataset_a in enumerate(dataset_names):
+        left = metadata_by_dataset[dataset_a]
+        left_contexts = set(left.frame["harmonized_context_key"].astype(str))
+        for dataset_b in dataset_names[idx + 1 :]:
+            if frozenset({dataset_a, dataset_b}) == PHASE12_ONLY_DATASETS:
+                continue
 
-    excluded_context_keys = set(retained_context_keys)
-    for bridge_name, source_name, target_names in bridge_specs:
-        if source_name not in metadata_by_dataset:
-            continue
-        if any(target_name not in metadata_by_dataset for target_name in target_names):
-            continue
+            right = metadata_by_dataset[dataset_b]
+            shared_contexts = sorted(
+                left_contexts & set(right.frame["harmonized_context_key"].astype(str))
+            )
+            if not shared_contexts:
+                continue
 
-        ranked = rank_bridge_line_candidates(
-            source=metadata_by_dataset[source_name],
-            targets=[metadata_by_dataset[target_name] for target_name in target_names],
-            max_log10_dose_diff=max_log10_dose_diff,
-            excluded_context_keys=excluded_context_keys,
-        )
-        if not ranked:
-            log(f"[forced-lines] no candidate line found for {bridge_name}", verbose=verbose)
-            continue
+            for context_key in shared_contexts:
+                edges, _ = collect_pair_match_edges(
+                    left=left,
+                    right=right,
+                    max_log10_dose_diff=max_log10_dose_diff,
+                    groups_attr="normalized_groups",
+                    pubchem_column="normalized_pubchem_cid",
+                    allowed_context_keys={context_key},
+                )
+                if not edges:
+                    continue
 
-        best = ranked[0]
-        best.bridge_name = bridge_name
-        selected.append(best)
-        excluded_context_keys.add(best.context_key)
-        log(
-            (
-                f"[forced-lines] selected {bridge_name}: context={best.context_key} "
-                f"matching_compounds={best.n_matching_compounds} "
-                f"matching_conditions={best.n_matching_conditions} "
-                f"matching_edges={best.n_matching_edges}"
-            ),
-            verbose=verbose,
-        )
+                matching_compounds = {edge.pubchem_cid for edge in edges}
+                if len(matching_compounds) < min_context_overlap_compounds:
+                    continue
+
+                matching_conditions = {
+                    (edge.pubchem_cid, edge.harmonized_context_key, edge.time_key)
+                    for edge in edges
+                }
+                selected.append(
+                    QualifiedContextMatch(
+                        dataset_a=dataset_a,
+                        dataset_b=dataset_b,
+                        context_key=context_key,
+                        n_matching_compounds=int(len(matching_compounds)),
+                        n_matching_conditions=int(len(matching_conditions)),
+                        n_matching_edges=int(len(edges)),
+                    )
+                )
+                log(
+                    (
+                        "[qualified-context] "
+                        f"{dataset_a} <-> {dataset_b} context={context_key} "
+                        f"matching_compounds={len(matching_compounds)} "
+                        f"matching_conditions={len(matching_conditions)} "
+                        f"matching_edges={len(edges)}"
+                    ),
+                    verbose=verbose,
+                )
 
     return selected
 
 
-def build_forced_bridge_edge_frame(
-    selected_lines: list[ForcedBridgeLine],
+def build_qualifying_context_edge_frame(
+    selected_context_matches: list[QualifiedContextMatch],
     metadata_by_dataset: dict[str, DatasetMetadata],
     max_log10_dose_diff: float,
 ) -> pd.DataFrame:
-    if not selected_lines:
+    if not selected_context_matches:
         return build_match_edge_frame([])
 
-    bridge_targets = {
-        "sciplex_l1000": ("sciplex", ["l1000_phase1", "l1000_phase2"]),
-        "tahoe_l1000": ("tahoe", ["l1000_phase1", "l1000_phase2"]),
-    }
     edges: list[MatchEdge] = []
+    for selected_match in selected_context_matches:
+        left = metadata_by_dataset[selected_match.dataset_a]
+        right = metadata_by_dataset[selected_match.dataset_b]
+        pair_edges, _ = collect_pair_match_edges(
+            left=left,
+            right=right,
+            max_log10_dose_diff=max_log10_dose_diff,
+            groups_attr="normalized_groups",
+            pubchem_column="normalized_pubchem_cid",
+            allowed_context_keys={selected_match.context_key},
+        )
+        edges.extend(pair_edges)
 
-    for selected_line in selected_lines:
-        if selected_line.bridge_name not in bridge_targets:
-            continue
-        source_name, target_names = bridge_targets[selected_line.bridge_name]
-        source = metadata_by_dataset[source_name]
-        for target_name in target_names:
-            target = metadata_by_dataset[target_name]
-            pair_edges, _ = collect_pair_match_edges(
-                left=source,
-                right=target,
-                max_log10_dose_diff=max_log10_dose_diff,
-                groups_attr="normalized_groups",
-                pubchem_column="normalized_pubchem_cid",
-                allowed_context_keys={selected_line.context_key},
-            )
-            edges.extend(pair_edges)
+    qualifying_frame = build_match_edge_frame(edges)
+    if qualifying_frame.empty:
+        return qualifying_frame
 
-    forced_frame = build_match_edge_frame(edges)
-    if forced_frame.empty:
-        return forced_frame
-
-    forced_frame = forced_frame.drop_duplicates(
+    qualifying_frame = qualifying_frame.drop_duplicates(
         subset=[
             "dataset_a",
             "dataset_b",
@@ -679,7 +638,7 @@ def build_forced_bridge_edge_frame(
             "time_key",
         ]
     ).reset_index(drop=True)
-    return forced_frame
+    return qualifying_frame
 
 
 def matched_obs_counts_from_edges(match_edges: pd.DataFrame) -> dict[str, int]:
@@ -983,6 +942,7 @@ def build_overlap_outputs(
     data_root: Path,
     output_dir: Path,
     max_log10_dose_diff: float,
+    min_context_overlap_compounds: int,
     keep_phase12_only_overlaps: bool,
     verbose: bool,
 ) -> None:
@@ -1013,22 +973,20 @@ def build_overlap_outputs(
         keep_phase12_only_overlaps=keep_phase12_only_overlaps,
         verbose=verbose,
     )
-    retained_context_keys = set(
-        retained_standard_match_edge_frame["harmonized_context_key"].astype(str)
-    )
-    forced_bridge_lines = select_forced_bridge_lines(
+    qualifying_context_matches = find_qualifying_context_matches(
+        dataset_names=dataset_names,
         metadata_by_dataset=metadata_by_dataset,
-        retained_context_keys=retained_context_keys,
         max_log10_dose_diff=max_log10_dose_diff,
+        min_context_overlap_compounds=min_context_overlap_compounds,
         verbose=verbose,
     )
-    forced_bridge_edge_frame = build_forced_bridge_edge_frame(
-        selected_lines=forced_bridge_lines,
+    qualifying_context_edge_frame = build_qualifying_context_edge_frame(
+        selected_context_matches=qualifying_context_matches,
         metadata_by_dataset=metadata_by_dataset,
         max_log10_dose_diff=max_log10_dose_diff,
     )
     preexport_match_edge_frame = pd.concat(
-        [all_match_edge_frame, forced_bridge_edge_frame],
+        [all_match_edge_frame, qualifying_context_edge_frame],
         ignore_index=True,
     )
     if not preexport_match_edge_frame.empty:
@@ -1044,7 +1002,7 @@ def build_overlap_outputs(
             ]
         ).reset_index(drop=True)
     retained_match_edge_frame = pd.concat(
-        [retained_standard_match_edge_frame, forced_bridge_edge_frame],
+        [retained_standard_match_edge_frame, qualifying_context_edge_frame],
         ignore_index=True,
     )
     if not retained_match_edge_frame.empty:
@@ -1131,6 +1089,7 @@ def main() -> None:
         data_root=args.data_root,
         output_dir=args.output_dir,
         max_log10_dose_diff=args.max_log10_dose_diff,
+        min_context_overlap_compounds=args.min_context_overlap_compounds,
         keep_phase12_only_overlaps=args.keep_phase12_only_overlaps,
         verbose=args.verbose,
     )

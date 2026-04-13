@@ -4,7 +4,8 @@ Cross-dataset retrieval benchmark for perturbation-response signatures.
 
 ## Reproducibility
 1. `scripts/build_dataset_summary.py` for table 1 content
-2. `scripts/overlap_filtered_h5ads.py` for getting pseudobulks of only overlapping 
+2. `scripts/overlap_filtered_h5ads.py` for getting pseudobulks of overlapping samples (excluding those overlapping only across l1000 phases as there are so many of these that they would dominate and differ from the other considered significantly)
+3. `notebooks/plot_overlap_heatmaps.ipynb` for cross-dataset overlap plots in fig1. In each dataset pair, we skip contexts that have less than 10 compounds shared between the two.
 
 ## What Is Implemented
 
