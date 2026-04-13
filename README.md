@@ -2,6 +2,10 @@
 
 Cross-dataset retrieval benchmark for perturbation-response signatures.
 
+## Reproducibility
+1. `scripts/build_dataset_summary.py` for table 1 content
+2. `scripts/overlap_filtered_h5ads.py` for getting pseudobulks of only overlapping 
+
 ## What Is Implemented
 
 - Dataset loading for `sciplex`, `tahoe`, `l1000_phase1`, `l1000_phase2` using paths from `notebooks/load_data.ipynb`.
