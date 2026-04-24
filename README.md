@@ -1,4 +1,4 @@
-# op3_analysis
+# Chem-PerturBridge_analysis
 
 Cross-dataset retrieval benchmark for perturbation-response signatures.
 
@@ -28,7 +28,7 @@ Cross-dataset retrieval benchmark for perturbation-response signatures.
 ## Run
 
 ```bash
-python -m op3_analysis.retrieval.cli --verbose
+python -m chem_perturbridge_analysis.retrieval.cli --verbose
 ```
 
 Outputs are written to:
@@ -42,7 +42,7 @@ Verbose mode now logs progress at pair, cell-type, and representation levels (in
 ## Useful Options
 
 ```bash
-python -m op3_analysis.retrieval.cli \
+python -m chem_perturbridge_analysis.retrieval.cli \
   --query-datasets sciplex,tahoe \
   --db-datasets l1000_phase1,l1000_phase2 \
   --cell-types CVCL_0002,CVCL_0063 \
@@ -56,7 +56,7 @@ python -m op3_analysis.retrieval.cli \
 Limit compute for faster runs:
 
 ```bash
-python -m op3_analysis.retrieval.cli \
+python -m chem_perturbridge_analysis.retrieval.cli \
   --representations logFC,signed \
   --metrics cosine
 ```
@@ -64,7 +64,7 @@ python -m op3_analysis.retrieval.cli \
 Override data paths:
 
 ```bash
-python -m op3_analysis.retrieval.cli \
+python -m chem_perturbridge_analysis.retrieval.cli \
   --dataset-path sciplex=/my/sciplex/results \
   --dataset-path l1000_phase1=/my/l1000_phase1/results
 ```
@@ -91,7 +91,7 @@ Precompute now also writes one AnnData per dataset pair with matches:
 
 ```bash
 # Stage 1: precompute truth matches + task matrix
-python -m op3_analysis.retrieval.parallel_cli precompute \
+python -m chem_perturbridge_analysis.retrieval.parallel_cli precompute \
   --output-dir results/full \
   --output-prefix my_run_fast \
   --query-datasets all \
@@ -100,7 +100,7 @@ python -m op3_analysis.retrieval.parallel_cli precompute \
   --verbose
 
 # Stage 2: run one task (task_id usually from Slurm array index)
-python -m op3_analysis.retrieval.parallel_cli run-task \
+python -m chem_perturbridge_analysis.retrieval.parallel_cli run-task \
   --task-file results/full/my_run_fast_tasks.csv \
   --task-id 1 \
   --output-dir results/full/tasks \
@@ -109,7 +109,7 @@ python -m op3_analysis.retrieval.parallel_cli run-task \
   --verbose
 
 # Stage 3: merge all task outputs
-python -m op3_analysis.retrieval.parallel_cli merge \
+python -m chem_perturbridge_analysis.retrieval.parallel_cli merge \
   --task-file results/full/my_run_fast_tasks.csv \
   --task-output-dir results/full/tasks \
   --output-dir results/full \

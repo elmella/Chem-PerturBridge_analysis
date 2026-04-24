@@ -44,7 +44,7 @@ mkdir -p "${OUTPUT_DIR}" "${TASK_OUTPUT_DIR}" "${LOGS_DIR}"
 
 TASK_FILE="${OUTPUT_DIR}/${OUTPUT_PREFIX}_tasks.csv"
 
-PRECOMPUTE_CMD="${UV_BIN} run python -m op3_analysis.retrieval.parallel_cli precompute \
+PRECOMPUTE_CMD="${UV_BIN} run python -m chem_perturbridge_analysis.retrieval.parallel_cli precompute \
     --output-dir ${OUTPUT_DIR} \
     --output-prefix ${OUTPUT_PREFIX} \
     --query-datasets ${QUERY_DATASETS} \
@@ -67,7 +67,7 @@ if [ -n "${DATASET_PATH_ARGS}" ]; then
     PRECOMPUTE_CMD="${PRECOMPUTE_CMD} ${DATASET_PATH_ARGS}"
 fi
 
-RUN_TASK_CMD="OMP_NUM_THREADS=${NUMPY_THREADS} OPENBLAS_NUM_THREADS=${NUMPY_THREADS} MKL_NUM_THREADS=${NUMPY_THREADS} NUMEXPR_NUM_THREADS=${NUMPY_THREADS} ${UV_BIN} run python -m op3_analysis.retrieval.parallel_cli run-task \
+RUN_TASK_CMD="OMP_NUM_THREADS=${NUMPY_THREADS} OPENBLAS_NUM_THREADS=${NUMPY_THREADS} MKL_NUM_THREADS=${NUMPY_THREADS} NUMEXPR_NUM_THREADS=${NUMPY_THREADS} ${UV_BIN} run python -m chem_perturbridge_analysis.retrieval.parallel_cli run-task \
     --task-file ${TASK_FILE} \
     --task-id \${SLURM_ARRAY_TASK_ID} \
     --output-dir ${TASK_OUTPUT_DIR} \
@@ -81,7 +81,7 @@ if [ -n "${DATASET_PATH_ARGS}" ]; then
     RUN_TASK_CMD="${RUN_TASK_CMD} ${DATASET_PATH_ARGS}"
 fi
 
-MERGE_CMD="${UV_BIN} run python -m op3_analysis.retrieval.parallel_cli merge \
+MERGE_CMD="${UV_BIN} run python -m chem_perturbridge_analysis.retrieval.parallel_cli merge \
     --task-file ${TASK_FILE} \
     --task-output-dir ${TASK_OUTPUT_DIR} \
     --output-dir ${OUTPUT_DIR} \

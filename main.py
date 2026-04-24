@@ -1,4 +1,4 @@
-from op3_analysis.retrieval.cli import main
+from chem_perturbridge_analysis.retrieval.cli import main
 
 
 if __name__ == "__main__":

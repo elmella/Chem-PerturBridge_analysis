@@ -2662,7 +2662,7 @@ wheels = [
 ]
 
 [[package]]
-name = "op3-analysis"
+name = "chem-perturbridge-analysis"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
