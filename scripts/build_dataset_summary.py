@@ -14,12 +14,18 @@ import pandas as pd
 
 DATA_ROOT = Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated")
 DATASET_ORDER = [
+    "cigs_mce",
+    "cigs_tcm",
+    "dilimap_train_val",
+    "gdpx2",
     "l1000_phase1",
     "l1000_phase2",
     "novartis_batch_2500",
     "op3",
     "sciplex",
     "tahoe",
+    "vcpi_0001",
+    "vcpi_0002",
 ]
 REPO_SEARCH_EXTENSIONS = {
     ".md",
@@ -36,16 +42,27 @@ REPO_SEARCH_EXTENSIONS = {
 }
 SKIP_REPO_PATH_PARTS = {".git", ".venv", "__pycache__", "results"}
 SOURCE_ALIASES = {
+    "cigs_mce": {"cigs_mce", "cigs mce", "compounds_mce", "hts2"},
+    "cigs_tcm": {"cigs_tcm", "cigs tcm", "compounds_tcm", "himap-seq"},
+    "dilimap_train": {"dilimap_train", "dilimap", "dilimap_pubchem_cache"},
+    "dilimap_train_val": {"dilimap_train_val", "dilimap", "dilimap_pubchem_cache"},
+    "gdpx2": {"gdpx2", "gdpx2_compounds", "gdpx2_pubchem_cache"},
     "l1000_phase1": {"l1000_phase1", "lincs_phase1_level3_epsilon", "l1000"},
     "l1000_phase2": {"l1000_phase2", "lincs_phase2_level3", "l1000"},
+    "novartis_batch_1000": {"novartis_batch_1000", "novartis moabox drug-seq", "drug-seq"},
     "novartis_batch_2500": {"novartis_batch_2500", "novartis moabox drug-seq", "drug-seq"},
     "op3": {"op3", "neurips2023 scperturb dge"},
     "sciplex": {"sciplex", "srivatsan20_sciplex3", "sci-plex"},
     "tahoe": {"tahoe", "tahoe100", "parse evercode"},
+    "vcpi_0001": {"vcpi_0001", "vcpi-0001", "vcpi ginkgo"},
+    "vcpi_0002": {"vcpi_0002", "vcpi-0002", "vcpi ginkgo"},
 }
 TECHNOLOGY_BY_ASSAY = {
     "L1000 mRNA profiling assay": "LINCS L1000 mRNA profiling assay",
     "DRUG-seq": "DRUG-seq",
+    "HTS2": "HTS2",
+    "HiMAP-seq": "HiMAP-seq",
+    "SMARTSeq bulk RNA-seq": "SMART-seq bulk RNA-seq",
     "10x 3' v3.1": "10x Genomics Chromium Single Cell 3' v3.1 RNA-seq",
     "sci-Plex": "sci-Plex single-cell RNA-seq",
     "Parse Evercode Whole Transcriptome v3": "Parse Biosciences Evercode Whole Transcriptome v3",
@@ -163,6 +180,8 @@ def detect_system(obs: pd.DataFrame) -> str:
         return "cell lines"
     if tissues == {"blood"}:
         return "primary PBMC"
+    if context_values and all(value.startswith("CL_") for value in context_values):
+        return "primary cells"
     return "cell lines"
 
 
