@@ -16,10 +16,16 @@ DATA_ROOT = Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated")
 DATASET_ORDER = [
     "l1000_phase1",
     "l1000_phase2",
-    "novartis_batch_2500",
-    "op3",
-    "sciplex",
     "tahoe",
+    "cigs_mce",
+    "novartis_batch_2500",
+    "vcpi_0001",
+    "cigs_tcm",
+    "vcpi_0002",
+    "gdpx2",
+    "sciplex",
+    "dilimap_train_val",
+    "op3",
 ]
 DATASET_ORDER_RANK = {
     dataset_name: index for index, dataset_name in enumerate(DATASET_ORDER)
@@ -842,8 +848,8 @@ def export_filtered_h5ads(
         finally:
             adata.file.close()
 
-        filtered.obs = filtered.obs.copy()
         filtered.obs_names = pd.Index(filtered.obs_names.astype(str), dtype=object)
+        filtered.obs = filtered.obs.copy()
         control_annotations = pd.DataFrame(
             {
                 "harmonized_context_key": kept_control_meta["harmonized_context_key"].to_numpy(),
