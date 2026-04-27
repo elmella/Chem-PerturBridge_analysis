@@ -3,6 +3,7 @@ set -euo pipefail
 
 UV_BIN="${UV_BIN:-uv}"
 UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
+PRECOMPUTE_SCRIPT="${PRECOMPUTE_SCRIPT:-scripts/precompute_replicate_signature_similarity.py}"
 QOS="${QOS:-cpu_normal}"
 PARTITION="${PARTITION:-cpu_p}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-4}"
@@ -36,6 +37,10 @@ START_STAGE="${START_STAGE:-1}"
 END_STAGE="${END_STAGE:-3}"
 TASK_ARRAY_SPEC="${TASK_ARRAY_SPEC:-}"
 RESHARD_TASKS="${RESHARD_TASKS:-0}"
+SKIP_EXISTING_DATASETS="${SKIP_EXISTING_DATASETS:-0}"
+EXISTING_RESULTS_DIR="${EXISTING_RESULTS_DIR:-${OUTPUT_DIR}}"
+ALLOW_SKIP_EXISTING_SAME_OUTPUT_DIR="${ALLOW_SKIP_EXISTING_SAME_OUTPUT_DIR:-0}"
+COMBINE_WITH_EXISTING_RESULTS="${COMBINE_WITH_EXISTING_RESULTS:-${SKIP_EXISTING_DATASETS}}"
 
 if [ "${QUICK_TEST_RUN}" = "1" ]; then
     TEST_ONE_LINE_PER_DATASET=1
@@ -61,6 +66,7 @@ TASK_CONFIG_FILE="${OUTPUT_DIR}/task_inputs/task_config.json"
 validate_reused_prepare_outputs() {
     env \
         TASK_CONFIG_FILE="${TASK_CONFIG_FILE}" \
+        PRECOMPUTE_SCRIPT="${PRECOMPUTE_SCRIPT}" \
         DATASETS="${DATASETS}" \
         MIN_REPLICATES_PER_CONDITION="${MIN_REPLICATES_PER_CONDITION}" \
         TEST_ONE_LINE_PER_DATASET="${TEST_ONE_LINE_PER_DATASET}" \
@@ -71,10 +77,28 @@ import json
 import os
 import pathlib
 import sys
+import ast
 
 config_path = pathlib.Path(os.environ["TASK_CONFIG_FILE"])
 if not config_path.exists():
     sys.exit(0)
+
+def current_default_datasets():
+    script_path = pathlib.Path(os.environ["PRECOMPUTE_SCRIPT"])
+    tree = ast.parse(script_path.read_text())
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "DEFAULT_SOURCE_DATASET_DIRS" for target in node.targets):
+            continue
+        if not isinstance(node.value, ast.Dict):
+            break
+        return [
+            key.value
+            for key in node.value.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        ]
+    raise RuntimeError(f"Could not read DEFAULT_SOURCE_DATASET_DIRS from {script_path}")
 
 config = json.loads(config_path.read_text())
 requested = {
@@ -84,7 +108,9 @@ requested = {
     "min_retrieval_compounds_per_line_time": int(os.environ["MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME"]),
 }
 datasets_arg = os.environ["DATASETS"].strip()
-if datasets_arg and datasets_arg.lower() != "all":
+if not datasets_arg or datasets_arg.lower() == "all":
+    requested["datasets"] = current_default_datasets()
+else:
     requested["datasets"] = [item.strip() for item in datasets_arg.split(",") if item.strip()]
 
 mismatches = []
@@ -126,6 +152,110 @@ config_path.write_text(json.dumps(config, indent=2))
 PY
 }
 
+resolve_missing_datasets() {
+    env \
+        PRECOMPUTE_SCRIPT="${PRECOMPUTE_SCRIPT}" \
+        DATASETS="${DATASETS}" \
+        EXISTING_RESULTS_DIR="${EXISTING_RESULTS_DIR}" \
+        python - <<'PY'
+import ast
+import csv
+import os
+import pathlib
+import sys
+
+def current_default_datasets(script_path: pathlib.Path):
+    tree = ast.parse(script_path.read_text())
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "DEFAULT_SOURCE_DATASET_DIRS" for target in node.targets):
+            continue
+        if not isinstance(node.value, ast.Dict):
+            break
+        return [
+            key.value
+            for key in node.value.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        ]
+    raise RuntimeError(f"Could not read DEFAULT_SOURCE_DATASET_DIRS from {script_path}")
+
+def requested_datasets(script_path: pathlib.Path):
+    defaults = current_default_datasets(script_path)
+    datasets_arg = os.environ["DATASETS"].strip()
+    if not datasets_arg or datasets_arg.lower() == "all":
+        return defaults
+
+    requested = [item.strip() for item in datasets_arg.split(",") if item.strip()]
+    unknown = [dataset_name for dataset_name in requested if dataset_name not in defaults]
+    if unknown:
+        raise ValueError(f"Unknown dataset names: {unknown}")
+    return requested
+
+def completed_datasets(results_dir: pathlib.Path):
+    condition_summary_path = results_dir / "condition_metric_summary.tsv"
+    if condition_summary_path.exists():
+        with condition_summary_path.open(newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            return {
+                str(row.get("dataset_name", "")).strip()
+                for row in reader
+                if str(row.get("dataset_name", "")).strip()
+            }
+
+    dataset_summary_path = results_dir / "dataset_metric_summary.tsv"
+    if dataset_summary_path.exists():
+        completed = set()
+        with dataset_summary_path.open(newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            for row in reader:
+                dataset_name = str(row.get("dataset_name", "")).strip()
+                if not dataset_name:
+                    continue
+                n_conditions_raw = str(row.get("n_conditions", "1")).strip()
+                try:
+                    n_conditions = float(n_conditions_raw)
+                except ValueError:
+                    n_conditions = 0.0
+                if n_conditions > 0:
+                    completed.add(dataset_name)
+        return completed
+
+    return set()
+
+script_path = pathlib.Path(os.environ["PRECOMPUTE_SCRIPT"])
+results_dir = pathlib.Path(os.environ["EXISTING_RESULTS_DIR"])
+requested = requested_datasets(script_path)
+completed = completed_datasets(results_dir)
+missing = [dataset_name for dataset_name in requested if dataset_name not in completed]
+
+print(",".join(missing))
+print(
+    f"> skip-existing reference: {results_dir} "
+    f"({len(completed)} completed, {len(missing)} missing from {len(requested)} requested)",
+    file=sys.stderr,
+)
+if completed:
+    print("> completed datasets: " + ", ".join(sorted(completed)), file=sys.stderr)
+if missing:
+    print("> datasets selected for this run: " + ", ".join(missing), file=sys.stderr)
+PY
+}
+
+same_output_dir_as_existing_results() {
+    env \
+        OUTPUT_DIR="${OUTPUT_DIR}" \
+        EXISTING_RESULTS_DIR="${EXISTING_RESULTS_DIR}" \
+        python - <<'PY'
+import os
+import pathlib
+
+output_dir = pathlib.Path(os.environ["OUTPUT_DIR"]).expanduser().resolve()
+existing_dir = pathlib.Path(os.environ["EXISTING_RESULTS_DIR"]).expanduser().resolve()
+print("1" if output_dir == existing_dir else "0")
+PY
+}
+
 if ! [[ "${START_STAGE}" =~ ^[123]$ ]]; then
     echo "> ERROR: START_STAGE must be 1, 2, or 3; got ${START_STAGE}"
     exit 1
@@ -139,7 +269,28 @@ if [ "${START_STAGE}" -gt "${END_STAGE}" ]; then
     exit 1
 fi
 
-PREP_CMD="UV_CACHE_DIR=${UV_CACHE_DIR} ${UV_BIN} run python scripts/precompute_replicate_signature_similarity.py prepare \
+if [ "${SKIP_EXISTING_DATASETS}" = "1" ]; then
+    if [ "$(same_output_dir_as_existing_results)" = "1" ] && [ "${ALLOW_SKIP_EXISTING_SAME_OUTPUT_DIR}" != "1" ]; then
+        echo "> ERROR: SKIP_EXISTING_DATASETS=1 needs a separate OUTPUT_DIR from EXISTING_RESULTS_DIR."
+        echo "> Missing-only runs rewrite task manifests and merged summaries, so using the same directory would replace combined outputs."
+        echo "> Example:"
+        echo "  SKIP_EXISTING_DATASETS=1 EXISTING_RESULTS_DIR=${EXISTING_RESULTS_DIR} OUTPUT_DIR=${OUTPUT_DIR}_missing ${0}"
+        echo "> To intentionally write missing-only outputs into the same directory, set ALLOW_SKIP_EXISTING_SAME_OUTPUT_DIR=1."
+        exit 1
+    fi
+
+    if ! RESOLVED_DATASETS=$(resolve_missing_datasets); then
+        echo "> ERROR: failed to resolve missing datasets from ${EXISTING_RESULTS_DIR}"
+        exit 1
+    fi
+    if [ -z "${RESOLVED_DATASETS}" ]; then
+        echo "> No missing datasets to run."
+        exit 0
+    fi
+    DATASETS="${RESOLVED_DATASETS}"
+fi
+
+PREP_CMD="UV_CACHE_DIR=${UV_CACHE_DIR} ${UV_BIN} run python ${PRECOMPUTE_SCRIPT} prepare \
     --output-dir ${OUTPUT_DIR} \
     --datasets ${DATASETS} \
     --top-k ${TOP_K} \
@@ -163,7 +314,7 @@ if [ "${COMPUTE_RETRIEVAL_METRICS}" = "1" ]; then
     PREP_CMD="${PREP_CMD} --compute-retrieval-metrics"
 fi
 
-RUN_TASK_CMD="UV_CACHE_DIR=${UV_CACHE_DIR} OMP_NUM_THREADS=${NUMPY_THREADS} OPENBLAS_NUM_THREADS=${NUMPY_THREADS} MKL_NUM_THREADS=${NUMPY_THREADS} NUMEXPR_NUM_THREADS=${NUMPY_THREADS} ${UV_BIN} run python scripts/precompute_replicate_signature_similarity.py run-task \
+RUN_TASK_CMD="UV_CACHE_DIR=${UV_CACHE_DIR} OMP_NUM_THREADS=${NUMPY_THREADS} OPENBLAS_NUM_THREADS=${NUMPY_THREADS} MKL_NUM_THREADS=${NUMPY_THREADS} NUMEXPR_NUM_THREADS=${NUMPY_THREADS} ${UV_BIN} run python ${PRECOMPUTE_SCRIPT} run-task \
     --output-dir ${OUTPUT_DIR} \
     --task-file ${TASK_FILE} \
     --task-id \${SLURM_ARRAY_TASK_ID} \
@@ -180,17 +331,20 @@ if [ "${COMPUTE_RETRIEVAL_METRICS}" = "1" ]; then
     RUN_TASK_CMD="${RUN_TASK_CMD} --compute-retrieval-metrics"
 fi
 
-RESHARD_CMD="UV_CACHE_DIR=${UV_CACHE_DIR} ${UV_BIN} run python scripts/precompute_replicate_signature_similarity.py reshard \
+RESHARD_CMD="UV_CACHE_DIR=${UV_CACHE_DIR} ${UV_BIN} run python ${PRECOMPUTE_SCRIPT} reshard \
     --output-dir ${OUTPUT_DIR} \
     --conditions-per-task ${CONDITIONS_PER_TASK}"
 
-MERGE_CMD="UV_CACHE_DIR=${UV_CACHE_DIR} ${UV_BIN} run python scripts/precompute_replicate_signature_similarity.py merge \
+MERGE_CMD="UV_CACHE_DIR=${UV_CACHE_DIR} ${UV_BIN} run python ${PRECOMPUTE_SCRIPT} merge \
     --output-dir ${OUTPUT_DIR} \
     --task-file ${TASK_FILE} \
     --task-output-dir ${TASK_OUTPUT_DIR} \
     --top-k ${TOP_K}"
 if [ "${STRICT_MISSING}" = "1" ]; then
     MERGE_CMD="${MERGE_CMD} --strict-missing"
+fi
+if [ "${COMBINE_WITH_EXISTING_RESULTS}" = "1" ]; then
+    MERGE_CMD="${MERGE_CMD} --existing-results-dir ${EXISTING_RESULTS_DIR}"
 fi
 
 if [ "${START_STAGE}" -le 1 ] && [ "${END_STAGE}" -ge 1 ]; then

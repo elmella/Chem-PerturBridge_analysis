@@ -21,10 +21,13 @@ DEFAULT_SOURCE_DATASET_DIRS = {
     "sciplex": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/sciplex/deg_data/sep_rep/full/qc_false/filter_min_cells_10/results"),
     "tahoe": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/tahoe/deg_data/sep_rep/full/qc_false/filter_min_cells_50/results"),
     "op3": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/op3/deg_data/sep_rep/full/qc_false/filter_min_cells_10/results"),
+    "cigs_mce": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/cigs_mce/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
     "novartis_batch_1000": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/novartis_batch_1000/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
     "vcpi_0001": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/vcpi_0001/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
+    "cigs_tcm": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/cigs_tcm/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
     "vcpi_0002": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/vcpi_0002/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
     "gdpx2": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/gdpx2/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
+    "dilimap_train_val": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/dilimap_train_val/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
     "l1000_phase1": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/l1000_phase1/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
     "l1000_phase2": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/l1000_phase2/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
 }
@@ -34,10 +37,13 @@ PRETTY_DATASET_LABELS = {
     "sciplex": "sci-Plex",
     "tahoe": "Tahoe-100M",
     "op3": "OP3",
+    "cigs_mce": "CIGS-MCE",
     "novartis_batch_1000": "Novartis DRUG-seq",
     "vcpi_0001": "VCPI-0001",
+    "cigs_tcm": "CIGS-TCM",
     "vcpi_0002": "VCPI-0002",
     "gdpx2": "GDPx2",
+    "dilimap_train_val": "DILImap",
     "l1000_phase1": "L1000 Phase I",
     "l1000_phase2": "L1000 Phase II",
 }
@@ -332,6 +338,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--strict-missing",
         action="store_true",
         help="Fail if any expected task output is missing.",
+    )
+    merge_parser.add_argument(
+        "--existing-results-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional previous output directory whose condition-level summaries should be "
+            "combined with the current task outputs before final summaries are rebuilt."
+        ),
     )
 
     return parser
@@ -3568,6 +3583,53 @@ def coerce_non_identifier_columns_to_numeric(frame: pd.DataFrame, identifier_col
     return coerced
 
 
+def combine_ordered_unique_names(*name_lists: Optional[list[str]]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for names in name_lists:
+        if names is None:
+            continue
+        for name in names:
+            name = str(name)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            result.append(name)
+    return result
+
+
+def read_dataset_names_from_selection_summary(results_dir: Path) -> Optional[list[str]]:
+    selection_summary_path = results_dir / "dataset_selection_summary.tsv"
+    if not selection_summary_path.exists():
+        return None
+    selection_summary = pd.read_csv(selection_summary_path, sep="\t", keep_default_na=False)
+    if "dataset_name" not in selection_summary.columns:
+        return None
+    return selection_summary["dataset_name"].astype(str).tolist()
+
+
+def drop_duplicate_condition_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    duplicate_key_options = [
+        ["dataset_name", "condition_key"],
+        ["dataset_name", "cell_type", "pubchem_cid", "time_key", "dose_key"],
+    ]
+    for key_columns in duplicate_key_options:
+        if all(column_name in frame.columns for column_name in key_columns):
+            return frame.drop_duplicates(subset=key_columns, keep="last").reset_index(drop=True)
+    return frame.reset_index(drop=True)
+
+
+def drop_duplicate_retrieval_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    duplicate_key_options = [
+        ["dataset_name", "representation", "condition_key"],
+        ["dataset_name", "cell_type", "time_key", "representation", "pubchem_cid", "dose_key"],
+    ]
+    for key_columns in duplicate_key_options:
+        if all(column_name in frame.columns for column_name in key_columns):
+            return frame.drop_duplicates(subset=key_columns, keep="last").reset_index(drop=True)
+    return frame.reset_index(drop=True)
+
+
 def merge_task_outputs(
     *,
     output_dir: Path,
@@ -3575,6 +3637,7 @@ def merge_task_outputs(
     task_output_dir_path: Optional[Path],
     top_k: int,
     strict_missing: bool,
+    existing_results_dir: Optional[Path] = None,
 ) -> None:
     manifest = load_task_manifest(task_file)
     task_output_dir_path = task_output_dir_path or task_output_dir(output_dir)
@@ -3585,17 +3648,43 @@ def merge_task_outputs(
     expect_baseline_metrics = bool(config.get("compute_baseline_metrics", False))
     expect_deg_metrics = bool(config.get("compute_deg_metrics", False))
     expect_retrieval_metrics = bool(config.get("compute_retrieval_metrics", False))
-    selection_summary_path = output_dir / "dataset_selection_summary.tsv"
-    all_dataset_names: Optional[list[str]] = None
-    if selection_summary_path.exists():
-        selection_summary = pd.read_csv(selection_summary_path, sep="\t", keep_default_na=False)
-        if "dataset_name" in selection_summary.columns:
-            all_dataset_names = selection_summary["dataset_name"].astype(str).tolist()
+    existing_results_dir = existing_results_dir.resolve() if existing_results_dir is not None else None
+    current_dataset_names = read_dataset_names_from_selection_summary(output_dir)
+    existing_dataset_names = (
+        read_dataset_names_from_selection_summary(existing_results_dir)
+        if existing_results_dir is not None
+        else None
+    )
+    all_dataset_names = combine_ordered_unique_names(existing_dataset_names, current_dataset_names) or None
 
     metric_frames: list[pd.DataFrame] = []
     error_frames: list[pd.DataFrame] = []
     retrieval_condition_frames: list[pd.DataFrame] = []
     missing_task_outputs: list[dict[str, object]] = []
+
+    if existing_results_dir is not None:
+        existing_condition_metric_path = existing_results_dir / "condition_metric_summary.tsv"
+        if not existing_condition_metric_path.exists():
+            raise FileNotFoundError(
+                f"Existing condition metric summary not found: {existing_condition_metric_path}"
+            )
+        existing_condition_metric = read_optional_tsv(existing_condition_metric_path)
+        if not existing_condition_metric.empty:
+            metric_frames.append(existing_condition_metric)
+            print(
+                "Loaded existing condition-level metric summary from "
+                f"{existing_condition_metric_path}"
+            )
+
+        existing_error_path = existing_results_dir / "condition_scoring_errors.tsv"
+        existing_errors = read_optional_tsv(existing_error_path)
+        if not existing_errors.empty:
+            error_frames.append(existing_errors)
+
+        existing_retrieval_path = existing_results_dir / "condition_retrieval_summary.tsv"
+        existing_retrieval = read_optional_tsv(existing_retrieval_path)
+        if not existing_retrieval.empty:
+            retrieval_condition_frames.append(existing_retrieval)
 
     for _, task_row in manifest.iterrows():
         task_id = int(task_row["task_id"])
@@ -3641,6 +3730,7 @@ def merge_task_outputs(
         raise ValueError("No task metric outputs were found to merge.")
 
     condition_metric_summary = pd.concat(metric_frames, ignore_index=True)
+    condition_metric_summary = drop_duplicate_condition_rows(condition_metric_summary)
     condition_metric_summary = coerce_non_identifier_columns_to_numeric(
         condition_metric_summary,
         identifier_columns={
@@ -3797,6 +3887,7 @@ def merge_task_outputs(
         )
     if retrieval_condition_frames:
         condition_retrieval_summary = pd.concat(retrieval_condition_frames, ignore_index=True)
+        condition_retrieval_summary = drop_duplicate_retrieval_rows(condition_retrieval_summary)
         condition_retrieval_summary = coerce_non_identifier_columns_to_numeric(
             condition_retrieval_summary,
             identifier_columns={
@@ -3882,6 +3973,7 @@ def run_all(args: argparse.Namespace) -> None:
         task_output_dir_path=prepare_result.task_output_dir,
         top_k=args.top_k,
         strict_missing=True,
+        existing_results_dir=None,
     )
 
 
@@ -3927,6 +4019,7 @@ def main() -> None:
             task_output_dir_path=args.task_output_dir,
             top_k=args.top_k,
             strict_missing=args.strict_missing,
+            existing_results_dir=args.existing_results_dir,
         )
         return
     run_all(args)
