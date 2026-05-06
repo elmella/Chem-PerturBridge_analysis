@@ -3,11 +3,45 @@
 Cross-dataset retrieval benchmark for perturbation-response signatures.
 
 ## Reproducibility
+### Environment
+
+The reproducible Python environment is defined by `pyproject.toml`,
+`uv.lock`, and `.python-version`. The checked-in lockfile recreates the
+environment currently activated with:
+
+```bash
+source .venv/bin/activate
+```
+
+from the repository root. The `.venv/` directory itself is intentionally not
+tracked.
+
+To create or refresh the environment:
+
+```bash
+uv sync --locked
+source .venv/bin/activate
+python --version  # Python 3.9.18
+```
+
+If Python 3.9.18 is not available locally, install or point `uv` at a 3.9.18
+interpreter first, then rerun `uv sync --locked`:
+
+```bash
+uv python install 3.9.18
+uv sync --locked
+```
+
+Most batch scripts in this repository call `uv run`, so they can also be
+launched without manually activating `.venv` as long as `uv sync --locked` has
+been run from the repository root.
+
+### Execution
 1. `scripts/build_dataset_summary.py` for table 1 content
 2. `scripts/overlap_filtered_h5ads.py` for getting pseudobulks of overlapping samples (excluding those overlapping only across l1000 phases as there are so many of these that they would dominate and differ from the other considered significantly)
 3. `notebooks/plot_overlap_heatmaps.ipynb` for cross-dataset overlap plots in fig1. In each dataset pair, we skip contexts that have less than 10 compounds shared between the two.
-4. `notebooks/overlap_group_rep_deg_metrics.ipynb` and `notebooks/overlap_group_rep_retrieval_metrics.ipynb` to plot cross-dataset agreement.
-5. `SKIP_EXISTING_DATASETS=1 EXISTING_RESULTS_DIR=./results/replicate_signature_similarity_sep_rep OUTPUT_DIR=./results/replicate_signature_similarity_sep_rep_combined COMPUTE_BASELINE_METRICS=1 COMPUTE_DEG_METRICS=1 scripts/slurm/run_replicate_signature_similarity.sh` and `notebooks/replicate_deg_metrics.ipynb` to compute the cross-replicate agreement.
+4. `notebooks/overlap_group_rep_deg_metrics.ipynb`, `notebooks/overlap_group_rep_signature_similarity.ipynb` and `notebooks/overlap_group_rep_retrieval_metrics.ipynb` to plot cross-dataset agreement.
+5. `SKIP_EXISTING_DATASETS=1 EXISTING_RESULTS_DIR=./results/replicate_signature_similarity_sep_rep OUTPUT_DIR=./results/replicate_signature_similarity_sep_rep_combined COMPUTE_BASELINE_METRICS=1 COMPUTE_DEG_METRICS=1 scripts/slurm/run_replicate_signature_similarity.sh`, `notebooks/replicate_signature_similarity.ipynb` and `notebooks/replicate_deg_metrics.ipynb` to compute the cross-replicate agreement.
 
 ## What Is Implemented
 
