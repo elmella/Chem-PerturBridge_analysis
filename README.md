@@ -37,146 +37,16 @@ launched without manually activating `.venv` as long as `uv sync --locked` has
 been run from the repository root.
 
 ### Execution
-Dataset scripts default to `data/processed`. Set `PERTURB_DATA_ROOT` to point at a different processed-data root.
-
-1. `scripts/build_dataset_summary.py` for table 1 content
-2. `scripts/overlap_filtered_h5ads.py` for getting pseudobulks of overlapping samples (excluding those overlapping only across l1000 phases as there are so many of these that they would dominate and differ from the other considered significantly)
-3. `notebooks/plot_overlap_heatmaps.ipynb` for cross-dataset overlap plots in fig1. In each dataset pair, we skip contexts that have less than 10 compounds shared between the two.
-4. `notebooks/overlap_group_rep_deg_metrics.ipynb`, `notebooks/overlap_group_rep_signature_similarity.ipynb` and `notebooks/overlap_group_rep_retrieval_metrics.ipynb` to plot cross-dataset agreement.
-5. `SKIP_EXISTING_DATASETS=1 EXISTING_RESULTS_DIR=./results/replicate_signature_similarity_sep_rep OUTPUT_DIR=./results/replicate_signature_similarity_sep_rep_combined COMPUTE_BASELINE_METRICS=1 COMPUTE_DEG_METRICS=1 scripts/slurm/run_replicate_signature_similarity.sh`, `notebooks/replicate_signature_similarity.ipynb` and `notebooks/replicate_deg_metrics.ipynb` to compute the cross-replicate agreement.
-
-## What Is Implemented
-
-- Dataset loading for `sciplex`, `tahoe`, `l1000_phase1`, `l1000_phase2` using paths derived from `PERTURB_DATA_ROOT`.
-- Per-cell-type retrieval with gene-overlap alignment for each query/db cell-type pair.
-- Global ranking against all db cell types (including non-matching cell types) for each query sample.
-- Ground-truth matching based on exact `cell_type` + `pubchem_cid`, with nearest `pert_time_h` and nearest `log(pert_dose_uM)` (falling back to linear dose distance for non-positive doses).
-- Layer-wise scoring over all shared layers except:
-  - `CI.L`, `CI.R`, `stdev.scaled`, `stdev.unscaled`, `AveExpr`
-  - `adj.P.Value.across_all_contrasts`, `adj.P.Value.within_one_contrast`
-- Additional derived representations:
-  - `-log10(p) * sign(logFC)`
-  - `sign(logFC) * Phi^-1(1 - p/2)`
-- Similarity/distance metrics:
-  - `cosine`, `pearson`, `spearman`, `mrrmse`
-- Rank normalization to `[0, 1]`:
-  - `rank_normalized` (0 is best)
-  - `retrieval_score` (1 is best)
-
-## Run
+Dataset scripts default to `data/processed`. Set `PERTURB_DATA_ROOT` to point at a different processed-data root:
 
 ```bash
-python -m chem_perturbridge_analysis.retrieval.cli --verbose
+export PERTURB_DATA_ROOT=/path/to/processed_data
 ```
 
-Outputs are written to:
+Typical analysis order:
 
-- `results/cross_dataset_retrieval_detail.csv`
-- `results/cross_dataset_retrieval_summary_by_cell_type.csv`
-- `results/cross_dataset_retrieval_summary_overall.csv`
-
-Verbose mode now logs progress at pair, cell-type, and representation levels (including elapsed time and rows produced).
-
-## Useful Options
-
-```bash
-python -m chem_perturbridge_analysis.retrieval.cli \
-  --query-datasets sciplex,tahoe \
-  --db-datasets l1000_phase1,l1000_phase2 \
-  --cell-types CVCL_0002,CVCL_0063 \
-  --representations logFC,P.Value,signed,z \
-  --metrics cosine,mrrmse \
-  --skip-representations P.Value \
-  --output-prefix my_run \
-  --verbose
-```
-
-Limit compute for faster runs:
-
-```bash
-python -m chem_perturbridge_analysis.retrieval.cli \
-  --representations logFC,signed \
-  --metrics cosine
-```
-
-Override data paths:
-
-```bash
-python -m chem_perturbridge_analysis.retrieval.cli \
-  --dataset-path sciplex=/my/sciplex/results \
-  --dataset-path l1000_phase1=/my/l1000_phase1/results
-```
-
-## Visualization
-
-Use `notebooks/visualize_retrieval_results.ipynb` to visualize retrieval outputs (`*_detail.csv`, `*_summary_by_cell_type.csv`, `*_summary_overall.csv`) for any run prefix (default in notebook: `my_run_fast`).
-
-## Parallel Slurm Workflow
-
-For large runs, use the parallel pipeline:
-
-1. Precompute true cell line-drug matches and generate task matrix (`pair x representation`).
-2. Run one task per row of the matrix (ideal for Slurm array jobs).
-3. Merge all task outputs into the final CSVs.
-
-Precompute now also writes one AnnData per dataset pair with matches:
-
-- `results/<run_dir>/<prefix>_pair_matches/<dataset_a>__<dataset_b>_matches.h5ad`
-- each file contains matched samples from both datasets on shared genes and includes
-  directional obs columns `<dataset_a>_<dataset_b>_match_id` and `<dataset_b>_<dataset_a>_match_id`.
-
-### Python CLI Stages
-
-```bash
-# Stage 1: precompute truth matches + task matrix
-python -m chem_perturbridge_analysis.retrieval.parallel_cli precompute \
-  --output-dir results/full \
-  --output-prefix my_run_fast \
-  --query-datasets all \
-  --db-datasets all \
-  --representations all \
-  --verbose
-
-# Stage 2: run one task (task_id usually from Slurm array index)
-python -m chem_perturbridge_analysis.retrieval.parallel_cli run-task \
-  --task-file results/full/my_run_fast_tasks.csv \
-  --task-id 1 \
-  --output-dir results/full/tasks \
-  --output-prefix my_run_fast \
-  --metrics all \
-  --verbose
-
-# Stage 3: merge all task outputs
-python -m chem_perturbridge_analysis.retrieval.parallel_cli merge \
-  --task-file results/full/my_run_fast_tasks.csv \
-  --task-output-dir results/full/tasks \
-  --output-dir results/full \
-  --output-prefix my_run_fast \
-  --verbose
-```
-
-### Slurm Launcher
-
-`scripts/slurm/run_retrieval_parallel.sh` orchestrates all three stages with `sbatch -W` and an array for stage 2.
-
-Example:
-
-```bash
-QOS=your_qos \
-PARTITION=your_partition \
-UV_BIN=uv \
-OUTPUT_PREFIX=my_run_fast \
-bash scripts/slurm/run_retrieval_parallel.sh
-```
-
-Useful environment variables:
-
-- `QUERY_DATASETS`, `DB_DATASETS` (comma-separated names or `all`)
-- `REPRESENTATIONS`, `SKIP_REPRESENTATIONS`
-- `METRICS`
-- `CELL_TYPES`
-- `QOS`, `PARTITION` if required by your Slurm cluster
-- `INCLUDE_SELF_DATASET` (`0`/`1`)
-- `UV_BIN` (default: `uv`)
-- `DATASET_PATH_ARGS` (e.g. `--dataset-path sciplex=/path --dataset-path tahoe=/path`)
-- `TASK_MEM`, `PREP_MEM`, `MERGE_MEM` (defaults set to `200G`)
+1. `scripts/build_dataset_summary.py` builds the dataset summary table.
+2. `scripts/build_overlap_filtered_h5ads.py` creates overlap-filtered grouped-replicate `.h5ad` files.
+3. `notebooks/plot_overlap_heatmaps.ipynb` plots cross-dataset overlap summaries.
+4. `notebooks/overlap_group_rep_signature_similarity.ipynb`, `notebooks/overlap_group_rep_deg_metrics.ipynb`, and `notebooks/overlap_group_rep_retrieval_metrics.ipynb` analyze cross-dataset agreement.
+5. `scripts/slurm/run_replicate_signature_similarity.sh`, `notebooks/replicate_signature_similarity.ipynb`, and `notebooks/replicate_deg_metrics.ipynb` analyze cross-replicate agreement.
