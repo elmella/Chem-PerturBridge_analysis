@@ -37,6 +37,8 @@ launched without manually activating `.venv` as long as `uv sync --locked` has
 been run from the repository root.
 
 ### Execution
+Dataset scripts default to `data/processed`. Set `PERTURB_DATA_ROOT` to point at a different processed-data root.
+
 1. `scripts/build_dataset_summary.py` for table 1 content
 2. `scripts/overlap_filtered_h5ads.py` for getting pseudobulks of overlapping samples (excluding those overlapping only across l1000 phases as there are so many of these that they would dominate and differ from the other considered significantly)
 3. `notebooks/plot_overlap_heatmaps.ipynb` for cross-dataset overlap plots in fig1. In each dataset pair, we skip contexts that have less than 10 compounds shared between the two.
@@ -45,7 +47,7 @@ been run from the repository root.
 
 ## What Is Implemented
 
-- Dataset loading for `sciplex`, `tahoe`, `l1000_phase1`, `l1000_phase2` using paths from `notebooks/load_data.ipynb`.
+- Dataset loading for `sciplex`, `tahoe`, `l1000_phase1`, `l1000_phase2` using paths derived from `PERTURB_DATA_ROOT`.
 - Per-cell-type retrieval with gene-overlap alignment for each query/db cell-type pair.
 - Global ranking against all db cell types (including non-matching cell types) for each query sample.
 - Ground-truth matching based on exact `cell_type` + `pubchem_cid`, with nearest `pert_time_h` and nearest `log(pert_dose_uM)` (falling back to linear dose distance for non-positive doses).
@@ -160,8 +162,8 @@ python -m chem_perturbridge_analysis.retrieval.parallel_cli merge \
 Example:
 
 ```bash
-QOS=cpu_normal \
-PARTITION=cpu_p \
+QOS=your_qos \
+PARTITION=your_partition \
 UV_BIN=uv \
 OUTPUT_PREFIX=my_run_fast \
 bash scripts/slurm/run_retrieval_parallel.sh
@@ -173,6 +175,7 @@ Useful environment variables:
 - `REPRESENTATIONS`, `SKIP_REPRESENTATIONS`
 - `METRICS`
 - `CELL_TYPES`
+- `QOS`, `PARTITION` if required by your Slurm cluster
 - `INCLUDE_SELF_DATASET` (`0`/`1`)
 - `UV_BIN` (default: `uv`)
 - `DATASET_PATH_ARGS` (e.g. `--dataset-path sciplex=/path --dataset-path tahoe=/path`)

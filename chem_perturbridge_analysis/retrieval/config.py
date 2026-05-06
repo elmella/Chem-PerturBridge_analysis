@@ -1,33 +1,37 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Mapping
 
+DATA_ROOT = Path(os.environ.get("PERTURB_DATA_ROOT", "data/processed"))
+
+
+def _group_rep_results(dataset_name: str, min_cells: int) -> Path:
+    return (
+        DATA_ROOT
+        / dataset_name
+        / "deg_data"
+        / "group_rep"
+        / "full"
+        / "qc_false"
+        / f"filter_min_cells_{min_cells}"
+        / "results"
+    )
+
+
 DEFAULT_DATASET_PATHS: dict[str, Path] = {
-    # Mirrors paths used in notebooks/load_data.ipynb
-    "sciplex": Path(
-        "/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/sciplex/deg_data/group_rep/full/qc_false/filter_min_cells_10/results"
-    ),
-    "tahoe": Path(
-        "/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/tahoe/deg_data/group_rep/full/qc_false/filter_min_cells_50/results"
-    ),
-    "l1000_phase1": Path(
-        "/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/l1000_phase1/deg_data/group_rep/full/qc_false/filter_min_cells_0/results"
-    ),
-    "l1000_phase2": Path(
-        "/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/l1000_phase2/deg_data/group_rep/full/qc_false/filter_min_cells_0/results"
-    ),
+    "sciplex": _group_rep_results("sciplex", 10),
+    "tahoe": _group_rep_results("tahoe", 50),
+    "l1000_phase1": _group_rep_results("l1000_phase1", 0),
+    "l1000_phase2": _group_rep_results("l1000_phase2", 0),
 }
 
 # Optional fallback paths for merged h5ad files.
 FALLBACK_DATASET_PATHS: dict[str, Path] = {
-    "l1000_phase1": Path(
-        "/lustre/groups/ml01/workspace/artur.szalata/data_updated/l1000_phase1/deg_data/group_rep/full/qc_false/filter_min_cells_0/l1000_phase1.h5ad"
-    ),
-    "l1000_phase2": Path(
-        "/lustre/groups/ml01/workspace/artur.szalata/data_updated/l1000_phase2/deg_data/group_rep/full/qc_false/filter_min_cells_0/l1000_phase2.h5ad"
-    ),
+    "l1000_phase1": _group_rep_results("l1000_phase1", 0).parent / "l1000_phase1.h5ad",
+    "l1000_phase2": _group_rep_results("l1000_phase2", 0).parent / "l1000_phase2.h5ad",
 }
 
 

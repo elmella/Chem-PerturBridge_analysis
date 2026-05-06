@@ -12,8 +12,8 @@ else
 fi
 
 UV_BIN="${UV_BIN:-uv}"
-QOS="${QOS:-cpu_normal}"
-PARTITION="${PARTITION:-cpu_p}"
+QOS="${QOS:-}"
+PARTITION="${PARTITION:-}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-2}"
 NUMPY_THREADS="${NUMPY_THREADS:-${CPUS_PER_TASK}}"
 
@@ -41,6 +41,14 @@ TASK_MEM="${TASK_MEM:-100G}"
 MERGE_MEM="${MERGE_MEM:-200G}"
 
 mkdir -p "${OUTPUT_DIR}" "${TASK_OUTPUT_DIR}" "${LOGS_DIR}"
+
+SBATCH_CLUSTER_ARGS=()
+if [ -n "${QOS}" ]; then
+    SBATCH_CLUSTER_ARGS+=(--qos="${QOS}")
+fi
+if [ -n "${PARTITION}" ]; then
+    SBATCH_CLUSTER_ARGS+=(--partition="${PARTITION}")
+fi
 
 TASK_FILE="${OUTPUT_DIR}/${OUTPUT_PREFIX}_tasks.csv"
 
@@ -95,8 +103,7 @@ echo "> Stage 1/3: Precompute true matches and task matrix"
 sbatch -W -J retrieval_precompute \
     -t "${PREP_TIME}" \
     -n 1 \
-    --qos="${QOS}" \
-    --partition="${PARTITION}" \
+    "${SBATCH_CLUSTER_ARGS[@]}" \
     --cpus-per-task="${CPUS_PER_TASK}" \
     --mem="${PREP_MEM}" \
     -e "${LOGS_DIR}/retrieval_precompute.%j.err" \
@@ -118,8 +125,7 @@ sbatch -W -J retrieval_task \
     -t "${TASK_TIME}" \
     -n 1 \
     --array=1-"${N_TASKS}" \
-    --qos="${QOS}" \
-    --partition="${PARTITION}" \
+    "${SBATCH_CLUSTER_ARGS[@]}" \
     --cpus-per-task="${CPUS_PER_TASK}" \
     --mem="${TASK_MEM}" \
     -e "${LOGS_DIR}/retrieval_task.%A_%a.err" \
@@ -130,8 +136,7 @@ echo "> Stage 3/3: Merge task outputs"
 sbatch -W -J retrieval_merge \
     -t "${MERGE_TIME}" \
     -n 1 \
-    --qos="${QOS}" \
-    --partition="${PARTITION}" \
+    "${SBATCH_CLUSTER_ARGS[@]}" \
     --cpus-per-task="${CPUS_PER_TASK}" \
     --mem="${MERGE_MEM}" \
     -e "${LOGS_DIR}/retrieval_merge.%j.err" \

@@ -4,8 +4,8 @@ set -euo pipefail
 UV_BIN="${UV_BIN:-uv}"
 UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
 PRECOMPUTE_SCRIPT="${PRECOMPUTE_SCRIPT:-scripts/precompute_replicate_signature_similarity.py}"
-QOS="${QOS:-cpu_normal}"
-PARTITION="${PARTITION:-cpu_p}"
+QOS="${QOS:-}"
+PARTITION="${PARTITION:-}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-4}"
 NUMPY_THREADS="${NUMPY_THREADS:-${CPUS_PER_TASK}}"
 
@@ -59,6 +59,14 @@ if [ "${QUICK_TEST_RUN}" = "1" ]; then
 fi
 
 mkdir -p "${OUTPUT_DIR}" "${TASK_OUTPUT_DIR}" "${LOGS_DIR}" "${UV_CACHE_DIR}"
+
+SBATCH_CLUSTER_ARGS=()
+if [ -n "${QOS}" ]; then
+    SBATCH_CLUSTER_ARGS+=(--qos="${QOS}")
+fi
+if [ -n "${PARTITION}" ]; then
+    SBATCH_CLUSTER_ARGS+=(--partition="${PARTITION}")
+fi
 
 TASK_FILE="${OUTPUT_DIR}/task_manifest.tsv"
 TASK_CONFIG_FILE="${OUTPUT_DIR}/task_inputs/task_config.json"
@@ -370,8 +378,7 @@ if [ "${START_STAGE}" -le 1 ] && [ "${END_STAGE}" -ge 1 ]; then
     sbatch -W -J replicate_similarity_prepare \
         -t "${PREP_TIME}" \
         -n 1 \
-        --qos="${QOS}" \
-        --partition="${PARTITION}" \
+        "${SBATCH_CLUSTER_ARGS[@]}" \
         --cpus-per-task="${CPUS_PER_TASK}" \
         --mem="${PREP_MEM}" \
         -e "${LOGS_DIR}/replicate_similarity_prepare.%j.err" \
@@ -434,8 +441,7 @@ if [ "${START_STAGE}" -le 2 ] && [ "${END_STAGE}" -ge 2 ]; then
         -t "${TASK_TIME}" \
         -n 1 \
         --array="${ARRAY_SPEC}" \
-        --qos="${QOS}" \
-        --partition="${PARTITION}" \
+        "${SBATCH_CLUSTER_ARGS[@]}" \
         --cpus-per-task="${CPUS_PER_TASK}" \
         --mem="${TASK_MEM}" \
         -e "${LOGS_DIR}/replicate_similarity_task.%A_%a.err" \
@@ -450,8 +456,7 @@ if [ "${START_STAGE}" -le 3 ] && [ "${END_STAGE}" -ge 3 ]; then
     sbatch -W -J replicate_similarity_merge \
         -t "${MERGE_TIME}" \
         -n 1 \
-        --qos="${QOS}" \
-        --partition="${PARTITION}" \
+        "${SBATCH_CLUSTER_ARGS[@]}" \
         --cpus-per-task="${CPUS_PER_TASK}" \
         --mem="${MERGE_MEM}" \
         -e "${LOGS_DIR}/replicate_similarity_merge.%j.err" \

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 
-DATA_ROOT = Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated")
+DATA_ROOT = Path(os.environ.get("PERTURB_DATA_ROOT", "data/processed"))
 DATASET_ORDER = [
     "l1000_phase1",
     "l1000_phase2",

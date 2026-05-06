@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import warnings
 from collections import defaultdict
@@ -17,21 +18,37 @@ import pandas as pd
 from scipy import stats
 
 
+DATA_ROOT = Path(os.environ.get("PERTURB_DATA_ROOT", "data/processed"))
+
+
+def _sep_rep_results(dataset_name: str, min_cells: int) -> Path:
+    return (
+        DATA_ROOT
+        / dataset_name
+        / "deg_data"
+        / "sep_rep"
+        / "full"
+        / "qc_false"
+        / f"filter_min_cells_{min_cells}"
+        / "results"
+    )
+
+
 DEFAULT_SOURCE_DATASET_DIRS = {
-    "sciplex": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/sciplex/deg_data/sep_rep/full/qc_false/filter_min_cells_10/results"),
-    "tahoe": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/tahoe/deg_data/sep_rep/full/qc_false/filter_min_cells_50/results"),
-    "op3": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/op3/deg_data/sep_rep/full/qc_false/filter_min_cells_10/results"),
-    "cigs_mce": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/cigs_mce/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "novartis_batch_1000": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/novartis_batch_1000/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "vcpi_0001": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/vcpi_0001/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "cigs_tcm": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/cigs_tcm/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "vcpi_0002": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/vcpi_0002/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "gdpx2": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/gdpx2/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "dilimap_train_val": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/dilimap_train_val/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "l1000_phase1": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/l1000_phase1/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "l1000_phase2": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/l1000_phase2/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
+    "sciplex": _sep_rep_results("sciplex", 10),
+    "tahoe": _sep_rep_results("tahoe", 50),
+    "op3": _sep_rep_results("op3", 10),
+    "cigs_mce": _sep_rep_results("cigs_mce", 0),
+    "novartis_batch_1000": _sep_rep_results("novartis_batch_1000", 0),
+    "vcpi_0001": _sep_rep_results("vcpi_0001", 0),
+    "cigs_tcm": _sep_rep_results("cigs_tcm", 0),
+    "vcpi_0002": _sep_rep_results("vcpi_0002", 0),
+    "gdpx2": _sep_rep_results("gdpx2", 0),
+    "dilimap_train_val": _sep_rep_results("dilimap_train_val", 0),
+    "l1000_phase1": _sep_rep_results("l1000_phase1", 0),
+    "l1000_phase2": _sep_rep_results("l1000_phase2", 0),
 }
-DEFAULT_PROCESSED_DATA_ROOT = Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated")
+DEFAULT_PROCESSED_DATA_ROOT = DATA_ROOT
 L1000_DATASETS = {"l1000_phase1", "l1000_phase2"}
 PRETTY_DATASET_LABELS = {
     "sciplex": "sci-Plex",
