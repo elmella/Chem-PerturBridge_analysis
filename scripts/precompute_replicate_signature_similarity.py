@@ -29,25 +29,58 @@ from peer_baselines import (
 )
 
 
-SOURCE_DATA_ROOT = Path(
-    os.environ.get(
-        "CPB_SOURCE_DATA_ROOT",
-        "/lustre/groups/ml01/workspace/olga.novitskaia/data_updated",
+REPO_ROOT = SCRIPT_DIR.parent
+CLUSTER_DATA_ROOT = Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated")
+REPO_DATA_ROOT = REPO_ROOT / "data" / "theislab_temp"
+
+
+def _default_source_data_root() -> Path:
+    """Prefer an explicit override, then the in-repo data directory, then the cluster path."""
+    override = os.environ.get("CPB_SOURCE_DATA_ROOT", "").strip()
+    if override:
+        return Path(override)
+    if REPO_DATA_ROOT.is_dir():
+        return REPO_DATA_ROOT
+    return CLUSTER_DATA_ROOT
+
+
+SOURCE_DATA_ROOT = _default_source_data_root()
+
+
+def sep_rep_dataset_dir(dataset_name: str, filter_min_cells: int) -> Path:
+    """Resolve a dataset's separate-replicate DEG directory across both known layouts.
+
+    The published release stages files flat, as `<dataset>/sep_rep/`; the cluster keeps the
+    full pipeline path. Prefer whichever exists so the same code runs in both places, and
+    fall back to the cluster shape when neither is present, which keeps the error message
+    pointing at the canonical location.
+    """
+    flat = SOURCE_DATA_ROOT / dataset_name / "sep_rep"
+    if flat.is_dir():
+        return flat
+    return (
+        SOURCE_DATA_ROOT
+        / dataset_name
+        / "deg_data"
+        / "sep_rep"
+        / "full"
+        / "qc_false"
+        / f"filter_min_cells_{int(filter_min_cells)}"
+        / "results"
     )
-)
 DEFAULT_SOURCE_DATASET_DIRS = {
-    "sciplex": SOURCE_DATA_ROOT / "sciplex/deg_data/sep_rep/full/qc_false/filter_min_cells_10/results",
-    "tahoe": SOURCE_DATA_ROOT / "tahoe/deg_data/sep_rep/full/qc_false/filter_min_cells_50/results",
-    "op3": SOURCE_DATA_ROOT / "op3/deg_data/sep_rep/full/qc_false/filter_min_cells_10/results",
-    "cigs_mce": SOURCE_DATA_ROOT / "cigs_mce/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
-    "novartis_batch_1000": SOURCE_DATA_ROOT / "novartis_batch_1000/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
-    "vcpi_0001": SOURCE_DATA_ROOT / "vcpi_0001/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
-    "cigs_tcm": SOURCE_DATA_ROOT / "cigs_tcm/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
-    "vcpi_0002": SOURCE_DATA_ROOT / "vcpi_0002/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
-    "gdpx2": SOURCE_DATA_ROOT / "gdpx2/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
-    "dilimap_train_val": SOURCE_DATA_ROOT / "dilimap_train_val/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
-    "l1000_phase1": SOURCE_DATA_ROOT / "l1000_phase1/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
-    "l1000_phase2": SOURCE_DATA_ROOT / "l1000_phase2/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
+    "sciplex": sep_rep_dataset_dir("sciplex", 10),
+    "tahoe": sep_rep_dataset_dir("tahoe", 50),
+    "op3": sep_rep_dataset_dir("op3", 10),
+    "cigs_mce": sep_rep_dataset_dir("cigs_mce", 0),
+    "novartis_batch_1000": sep_rep_dataset_dir("novartis_batch_1000", 0),
+    "vcpi_0001": sep_rep_dataset_dir("vcpi_0001", 0),
+    "cigs_tcm": sep_rep_dataset_dir("cigs_tcm", 0),
+    "vcpi_0002": sep_rep_dataset_dir("vcpi_0002", 0),
+    "gdpx2": sep_rep_dataset_dir("gdpx2", 0),
+    "dilimap_train_val": sep_rep_dataset_dir("dilimap_train_val", 0),
+    "l1000_phase1": sep_rep_dataset_dir("l1000_phase1", 0),
+    "l1000_phase2": sep_rep_dataset_dir("l1000_phase2", 0),
 }
 DEFAULT_PROCESSED_DATA_ROOT = Path(
     os.environ.get("CPB_PROCESSED_DATA_ROOT", str(SOURCE_DATA_ROOT))
