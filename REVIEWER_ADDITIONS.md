@@ -86,6 +86,38 @@ package is reserved for the parallel retrieval CLI.
 
 Outputs land in `results/<analysis>/` and are **not** tracked by git.
 
+### Resumability
+
+Every notebook below is restartable. Each expensive stage goes through `cached_frame` in
+`scripts/notebook_cache.py`: if the stage's output TSV already exists it is reloaded
+instead of recomputed, so a crash late in a notebook no longer means redoing the scoring
+above it. Cheap aggregations are left alone, since they derive from the cached frames in
+seconds. Each notebook ends with `display(cache_summary())`, showing which stages were
+reloaded and which ran.
+
+| Notebook | Stages |
+|---|---|
+| `overlap_group_rep_deg_metrics_reviewer_additions` | `matched_pairs`, `deg_metrics`, `deg_ci`, `dose_ci`, `peer_baselines`, `peer_ci` |
+| `overlap_group_rep_signature_similarity` | `matched_pairs`, `signature_metrics`, `signature_ci`, `peer_baselines`, `peer_ci` |
+| `overlap_group_rep_retrieval_metrics_spearman_addendum` | `matched_pairs`, `retrieval_ablation`, `ablation_ci`, `null_calibration`, `null_ci` |
+| `replicate_deg_metrics` | `replicate_deg_ci` |
+| `replicate_signature_similarity` | `replicate_signature_ci` |
+
+To rebuild a stage, delete its TSV or name it:
+
+```python
+force_recompute("peer_baselines")     # in a cell, before that stage runs
+```
+
+```bash
+CPB_FORCE_RECOMPUTE=peer_baselines,peer_ci jupyter lab    # or from the shell
+CPB_FORCE_RECOMPUTE=all jupyter lab                       # ignore every cache
+```
+
+Note that changing `DATASET_ORDER` invalidates the upstream caches: `matched_pairs` and the
+metric tables were built for the previous dataset set, so force those stages (or delete
+their TSVs) when switching, otherwise later stages score against a stale match table.
+
 ```bash
 uv sync --locked
 source .venv/bin/activate
