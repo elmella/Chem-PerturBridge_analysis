@@ -212,3 +212,6 @@ results/
 .DS_Store
 .vscode
 .codex
+# Reviewer-response working material and scoped notebook re-runs
+tmp/
+notebooks/archive/
