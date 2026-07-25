@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import warnings
 from collections import defaultdict
@@ -28,21 +29,29 @@ from peer_baselines import (
 )
 
 
+SOURCE_DATA_ROOT = Path(
+    os.environ.get(
+        "CPB_SOURCE_DATA_ROOT",
+        "/lustre/groups/ml01/workspace/olga.novitskaia/data_updated",
+    )
+)
 DEFAULT_SOURCE_DATASET_DIRS = {
-    "sciplex": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/sciplex/deg_data/sep_rep/full/qc_false/filter_min_cells_10/results"),
-    "tahoe": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/tahoe/deg_data/sep_rep/full/qc_false/filter_min_cells_50/results"),
-    "op3": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/op3/deg_data/sep_rep/full/qc_false/filter_min_cells_10/results"),
-    "cigs_mce": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/cigs_mce/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "novartis_batch_1000": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/novartis_batch_1000/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "vcpi_0001": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/vcpi_0001/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "cigs_tcm": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/cigs_tcm/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "vcpi_0002": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/vcpi_0002/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "gdpx2": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/gdpx2/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "dilimap_train_val": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/dilimap_train_val/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "l1000_phase1": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/l1000_phase1/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
-    "l1000_phase2": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/l1000_phase2/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results"),
+    "sciplex": SOURCE_DATA_ROOT / "sciplex/deg_data/sep_rep/full/qc_false/filter_min_cells_10/results",
+    "tahoe": SOURCE_DATA_ROOT / "tahoe/deg_data/sep_rep/full/qc_false/filter_min_cells_50/results",
+    "op3": SOURCE_DATA_ROOT / "op3/deg_data/sep_rep/full/qc_false/filter_min_cells_10/results",
+    "cigs_mce": SOURCE_DATA_ROOT / "cigs_mce/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
+    "novartis_batch_1000": SOURCE_DATA_ROOT / "novartis_batch_1000/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
+    "vcpi_0001": SOURCE_DATA_ROOT / "vcpi_0001/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
+    "cigs_tcm": SOURCE_DATA_ROOT / "cigs_tcm/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
+    "vcpi_0002": SOURCE_DATA_ROOT / "vcpi_0002/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
+    "gdpx2": SOURCE_DATA_ROOT / "gdpx2/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
+    "dilimap_train_val": SOURCE_DATA_ROOT / "dilimap_train_val/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
+    "l1000_phase1": SOURCE_DATA_ROOT / "l1000_phase1/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
+    "l1000_phase2": SOURCE_DATA_ROOT / "l1000_phase2/deg_data/sep_rep/full/qc_false/filter_min_cells_0/results",
 }
-DEFAULT_PROCESSED_DATA_ROOT = Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated")
+DEFAULT_PROCESSED_DATA_ROOT = Path(
+    os.environ.get("CPB_PROCESSED_DATA_ROOT", str(SOURCE_DATA_ROOT))
+)
 L1000_DATASETS = {"l1000_phase1", "l1000_phase2"}
 PRETTY_DATASET_LABELS = {
     "sciplex": "sci-Plex",
