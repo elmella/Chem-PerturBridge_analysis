@@ -32,6 +32,7 @@ COMPUTE_BASELINE_METRICS="${COMPUTE_BASELINE_METRICS:-0}"
 COMPUTE_DEG_METRICS="${COMPUTE_DEG_METRICS:-0}"
 COMPUTE_RETRIEVAL_METRICS="${COMPUTE_RETRIEVAL_METRICS:-0}"
 MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME="${MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME:-10}"
+MAX_BASELINE_PEERS="${MAX_BASELINE_PEERS:-}"
 QUICK_TEST_RUN="${QUICK_TEST_RUN:-0}"
 START_STAGE="${START_STAGE:-1}"
 END_STAGE="${END_STAGE:-3}"
@@ -330,6 +331,12 @@ fi
 if [ "${COMPUTE_RETRIEVAL_METRICS}" = "1" ]; then
     RUN_TASK_CMD="${RUN_TASK_CMD} --compute-retrieval-metrics"
 fi
+# Caps how many same line / time / dose other-drug peers are scored individually for the
+# per-peer baselines. Unset scores every peer; the scoring stage records both the total
+# and scored peer counts either way. Only the scoring stage needs this.
+if [ -n "${MAX_BASELINE_PEERS}" ]; then
+    RUN_TASK_CMD="${RUN_TASK_CMD} --max-baseline-peers ${MAX_BASELINE_PEERS}"
+fi
 
 RESHARD_CMD="UV_CACHE_DIR=${UV_CACHE_DIR} ${UV_BIN} run python ${PRECOMPUTE_SCRIPT} reshard \
     --output-dir ${OUTPUT_DIR} \
@@ -360,6 +367,12 @@ if [ "${START_STAGE}" -le 1 ] && [ "${END_STAGE}" -ge 1 ]; then
     fi
     if [ "${COMPUTE_BASELINE_METRICS}" = "1" ]; then
         echo "  baseline metrics: enabled"
+    fi
+
+    if [ -n "${MAX_BASELINE_PEERS}" ]; then
+        echo "  per-peer baseline cap: ${MAX_BASELINE_PEERS} peers per condition"
+    else
+        echo "  per-peer baseline cap: none (every peer scored)"
     fi
     if [ "${COMPUTE_DEG_METRICS}" = "1" ]; then
         echo "  DEG metrics: enabled"
