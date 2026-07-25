@@ -16,6 +16,17 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from peer_baselines import (
+    direction_agreement_against_peers,
+    select_peer_indices,
+    spearman_against_peers,
+    summarize_peer_scores,
+)
+
 
 DEFAULT_SOURCE_DATASET_DIRS = {
     "sciplex": Path("/lustre/groups/ml01/workspace/olga.novitskaia/data_updated/sciplex/deg_data/sep_rep/full/qc_false/filter_min_cells_10/results"),
@@ -51,6 +62,14 @@ DEG_P_THRESHOLD = 0.05
 DEG_ABS_LOGFC_THRESHOLD = 0.2
 DE_OVERLAP_K_VALUES = (50, 100, 200)
 DEFAULT_MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME = 10
+# Per-peer ("single-signature") baselines score every same-context different-compound peer
+# separately instead of averaging them into a centroid first. Replicate peer sets can hold
+# thousands of rows, so --max-baseline-peers caps how many are scored; the cap is applied
+# by select_peer_indices with a deterministic per-condition seed, and both the total and
+# scored peer counts are recorded so a capped run is never mistaken for a full one.
+MAX_BASELINE_PEERS: Optional[int] = None
+# Tables 7 and 8 report the adj.P.Value < 0.05 DEG-restricted metrics.
+PEER_BASELINE_DEG_METRICS = ("deg_lfc_spearman_sym", "direction_agreement")
 DEG_DEFINITION_CONFIG = {
     "p05": {
         "display": "adj.P.Value < 0.05",
@@ -195,6 +214,16 @@ def add_common_run_args(parser: argparse.ArgumentParser) -> None:
             "replicate retrieval."
         ),
     )
+    parser.add_argument(
+        "--max-baseline-peers",
+        type=int,
+        default=None,
+        help=(
+            "Cap how many same line / time / dose other-drug peers are scored individually "
+            "for the per-peer baselines. Omit to score every peer. Capped runs record both "
+            "the total and scored peer counts."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -304,6 +333,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME,
         help="Minimum unique compounds required in a line-time stratum for retrieval scoring.",
+    )
+    run_task_parser.add_argument(
+        "--max-baseline-peers",
+        type=int,
+        default=None,
+        help=(
+            "Cap how many same line / time / dose other-drug peers are scored individually "
+            "for the per-peer baselines. Omit to score every peer."
+        ),
     )
 
     merge_parser = subparsers.add_parser(
@@ -865,6 +903,64 @@ def pairwise_replicate_baseline_values(
         np.asarray(replicate_baseline_values, dtype=np.float64),
         np.asarray(baseline_values, dtype=np.float64),
     )
+
+
+def build_peer_matrix(
+    vectors: list[Optional[np.ndarray]],
+    *,
+    finite_mask: Optional[np.ndarray],
+    n_expected_columns: int,
+    seed_key: str,
+) -> tuple[Optional[np.ndarray], int, int]:
+    """Stack the peer vectors that `build_baseline_vector` would have averaged.
+
+    Returns the matrix aligned to the evaluation gene set together with the total and
+    scored peer counts, or `(None, n_total, 0)` when it cannot be aligned. Rows are
+    subsampled by `select_peer_indices` when `MAX_BASELINE_PEERS` is set.
+    """
+    present_vectors = [
+        np.asarray(vector, dtype=np.float64) for vector in vectors if vector is not None
+    ]
+    n_total_peers = int(len(present_vectors))
+    if n_total_peers == 0:
+        return None, 0, 0
+
+    selected = select_peer_indices(n_total_peers, MAX_BASELINE_PEERS, seed_key)
+    matrix = np.vstack([present_vectors[int(index)] for index in selected]).astype(np.float64)
+    if matrix.shape[1] == int(n_expected_columns):
+        return matrix, n_total_peers, int(matrix.shape[0])
+    if finite_mask is not None and matrix.shape[1] == int(finite_mask.shape[0]):
+        reduced = matrix[:, finite_mask]
+        if reduced.shape[1] == int(n_expected_columns):
+            return reduced, n_total_peers, int(reduced.shape[0])
+    return None, n_total_peers, 0
+
+
+def replicate_pair_peer_summary(
+    left_peer_scores: np.ndarray,
+    right_peer_scores: np.ndarray,
+    observed_value: float,
+    prefix: str,
+) -> dict[str, float | int]:
+    """Summarize one replicate pair's per-peer baseline distribution.
+
+    Each peer contributes the mean of its score against the two replicates, matching how
+    `pairwise_replicate_baseline_values` averages the two centroid scores.
+    """
+    stacked = np.vstack(
+        [
+            np.asarray(left_peer_scores, dtype=np.float64),
+            np.asarray(right_peer_scores, dtype=np.float64),
+        ]
+    )
+    # Mean over whichever sides are defined, matching mean_available in the centroid path.
+    finite = np.isfinite(stacked)
+    counts = finite.sum(axis=0)
+    sums = np.where(finite, stacked, 0.0).sum(axis=0)
+    pair_peer_scores = np.full(stacked.shape[1], np.nan, dtype=np.float64)
+    valid = counts > 0
+    pair_peer_scores[valid] = sums[valid] / counts[valid]
+    return summarize_peer_scores(observed_value, pair_peer_scores, prefix)
 
 
 def build_sampled_replicate_domain_rows(context_frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1929,6 +2025,8 @@ def compute_condition_metric_record_from_rows(
 
     local_baseline_logfc: Optional[np.ndarray] = None
     global_baseline_logfc: Optional[np.ndarray] = None
+    local_peer_logfc_matrix: Optional[np.ndarray] = None
+    peer_seed_key = "|".join([dataset_name, cell_type, pubchem_cid, time_key, dose_key])
 
     if compute_baseline_metrics and baseline_source_frame is not None and baseline_context_row_indexes is not None:
         context_key = (cell_type, time_key, dose_key)
@@ -2038,6 +2136,76 @@ def compute_condition_metric_record_from_rows(
                     record["n_valid_replicate_minus_baseline_t_pairs"] = int(np.isfinite(replicate_minus_baseline_t).sum())
                     record[f"n_valid_replicate_minus_baseline_signed_overlap_t_top{top_k}_pairs"] = int(np.isfinite(replicate_minus_baseline_overlap).sum())
 
+                # Per-peer baseline for the all-gene logFC Spearman summary: score each
+                # same line / time / dose other-drug peer separately instead of averaging
+                # the peers into a centroid first.
+                if local_logfc_matrix is not None:
+                    local_peer_logfc_matrix, n_total_peers, n_scored_peers = build_peer_matrix(
+                        local_baseline_logfc_vectors,
+                        finite_mask=finite_local_mask,
+                        n_expected_columns=int(local_logfc_matrix.shape[1]),
+                        seed_key=peer_seed_key,
+                    )
+                    record["n_peer_rows_total"] = int(n_total_peers)
+                    record["n_peer_rows_scored"] = int(n_scored_peers)
+                    if local_peer_logfc_matrix is not None and local_peer_logfc_matrix.shape[0] > 0:
+                        peer_summary_fields: dict[str, list[float]] = defaultdict(list)
+                        peer_delta_values: list[float] = []
+                        for pair_position, (left_idx, right_idx) in enumerate(pair_indices):
+                            left_peer_scores = spearman_against_peers(
+                                local_logfc_matrix[left_idx],
+                                local_peer_logfc_matrix,
+                            )
+                            right_peer_scores = spearman_against_peers(
+                                local_logfc_matrix[right_idx],
+                                local_peer_logfc_matrix,
+                            )
+                            observed_value = (
+                                float(logfc_values[pair_position])
+                                if pair_position < len(logfc_values)
+                                else float("nan")
+                            )
+                            pair_peer_summary = replicate_pair_peer_summary(
+                                left_peer_scores,
+                                right_peer_scores,
+                                observed_value,
+                                "peer",
+                            )
+                            for field_name, field_value in pair_peer_summary.items():
+                                peer_summary_fields[field_name].append(float(field_value))
+                            peer_delta_values.append(
+                                difference_if_both_defined(
+                                    observed_value,
+                                    float(pair_peer_summary["peer_mean_score"]),
+                                )
+                            )
+                        record["mean_peer_baseline_spearman_logfc"] = mean_available(
+                            np.asarray(peer_summary_fields["peer_mean_score"], dtype=np.float64)
+                        )
+                        record["mean_peer_baseline_sd_spearman_logfc"] = mean_available(
+                            np.asarray(peer_summary_fields["peer_sd_score"], dtype=np.float64)
+                        )
+                        record["mean_peer_baseline_fraction_below_observed_spearman_logfc"] = mean_available(
+                            np.asarray(
+                                peer_summary_fields["peer_fraction_below_observed"],
+                                dtype=np.float64,
+                            )
+                        )
+                        record["mean_peer_baseline_corrected_percentile_spearman_logfc"] = mean_available(
+                            np.asarray(
+                                peer_summary_fields["peer_corrected_percentile"],
+                                dtype=np.float64,
+                            )
+                        )
+                        record["mean_replicate_minus_peer_baseline_spearman_logfc"] = mean_available(
+                            np.asarray(peer_delta_values, dtype=np.float64)
+                        )
+                        record["n_valid_peer_baseline_logfc_pairs"] = int(
+                            np.isfinite(
+                                np.asarray(peer_summary_fields["peer_mean_score"], dtype=np.float64)
+                            ).sum()
+                        )
+
                 if (
                     global_logfc_matrix is not None
                     and global_t_matrix is not None
@@ -2113,6 +2281,10 @@ def compute_condition_metric_record_from_rows(
                 metric_name: []
                 for metric_name in deg_metric_names()
             }
+            peer_values_by_metric: dict[str, dict[str, list[float]]] = {
+                metric_name: defaultdict(list)
+                for metric_name in PEER_BASELINE_DEG_METRICS
+            }
 
             for left_idx, right_idx in pair_indices:
                 observed_metrics = compute_observed_deg_metrics_for_pair(
@@ -2164,6 +2336,76 @@ def compute_condition_metric_record_from_rows(
                         baseline_pair_values_by_metric[metric_name].append(float("nan"))
                         delta_values_by_metric[metric_name].append(float("nan"))
 
+                # Per-peer DEG baselines, on the sample-referenced convention: each
+                # replicate's own DEG mask defines the evaluation genes, exactly as the
+                # centroid baseline does in compute_sample_baseline_deg_metrics.
+                if local_peer_logfc_matrix is not None and local_peer_logfc_matrix.shape[0] > 0:
+                    left_deg_mask = deg_mask(
+                        local_logfc_matrix[left_idx],
+                        local_adj_p_matrix[left_idx],
+                        definition_key,
+                    )
+                    right_deg_mask = deg_mask(
+                        local_logfc_matrix[right_idx],
+                        local_adj_p_matrix[right_idx],
+                        definition_key,
+                    )
+                    for metric_name in PEER_BASELINE_DEG_METRICS:
+                        if metric_name == "deg_lfc_spearman_sym":
+                            left_peer_scores = spearman_against_peers(
+                                local_logfc_matrix[left_idx],
+                                local_peer_logfc_matrix,
+                                left_deg_mask,
+                            )
+                            right_peer_scores = spearman_against_peers(
+                                local_logfc_matrix[right_idx],
+                                local_peer_logfc_matrix,
+                                right_deg_mask,
+                            )
+                        else:
+                            left_peer_scores = direction_agreement_against_peers(
+                                local_logfc_matrix[left_idx],
+                                local_peer_logfc_matrix,
+                                left_deg_mask,
+                            )
+                            right_peer_scores = direction_agreement_against_peers(
+                                local_logfc_matrix[right_idx],
+                                local_peer_logfc_matrix,
+                                right_deg_mask,
+                            )
+                        observed_value = float(observed_metrics[metric_name])
+                        pair_peer_summary = replicate_pair_peer_summary(
+                            left_peer_scores,
+                            right_peer_scores,
+                            observed_value,
+                            "peer",
+                        )
+                        for field_name, field_value in pair_peer_summary.items():
+                            peer_values_by_metric[metric_name][field_name].append(float(field_value))
+                        peer_values_by_metric[metric_name]["delta"].append(
+                            difference_if_both_defined(
+                                observed_value,
+                                float(pair_peer_summary["peer_mean_score"]),
+                            )
+                        )
+
+            for metric_name in PEER_BASELINE_DEG_METRICS:
+                field_values = peer_values_by_metric[metric_name]
+                if not field_values:
+                    continue
+                for record_suffix, field_name in (
+                    ("", "peer_mean_score"),
+                    ("_sd", "peer_sd_score"),
+                    ("_fraction_below_observed", "peer_fraction_below_observed"),
+                    ("_corrected_percentile", "peer_corrected_percentile"),
+                ):
+                    record[f"mean_peer_baseline_{metric_name}{record_suffix}_{definition_key}"] = mean_available(
+                        np.asarray(field_values.get(field_name, []), dtype=np.float64)
+                    )
+                record[f"mean_delta_vs_peer_baseline_{metric_name}_{definition_key}"] = mean_available(
+                    np.asarray(field_values.get("delta", []), dtype=np.float64)
+                )
+
             for metric_name in deg_metric_names():
                 observed_array = np.asarray(observed_values_by_metric[metric_name], dtype=np.float64)
                 baseline_array = np.asarray(baseline_pair_values_by_metric[metric_name], dtype=np.float64)
@@ -2194,6 +2436,8 @@ def summarize_condition_frame(frame: pd.DataFrame, top_k: int) -> pd.Series:
         "mean_mean_abs_t_global": float(frame["mean_abs_t_global"].mean()) if "mean_abs_t_global" in frame.columns else float("nan"),
         "mean_n_baseline_peer_rows": float(frame["n_baseline_peer_rows"].mean()) if "n_baseline_peer_rows" in frame.columns else float("nan"),
         "mean_n_baseline_peer_compounds": float(frame["n_baseline_peer_compounds"].mean()) if "n_baseline_peer_compounds" in frame.columns else float("nan"),
+        "mean_n_peer_rows_total": float(frame["n_peer_rows_total"].mean()) if "n_peer_rows_total" in frame.columns else float("nan"),
+        "mean_n_peer_rows_scored": float(frame["n_peer_rows_scored"].mean()) if "n_peer_rows_scored" in frame.columns else float("nan"),
     }
     summary_mean_columns = [
         "mean_replicate_spearman_logfc",
@@ -2257,10 +2501,15 @@ def summarize_condition_frame(frame: pd.DataFrame, top_k: int) -> pd.Series:
                     "median_baseline_pair_deg_",
                     "mean_delta_vs_baseline_pair_deg_",
                     "median_delta_vs_baseline_pair_deg_",
+                    # Per-peer baselines: all-gene logFC plus the DEG-restricted metrics.
+                    "mean_peer_baseline_",
+                    "mean_delta_vs_peer_baseline_",
+                    "mean_replicate_minus_peer_baseline_",
                 )
             )
         )
     )
+    summary_mean_columns = list(dict.fromkeys(summary_mean_columns))
     for column_name in summary_mean_columns:
         record[column_name] = float(frame[column_name].mean()) if column_name in frame.columns else float("nan")
     return pd.Series(record)
@@ -3413,6 +3662,8 @@ def deg_metric_columns(frame: pd.DataFrame) -> list[str]:
         "median_baseline_pair_",
         "mean_delta_vs_baseline_pair_",
         "median_delta_vs_baseline_pair_",
+        "mean_peer_baseline_",
+        "mean_delta_vs_peer_baseline_",
     )
     return sorted(
         column_name
@@ -3806,6 +4057,11 @@ def merge_task_outputs(
                 "n_local_shared_genes",
                 "n_baseline_peer_rows",
                 "n_baseline_peer_compounds",
+                *[
+                    column_name
+                    for column_name in ("n_peer_rows_total", "n_peer_rows_scored")
+                    if column_name in condition_metric_summary.columns
+                ],
                 *condition_deg_columns,
             ]
         ].copy()
@@ -3978,7 +4234,12 @@ def run_all(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    global MAX_BASELINE_PEERS
     args = parse_args()
+    # Read at call time inside the scoring functions, so setting it here covers every command.
+    MAX_BASELINE_PEERS = getattr(args, "max_baseline_peers", None)
+    if MAX_BASELINE_PEERS is not None and int(MAX_BASELINE_PEERS) <= 0:
+        raise SystemExit("--max-baseline-peers must be a positive integer when provided.")
     if args.command == "prepare":
         prepare(
             output_dir=args.output_dir,
