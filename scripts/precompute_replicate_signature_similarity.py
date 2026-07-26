@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -22,9 +23,15 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from peer_baselines import (
+    DEFAULT_PEER_SAMPLING_SEED,
+    PreparedSpearmanRows,
     direction_agreement_against_peers,
+    exact_mean_excluding_row_mask,
+    finite_column_totals,
+    prepare_spearman_rows,
     select_peer_indices,
     spearman_against_peers,
+    spearman_against_prepared_peers,
     summarize_peer_scores,
 )
 
@@ -110,6 +117,7 @@ DEFAULT_MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME = 10
 # by select_peer_indices with a deterministic per-condition seed, and both the total and
 # scored peer counts are recorded so a capped run is never mistaken for a full one.
 MAX_BASELINE_PEERS: Optional[int] = None
+PEER_SAMPLING_SEED = DEFAULT_PEER_SAMPLING_SEED
 # Tables 7 and 8 report the adj.P.Value < 0.05 DEG-restricted metrics.
 PEER_BASELINE_DEG_METRICS = ("deg_lfc_spearman_sym", "direction_agreement")
 DEG_DEFINITION_CONFIG = {
@@ -166,6 +174,19 @@ class ReshardResult:
     output_dir: Path
     task_manifest_path: Path
     task_output_dir: Path
+
+
+@dataclass
+class BaselineContextVectors:
+    """All reusable vectors for one dataset / line / time / dose / gene-set context."""
+
+    rows: pd.DataFrame
+    local_logfc: np.ndarray
+    local_t: np.ndarray
+    global_logfc: np.ndarray
+    global_t: np.ndarray
+    finite_totals: dict[str, tuple[np.ndarray, np.ndarray]]
+    prepared_local_logfc: dict[bytes, PreparedSpearmanRows]
 
 
 GENE_INFO_CACHE: dict[str, GeneInfo] = {}
@@ -259,12 +280,19 @@ def add_common_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-baseline-peers",
         type=int,
-        default=None,
+        default=512,
         help=(
             "Cap how many same line / time / dose other-drug peers are scored individually "
             "for the per-peer baselines. Omit to score every peer. Capped runs record both "
-            "the total and scored peer counts."
+            "the total and scored peer counts. The exact centroid always uses every "
+            "eligible peer. Default: 512."
         ),
+    )
+    parser.add_argument(
+        "--peer-sampling-seed",
+        type=int,
+        default=DEFAULT_PEER_SAMPLING_SEED,
+        help="Seed for deterministic capped peer sampling. Default: 20260505.",
     )
 
 
@@ -282,7 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_all_parser.add_argument(
         "--conditions-per-task",
         type=int,
-        default=100,
+        default=250,
         help="Maximum number of retained conditions to score in one task shard.",
     )
 
@@ -294,7 +322,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument(
         "--conditions-per-task",
         type=int,
-        default=100,
+        default=250,
         help="Maximum number of retained conditions to score in one task shard.",
     )
 
@@ -379,11 +407,18 @@ def build_parser() -> argparse.ArgumentParser:
     run_task_parser.add_argument(
         "--max-baseline-peers",
         type=int,
-        default=None,
+        default=512,
         help=(
             "Cap how many same line / time / dose other-drug peers are scored individually "
-            "for the per-peer baselines. Omit to score every peer."
+            "for the per-peer baselines. Use a value greater than the available peer "
+            "count to score every peer. The centroid is never capped."
         ),
+    )
+    run_task_parser.add_argument(
+        "--peer-sampling-seed",
+        type=int,
+        default=DEFAULT_PEER_SAMPLING_SEED,
+        help="Seed for deterministic capped peer sampling. Default: 20260505.",
     )
 
     merge_parser = subparsers.add_parser(
@@ -735,6 +770,115 @@ def build_baseline_vector(vectors: list[Optional[np.ndarray]]) -> Optional[np.nd
     return np.asarray(baseline, dtype=np.float64)
 
 
+def optional_vectors_to_matrix(
+    vectors: list[Optional[np.ndarray]],
+    *,
+    n_columns: int,
+) -> np.ndarray:
+    """Preserve metadata-row alignment while representing unavailable vectors as NaN."""
+    matrix = np.full((len(vectors), int(n_columns)), np.nan, dtype=np.float64)
+    for row_index, vector in enumerate(vectors):
+        if vector is None:
+            continue
+        values = np.asarray(vector, dtype=np.float64).reshape(-1)
+        if values.size == int(n_columns):
+            matrix[row_index] = values
+    return matrix
+
+
+def get_baseline_context_vectors(
+    *,
+    context_rows: pd.DataFrame,
+    context_key: tuple[str, str, str],
+    local_gene_keys: np.ndarray,
+    global_gene_keys: np.ndarray,
+    open_adatas: dict[str, ad.AnnData],
+    cache: dict[tuple[object, ...], BaselineContextVectors],
+) -> BaselineContextVectors:
+    """Load a context once per local/global gene-set combination within a task."""
+    cache_key = (
+        *context_key,
+        tuple(map(str, np.asarray(local_gene_keys, dtype=object).tolist())),
+        tuple(map(str, np.asarray(global_gene_keys, dtype=object).tolist())),
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    rows = normalize_source_metadata_frame(context_rows).reset_index(drop=True)
+    local_logfc_vectors, local_t_vectors = load_vectors_for_rows(
+        rows,
+        gene_keys=local_gene_keys,
+        open_adatas=open_adatas,
+    )
+    if np.array_equal(local_gene_keys, global_gene_keys):
+        global_logfc_vectors = local_logfc_vectors
+        global_t_vectors = local_t_vectors
+    else:
+        global_logfc_vectors, global_t_vectors = load_vectors_for_rows(
+            rows,
+            gene_keys=global_gene_keys,
+            open_adatas=open_adatas,
+        )
+    matrices = {
+        "local_logfc": optional_vectors_to_matrix(
+            local_logfc_vectors,
+            n_columns=int(local_gene_keys.size),
+        ),
+        "local_t": optional_vectors_to_matrix(
+            local_t_vectors,
+            n_columns=int(local_gene_keys.size),
+        ),
+        "global_logfc": optional_vectors_to_matrix(
+            global_logfc_vectors,
+            n_columns=int(global_gene_keys.size),
+        ),
+        "global_t": optional_vectors_to_matrix(
+            global_t_vectors,
+            n_columns=int(global_gene_keys.size),
+        ),
+    }
+    loaded = BaselineContextVectors(
+        rows=rows,
+        local_logfc=matrices["local_logfc"],
+        local_t=matrices["local_t"],
+        global_logfc=matrices["global_logfc"],
+        global_t=matrices["global_t"],
+        finite_totals={
+            matrix_name: finite_column_totals(matrix)
+            for matrix_name, matrix in matrices.items()
+        },
+        prepared_local_logfc={},
+    )
+    cache[cache_key] = loaded
+    return loaded
+
+
+def get_prepared_local_context_spearman(
+    context_vectors: BaselineContextVectors,
+    column_mask: Optional[np.ndarray],
+) -> PreparedSpearmanRows:
+    """Reuse context row ranks across compounds sharing the same evaluation genes."""
+    if column_mask is None:
+        cache_key = b"all"
+        matrix = context_vectors.local_logfc
+    else:
+        normalized_mask = np.asarray(column_mask, dtype=bool).reshape(-1)
+        cache_key = normalized_mask.tobytes()
+        matrix = context_vectors.local_logfc[:, normalized_mask]
+    cached = context_vectors.prepared_local_logfc.get(cache_key)
+    if cached is not None:
+        return cached
+    # Bound rank-cache memory when rare condition-specific finite masks differ.
+    if len(context_vectors.prepared_local_logfc) >= 2:
+        context_vectors.prepared_local_logfc.pop(
+            next(iter(context_vectors.prepared_local_logfc))
+        )
+    prepared = prepare_spearman_rows(matrix)
+    context_vectors.prepared_local_logfc[cache_key] = prepared
+    return prepared
+
+
 def deg_metric_names() -> list[str]:
     return [
         "deg_lfc_spearman_sym",
@@ -973,7 +1117,12 @@ def build_peer_matrix(
     # here would be a no-op at best and a different draw at worst.
     if n_total_peers_override is None:
         n_total_peers = n_loaded_peers
-        selected = select_peer_indices(n_total_peers, MAX_BASELINE_PEERS, seed_key)
+        selected = select_peer_indices(
+            n_total_peers,
+            MAX_BASELINE_PEERS,
+            seed_key,
+            sampling_seed=PEER_SAMPLING_SEED,
+        )
     else:
         n_total_peers = int(n_total_peers_override)
         selected = np.arange(n_loaded_peers, dtype=np.int64)
@@ -1808,13 +1957,32 @@ def load_task_manifest(path: Path) -> pd.DataFrame:
 
 def write_task_config(path: Path, config: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+    temporary_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+    os.replace(temporary_path, path)
 
 
 def load_task_config(path: Path) -> dict[str, object]:
     if not path.exists():
         raise FileNotFoundError(f"Task config not found: {path}")
     return json.loads(path.read_text())
+
+
+def config_fingerprint(config: dict[str, object]) -> str:
+    canonical = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def write_tsv_atomic(frame: pd.DataFrame, path: Path) -> None:
+    """Write a complete TSV before atomically publishing it at the final path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        frame.to_csv(temporary_path, sep="\t", index=False)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
 
 
 def write_line_global_gene_keys(path: Path, mapping: dict[str, np.ndarray]) -> None:
@@ -1851,6 +2019,9 @@ def compute_condition_metric_record_from_rows(
     compute_baseline_metrics: bool = False,
     baseline_source_frame: Optional[pd.DataFrame] = None,
     baseline_context_row_indexes: Optional[dict[tuple[str, str, str], np.ndarray]] = None,
+    baseline_context_vector_cache: Optional[
+        dict[tuple[object, ...], BaselineContextVectors]
+    ] = None,
     open_adatas: Optional[dict[str, ad.AnnData]] = None,
 ) -> Optional[dict[str, object]]:
     condition_rows = normalize_source_metadata_frame(condition_rows)
@@ -1870,6 +2041,8 @@ def compute_condition_metric_record_from_rows(
     global_gene_keys = line_global_shared_gene_keys.get(cell_type, np.asarray([], dtype=object))
     if open_adatas is None:
         open_adatas = {}
+    if baseline_context_vector_cache is None:
+        baseline_context_vector_cache = {}
 
     indexed_rows = condition_rows.reset_index(drop=True)
     local_logfc_vectors, local_t_vectors = load_vectors_for_rows(
@@ -1901,6 +2074,10 @@ def compute_condition_metric_record_from_rows(
         "mean_abs_t_global": float("nan"),
         "n_baseline_peer_rows": 0,
         "n_baseline_peer_compounds": 0,
+        "n_baseline_peer_rows_loaded": 0,
+        "n_peer_rows_total": 0,
+        "n_peer_rows_available": 0,
+        "n_peer_rows_scored": 0,
         "mean_replicate_spearman_logfc": float("nan"),
         "median_replicate_spearman_logfc": float("nan"),
         "mean_replicate_spearman_t": float("nan"),
@@ -2077,45 +2254,61 @@ def compute_condition_metric_record_from_rows(
     local_baseline_logfc: Optional[np.ndarray] = None
     global_baseline_logfc: Optional[np.ndarray] = None
     local_peer_logfc_matrix: Optional[np.ndarray] = None
+    local_peer_logfc_prepared = None
     peer_seed_key = "|".join([dataset_name, cell_type, pubchem_cid, time_key, dose_key])
 
     if compute_baseline_metrics and baseline_source_frame is not None and baseline_context_row_indexes is not None:
         context_key = (cell_type, time_key, dose_key)
         context_indexes = baseline_context_row_indexes.get(context_key)
         if context_indexes is not None and len(context_indexes) > 0:
-            context_frame = baseline_source_frame.iloc[np.asarray(context_indexes, dtype=np.int64)].copy()
-            baseline_rows = context_frame.loc[context_frame["pubchem_cid"].astype(str) != pubchem_cid].copy().reset_index(drop=True)
-            if not baseline_rows.empty:
-                record["n_baseline_peer_rows"] = int(len(baseline_rows))
-                record["n_baseline_peer_compounds"] = int(baseline_rows["pubchem_cid"].astype(str).nunique())
-
-                # Cap before loading, not after: these rows are read twice (local and
-                # global gene sets), so subsampling afterwards would leave the dominant
-                # cost untouched. n_baseline_peer_rows above still records the full set.
-                n_total_baseline_peers = int(len(baseline_rows))
-                capped_positions = select_peer_indices(
-                    n_total_baseline_peers,
-                    MAX_BASELINE_PEERS,
-                    peer_seed_key,
+            raw_context_frame = baseline_source_frame.iloc[
+                np.asarray(context_indexes, dtype=np.int64)
+            ].copy()
+            context_vectors = get_baseline_context_vectors(
+                context_rows=raw_context_frame,
+                context_key=context_key,
+                local_gene_keys=local_gene_keys,
+                global_gene_keys=global_gene_keys,
+                open_adatas=open_adatas,
+                cache=baseline_context_vector_cache,
+            )
+            peer_row_mask = (
+                context_vectors.rows["pubchem_cid"].astype(str).to_numpy() != pubchem_cid
+            )
+            if peer_row_mask.any():
+                same_compound_mask = ~peer_row_mask
+                baseline_rows = context_vectors.rows.loc[peer_row_mask].reset_index(drop=True)
+                record["n_baseline_peer_rows"] = int(peer_row_mask.sum())
+                record["n_baseline_peer_compounds"] = int(
+                    baseline_rows["pubchem_cid"].astype(str).nunique()
                 )
-                baseline_rows = baseline_rows.iloc[capped_positions].reset_index(drop=True)
-                record["n_baseline_peer_rows_loaded"] = int(len(baseline_rows))
-
-                local_baseline_logfc_vectors, local_baseline_t_vectors = load_vectors_for_rows(
-                    baseline_rows,
-                    gene_keys=local_gene_keys,
-                    open_adatas=open_adatas,
+                # The published centroid remains exact and therefore always uses every
+                # eligible peer row. The cap applies only to the single-peer distribution.
+                local_baseline_logfc = exact_mean_excluding_row_mask(
+                    context_vectors.local_logfc,
+                    same_compound_mask,
+                    total_sums=context_vectors.finite_totals["local_logfc"][0],
+                    total_counts=context_vectors.finite_totals["local_logfc"][1],
                 )
-                global_baseline_logfc_vectors, global_baseline_t_vectors = load_vectors_for_rows(
-                    baseline_rows,
-                    gene_keys=global_gene_keys,
-                    open_adatas=open_adatas,
+                local_baseline_t = exact_mean_excluding_row_mask(
+                    context_vectors.local_t,
+                    same_compound_mask,
+                    total_sums=context_vectors.finite_totals["local_t"][0],
+                    total_counts=context_vectors.finite_totals["local_t"][1],
                 )
-
-                local_baseline_logfc = build_baseline_vector(local_baseline_logfc_vectors)
-                local_baseline_t = build_baseline_vector(local_baseline_t_vectors)
-                global_baseline_logfc = build_baseline_vector(global_baseline_logfc_vectors)
-                global_baseline_t = build_baseline_vector(global_baseline_t_vectors)
+                global_baseline_logfc = exact_mean_excluding_row_mask(
+                    context_vectors.global_logfc,
+                    same_compound_mask,
+                    total_sums=context_vectors.finite_totals["global_logfc"][0],
+                    total_counts=context_vectors.finite_totals["global_logfc"][1],
+                )
+                global_baseline_t = exact_mean_excluding_row_mask(
+                    context_vectors.global_t,
+                    same_compound_mask,
+                    total_sums=context_vectors.finite_totals["global_t"][0],
+                    total_counts=context_vectors.finite_totals["global_t"][1],
+                )
+                record["n_baseline_peer_rows_loaded"] = int(peer_row_mask.sum())
 
                 if local_baseline_logfc is not None and local_logfc_matrix is not None:
                     if local_adj_p_matrix is not None:
@@ -2203,26 +2396,55 @@ def compute_condition_metric_record_from_rows(
                 # same line / time / dose other-drug peer separately instead of averaging
                 # the peers into a centroid first.
                 if local_logfc_matrix is not None:
-                    local_peer_logfc_matrix, n_total_peers, n_scored_peers = build_peer_matrix(
-                        local_baseline_logfc_vectors,
-                        finite_mask=finite_local_mask,
-                        n_expected_columns=int(local_logfc_matrix.shape[1]),
-                        seed_key=peer_seed_key,
-                        n_total_peers_override=n_total_baseline_peers,
+                    peer_context_positions = np.flatnonzero(
+                        peer_row_mask
+                        & np.isfinite(context_vectors.local_logfc).any(axis=1)
                     )
-                    record["n_peer_rows_total"] = int(n_total_peers)
-                    record["n_peer_rows_scored"] = int(n_scored_peers)
+                    selected_peer_positions = select_peer_indices(
+                        int(peer_context_positions.size),
+                        MAX_BASELINE_PEERS,
+                        peer_seed_key,
+                        sampling_seed=PEER_SAMPLING_SEED,
+                    )
+                    scored_context_positions = peer_context_positions[
+                        selected_peer_positions
+                    ]
+                    local_peer_logfc_matrix = context_vectors.local_logfc[
+                        scored_context_positions
+                    ]
+                    if local_adj_p_matrix is not None:
+                        local_peer_logfc_matrix = local_peer_logfc_matrix[
+                            :, finite_local_mask
+                        ]
+                    elif local_peer_logfc_matrix.shape[1] != local_logfc_matrix.shape[1]:
+                        local_peer_logfc_matrix = None
+                    record["n_peer_rows_total"] = int(peer_row_mask.sum())
+                    record["n_peer_rows_available"] = int(peer_context_positions.size)
+                    record["n_peer_rows_scored"] = (
+                        int(local_peer_logfc_matrix.shape[0])
+                        if local_peer_logfc_matrix is not None
+                        else 0
+                    )
+                    record["peer_sampling_seed"] = int(PEER_SAMPLING_SEED)
                     if local_peer_logfc_matrix is not None and local_peer_logfc_matrix.shape[0] > 0:
+                        local_peer_logfc_prepared = get_prepared_local_context_spearman(
+                            context_vectors,
+                            finite_local_mask
+                            if local_adj_p_matrix is not None
+                            else None,
+                        )
                         peer_summary_fields: dict[str, list[float]] = defaultdict(list)
                         peer_delta_values: list[float] = []
                         for pair_position, (left_idx, right_idx) in enumerate(pair_indices):
-                            left_peer_scores = spearman_against_peers(
+                            left_peer_scores = spearman_against_prepared_peers(
                                 local_logfc_matrix[left_idx],
-                                local_peer_logfc_matrix,
+                                local_peer_logfc_prepared,
+                                row_indices=scored_context_positions,
                             )
-                            right_peer_scores = spearman_against_peers(
+                            right_peer_scores = spearman_against_prepared_peers(
                                 local_logfc_matrix[right_idx],
-                                local_peer_logfc_matrix,
+                                local_peer_logfc_prepared,
+                                row_indices=scored_context_positions,
                             )
                             observed_value = (
                                 float(logfc_values[pair_position])
@@ -2501,6 +2723,7 @@ def summarize_condition_frame(frame: pd.DataFrame, top_k: int) -> pd.Series:
         "mean_n_baseline_peer_rows": float(frame["n_baseline_peer_rows"].mean()) if "n_baseline_peer_rows" in frame.columns else float("nan"),
         "mean_n_baseline_peer_compounds": float(frame["n_baseline_peer_compounds"].mean()) if "n_baseline_peer_compounds" in frame.columns else float("nan"),
         "mean_n_peer_rows_total": float(frame["n_peer_rows_total"].mean()) if "n_peer_rows_total" in frame.columns else float("nan"),
+        "mean_n_peer_rows_available": float(frame["n_peer_rows_available"].mean()) if "n_peer_rows_available" in frame.columns else float("nan"),
         "mean_n_peer_rows_scored": float(frame["n_peer_rows_scored"].mean()) if "n_peer_rows_scored" in frame.columns else float("nan"),
     }
     summary_mean_columns = [
@@ -3034,7 +3257,18 @@ def create_task_shards(
 
     task_records: list[dict[str, object]] = []
     task_id = 0
-    for (dataset_name, source_path_key), batch_frame in retained_conditions.groupby(["dataset_name", "source_path_key"], sort=False):
+    shard_group_columns = [
+        "dataset_name",
+        "source_path_key",
+        "cell_type",
+        "time_key",
+        "dose_key",
+    ]
+    for shard_key, batch_frame in retained_conditions.groupby(
+        shard_group_columns,
+        sort=False,
+    ):
+        dataset_name, source_path_key, cell_type, time_key, dose_key = shard_key
         batch_frame = batch_frame.reset_index(drop=True)
         condition_row_lookup = dataset_indices[dataset_name]["condition_rows_by_key"]
         dataset_frame = dataset_indices[dataset_name]["frame"]
@@ -3060,6 +3294,9 @@ def create_task_shards(
                     "task_id": task_id,
                     "dataset_name": str(dataset_name),
                     "source_path_key": str(source_path_key),
+                    "cell_type": str(cell_type),
+                    "time_key": str(time_key),
+                    "dose_key": str(dose_key),
                     "n_conditions": int(len(chunk_frame)),
                     "n_replicate_rows": int(len(chunk_replicates)),
                     "n_source_files": int(len(source_paths)),
@@ -3135,6 +3372,8 @@ def prepare(
     compute_deg_metrics: bool = False,
     compute_retrieval_metrics: bool = False,
     min_retrieval_compounds_per_line_time: int = DEFAULT_MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME,
+    max_baseline_peers: Optional[int] = 512,
+    peer_sampling_seed: int = DEFAULT_PEER_SAMPLING_SEED,
 ) -> PrepareResult:
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset_order = resolve_dataset_order(dataset_arg)
@@ -3387,6 +3626,11 @@ def prepare(
             "compute_deg_metrics": bool(compute_deg_metrics),
             "compute_retrieval_metrics": bool(compute_retrieval_metrics),
             "min_retrieval_compounds_per_line_time": int(min_retrieval_compounds_per_line_time),
+            "max_baseline_peers": (
+                int(max_baseline_peers) if max_baseline_peers is not None else None
+            ),
+            "peer_sampling_seed": int(peer_sampling_seed),
+            "peer_baseline_engine_version": 2,
         },
     )
     create_task_shards(
@@ -3445,6 +3689,20 @@ def run_task(
     compute_retrieval_metrics: bool,
     min_retrieval_compounds_per_line_time: int,
 ) -> None:
+    saved_config = (
+        load_task_config(task_config_path(output_dir))
+        if task_config_path(output_dir).exists()
+        else {}
+    )
+    saved_config = {
+        **saved_config,
+        "max_baseline_peers": (
+            int(MAX_BASELINE_PEERS) if MAX_BASELINE_PEERS is not None else None
+        ),
+        "peer_sampling_seed": int(PEER_SAMPLING_SEED),
+        "peer_baseline_engine_version": 2,
+    }
+    peer_config_fingerprint = config_fingerprint(saved_config)
     manifest = load_task_manifest(task_file)
     task_row = manifest.loc[manifest["task_id"] == int(task_id)]
     if task_row.empty:
@@ -3507,6 +3765,9 @@ def run_task(
         }
 
     open_adatas: dict[str, ad.AnnData] = {}
+    baseline_context_vector_cache: dict[
+        tuple[object, ...], BaselineContextVectors
+    ] = {}
     metric_records: list[dict[str, object]] = []
     error_records: list[dict[str, object]] = []
     retrieval_condition_summary = pd.DataFrame()
@@ -3542,6 +3803,7 @@ def run_task(
                     compute_baseline_metrics=compute_baseline_metrics,
                     baseline_source_frame=baseline_source_frame,
                     baseline_context_row_indexes=baseline_context_row_indexes,
+                    baseline_context_vector_cache=baseline_context_vector_cache,
                     open_adatas=open_adatas,
                 )
             except Exception as exc:
@@ -3557,6 +3819,13 @@ def run_task(
                 )
                 continue
             if record is not None:
+                record["max_baseline_peers"] = (
+                    int(MAX_BASELINE_PEERS)
+                    if MAX_BASELINE_PEERS is not None
+                    else 0
+                )
+                record["peer_sampling_seed"] = int(PEER_SAMPLING_SEED)
+                record["peer_config_fingerprint"] = peer_config_fingerprint
                 metric_records.append(record)
 
         if compute_retrieval_metrics and full_dataset_source_frame is not None and not full_dataset_source_frame.empty:
@@ -3577,13 +3846,13 @@ def run_task(
     error_path = task_errors_path(task_output_dir_path, int(task_id))
     retrieval_path = task_condition_retrieval_path(task_output_dir_path, int(task_id))
 
-    pd.DataFrame(metric_records).to_csv(metric_path, sep="\t", index=False)
+    write_tsv_atomic(pd.DataFrame(metric_records), metric_path)
     if compute_retrieval_metrics:
-        retrieval_condition_summary.to_csv(retrieval_path, sep="\t", index=False)
+        write_tsv_atomic(retrieval_condition_summary, retrieval_path)
     elif retrieval_path.exists():
         retrieval_path.unlink()
     if error_records:
-        pd.DataFrame(error_records).to_csv(error_path, sep="\t", index=False)
+        write_tsv_atomic(pd.DataFrame(error_records), error_path)
     elif error_path.exists():
         error_path.unlink()
 
@@ -3963,6 +4232,7 @@ def merge_task_outputs(
     expect_baseline_metrics = bool(config.get("compute_baseline_metrics", False))
     expect_deg_metrics = bool(config.get("compute_deg_metrics", False))
     expect_retrieval_metrics = bool(config.get("compute_retrieval_metrics", False))
+    expected_peer_config_fingerprint = config_fingerprint(config) if config else None
     existing_results_dir = existing_results_dir.resolve() if existing_results_dir is not None else None
     current_dataset_names = read_dataset_names_from_selection_summary(output_dir)
     existing_dataset_names = (
@@ -4010,6 +4280,21 @@ def merge_task_outputs(
         if metric_path.exists():
             frame = read_optional_tsv(metric_path)
             if not frame.empty:
+                if expect_baseline_metrics and expected_peer_config_fingerprint is not None:
+                    if "peer_config_fingerprint" not in frame.columns:
+                        raise ValueError(
+                            f"Task {task_id} predates peer-baseline cache provenance. "
+                            "Rerun stage 2 before merging."
+                        )
+                    observed_fingerprints = set(
+                        frame["peer_config_fingerprint"].astype(str).tolist()
+                    )
+                    if observed_fingerprints != {expected_peer_config_fingerprint}:
+                        raise ValueError(
+                            f"Task {task_id} has stale peer-baseline configuration "
+                            f"{sorted(observed_fingerprints)!r}; expected "
+                            f"{expected_peer_config_fingerprint!r}. Rerun stage 2."
+                        )
                 metric_frames.append(frame)
         else:
             missing_task_outputs.append(
@@ -4056,6 +4341,7 @@ def merge_task_outputs(
             "dose_key",
             "condition_key",
             "perturbagen_display",
+            "peer_config_fingerprint",
         },
     )
     condition_metric_summary = condition_metric_summary.sort_values(
@@ -4268,6 +4554,8 @@ def run_all(args: argparse.Namespace) -> None:
         compute_deg_metrics=args.compute_deg_metrics,
         compute_retrieval_metrics=args.compute_retrieval_metrics,
         min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
+        max_baseline_peers=args.max_baseline_peers,
+        peer_sampling_seed=args.peer_sampling_seed,
     )
     manifest = load_task_manifest(prepare_result.task_manifest_path)
     n_tasks = int(len(manifest))
@@ -4298,10 +4586,13 @@ def run_all(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    global MAX_BASELINE_PEERS
+    global MAX_BASELINE_PEERS, PEER_SAMPLING_SEED
     args = parse_args()
     # Read at call time inside the scoring functions, so setting it here covers every command.
     MAX_BASELINE_PEERS = getattr(args, "max_baseline_peers", None)
+    PEER_SAMPLING_SEED = int(
+        getattr(args, "peer_sampling_seed", DEFAULT_PEER_SAMPLING_SEED)
+    )
     if MAX_BASELINE_PEERS is not None and int(MAX_BASELINE_PEERS) <= 0:
         raise SystemExit("--max-baseline-peers must be a positive integer when provided.")
     if args.command == "prepare":
@@ -4316,6 +4607,8 @@ def main() -> None:
             compute_deg_metrics=args.compute_deg_metrics,
             compute_retrieval_metrics=args.compute_retrieval_metrics,
             min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
+            max_baseline_peers=args.max_baseline_peers,
+            peer_sampling_seed=args.peer_sampling_seed,
         )
         return
     if args.command == "reshard":

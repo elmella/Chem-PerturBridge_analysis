@@ -30,6 +30,7 @@ Run ``python scripts/notebook_cache.py`` to execute the self-tests.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
@@ -118,14 +119,29 @@ def force_recompute(*stages: str, replace: bool = False) -> set[str]:
     return set(FORCE_RECOMPUTE)
 
 
-def is_cached(stage: str, path: Path) -> bool:
+def is_cached(
+    stage: str,
+    path: Path,
+    *,
+    fingerprint: Optional[str] = None,
+) -> bool:
     """Whether :func:`cached_frame` would reload this stage rather than rebuild it.
 
     Useful when the expensive work is a module-level loop that would be awkward to move
     into a builder: guard the loop's input with this so it becomes a no-op on a cache hit,
     and let ``cached_frame`` assemble the result from whatever the loop produced.
     """
-    return Path(path).exists() and not FORCE_ALL and stage not in FORCE_RECOMPUTE
+    path = Path(path)
+    if not path.exists() or FORCE_ALL or stage in FORCE_RECOMPUTE:
+        return False
+    if fingerprint is None:
+        return True
+    metadata_path = path.with_name(f"{path.name}.cache.json")
+    try:
+        metadata = json.loads(metadata_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+    return metadata.get("fingerprint") == str(fingerprint)
 
 
 def cached_frame(
@@ -134,6 +150,8 @@ def cached_frame(
     build: Callable[[], pd.DataFrame],
     *,
     string_columns: Optional[Sequence[str]] = None,
+    fingerprint: Optional[str] = None,
+    required_columns: Optional[Sequence[str]] = None,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """Reload ``path`` when it exists, otherwise run ``build()`` and save the result.
@@ -145,8 +163,14 @@ def cached_frame(
     columns: Iterable[str] = (
         CACHE_STRING_COLUMNS if string_columns is None else tuple(string_columns)
     )
+    metadata_path = path.with_name(f"{path.name}.cache.json")
+    cache_is_compatible = is_cached(
+        stage,
+        path,
+        fingerprint=fingerprint,
+    )
 
-    if path.exists() and not FORCE_ALL and stage not in FORCE_RECOMPUTE:
+    if cache_is_compatible:
         frame = pd.read_csv(
             path,
             sep="\t",
@@ -157,16 +181,49 @@ def cached_frame(
                 frame[column_name] = (
                     frame[column_name].astype("string").fillna("").astype(str)
                 )
-        CACHE_STATUS[stage] = "reloaded"
-        if verbose:
-            print(f"[{stage}] reloaded {len(frame):,} rows from {path.name}")
-        return frame
+        missing_columns = set(required_columns or ()) - set(frame.columns)
+        if missing_columns:
+            cache_is_compatible = False
+        else:
+            CACHE_STATUS[stage] = "reloaded"
+            if verbose:
+                print(f"[{stage}] reloaded {len(frame):,} rows from {path.name}")
+            return frame
 
     frame = build()
     if not isinstance(frame, pd.DataFrame):
         raise TypeError(f"[{stage}] build() returned {type(frame).__name__}, not a DataFrame")
+    missing_columns = set(required_columns or ()) - set(frame.columns)
+    if missing_columns:
+        raise ValueError(
+            f"[{stage}] build() omitted required columns: {sorted(missing_columns)!r}"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(path, sep="\t", index=False)
+    temporary_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary_metadata_path = metadata_path.with_name(
+        f".{metadata_path.name}.tmp-{os.getpid()}"
+    )
+    try:
+        frame.to_csv(temporary_path, sep="\t", index=False)
+        os.replace(temporary_path, path)
+        if fingerprint is not None:
+            temporary_metadata_path.write_text(
+                json.dumps(
+                    {
+                        "fingerprint": str(fingerprint),
+                        "columns": frame.columns.tolist(),
+                        "n_rows": int(len(frame)),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            os.replace(temporary_metadata_path, metadata_path)
+    finally:
+        for temporary in (temporary_path, temporary_metadata_path):
+            if temporary.exists():
+                temporary.unlink()
     CACHE_STATUS[stage] = "computed"
     if verbose:
         print(f"[{stage}] computed and saved {len(frame):,} rows to {path.name}")
@@ -226,14 +283,35 @@ def _self_test() -> None:
         assert FORCE_RECOMPUTE == {"other"}
         cached_frame("demo", path, explode, verbose=False)
 
+        fingerprint_path = Path(directory) / "fingerprinted.tsv"
+        cached_frame(
+            "fingerprinted",
+            fingerprint_path,
+            lambda: frame,
+            fingerprint="v1",
+            required_columns=["score"],
+            verbose=False,
+        )
+        fingerprint_calls: list[int] = []
+        cached_frame(
+            "fingerprinted",
+            fingerprint_path,
+            lambda: (fingerprint_calls.append(1), frame)[1],
+            fingerprint="v2",
+            required_columns=["score"],
+            verbose=False,
+        )
+        assert fingerprint_calls == [1], "changed fingerprint must invalidate cache"
+
         assert is_cached("demo", path) and not is_cached("absent", Path(directory) / "nope.tsv")
         force_recompute("demo")
         assert not is_cached("demo", path), "force_recompute must defeat is_cached"
         force_recompute("other", replace=True)
 
         summary = cache_summary()
-        assert summary["stage"].tolist() == ["demo"]
-        assert summary["status"].tolist() == ["reloaded"]
+        assert summary["stage"].tolist() == ["demo", "fingerprinted"]
+        assert summary.set_index("stage").loc["demo", "status"] == "reloaded"
+        assert summary.set_index("stage").loc["fingerprinted", "status"] == "computed"
 
         try:
             cached_frame("bad", Path(directory) / "bad.tsv", lambda: "not a frame", verbose=False)

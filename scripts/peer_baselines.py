@@ -22,17 +22,25 @@ vectorized paths against scalar reference implementations copied from the notebo
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 from scipy.stats import rankdata
 
 __all__ = [
+    "DEFAULT_PEER_SAMPLING_SEED",
     "PEER_SUMMARY_FIELDS",
     "summarize_peer_scores",
     "empty_peer_score_summary",
     "spearman_scalar",
     "spearman_against_peers",
+    "PreparedSpearmanRows",
+    "prepare_spearman_rows",
+    "spearman_against_prepared_peers",
+    "exact_mean_for_row_mask",
+    "finite_column_totals",
+    "exact_mean_excluding_row_mask",
     "direction_agreement_scalar",
     "direction_agreement_against_peers",
     "select_peer_indices",
@@ -48,6 +56,18 @@ PEER_SUMMARY_FIELDS = (
     "n_at_least_observed",
     "empirical_p_upper",
 )
+
+DEFAULT_PEER_SAMPLING_SEED = 20260505
+
+
+@dataclass(frozen=True)
+class PreparedSpearmanRows:
+    """Peer rows with reusable normalized ranks for repeated all-gene scoring."""
+
+    values: np.ndarray
+    normalized_ranks: np.ndarray
+    finite_rows: np.ndarray
+    valid_rows: np.ndarray
 
 
 def summarize_peer_scores(
@@ -163,7 +183,7 @@ def spearman_against_peers(
             query_norm = float(np.linalg.norm(centered_query))
             centered_peers = peer_ranks - peer_ranks.mean(axis=1, keepdims=True)
             peer_norms = np.linalg.norm(centered_peers, axis=1)
-            with np.errstate(invalid="ignore", divide="ignore"):
+            with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
                 row_scores = (centered_peers @ centered_query) / (peer_norms * query_norm)
             row_scores = np.clip(row_scores, -1.0, 1.0)
             row_scores[constant_rows | ~(peer_norms > 0.0)] = np.nan
@@ -172,6 +192,151 @@ def spearman_against_peers(
     for row_index in np.flatnonzero(~finite_rows):
         scores[row_index] = spearman_scalar(query_subset, peer_subset[row_index])
     return scores
+
+
+def prepare_spearman_rows(peer_matrix: np.ndarray) -> PreparedSpearmanRows:
+    """Rank and normalize finite peer rows once for repeated all-gene Spearman calls.
+
+    Rows containing non-finite values remain available in ``values`` and are evaluated
+    with the scalar reference path by :func:`spearman_against_prepared_peers`.
+    """
+    values = np.atleast_2d(np.asarray(peer_matrix, dtype=np.float64))
+    n_rows, n_columns = values.shape
+    normalized_ranks = np.full((n_rows, n_columns), np.nan, dtype=np.float64)
+    finite_rows = np.isfinite(values).all(axis=1)
+    valid_rows = np.zeros(n_rows, dtype=bool)
+    if n_columns < 2 or not finite_rows.any():
+        return PreparedSpearmanRows(values, normalized_ranks, finite_rows, valid_rows)
+
+    ranks = np.atleast_2d(
+        rankdata(values[finite_rows], method="average", axis=1)
+    ).astype(np.float64)
+    centered = ranks - ranks.mean(axis=1, keepdims=True)
+    norms = np.linalg.norm(centered, axis=1)
+    finite_positions = np.flatnonzero(finite_rows)
+    usable = norms > 0.0
+    if usable.any():
+        normalized_ranks[finite_positions[usable]] = (
+            centered[usable] / norms[usable, None]
+        )
+        valid_rows[finite_positions[usable]] = True
+    return PreparedSpearmanRows(values, normalized_ranks, finite_rows, valid_rows)
+
+
+def spearman_against_prepared_peers(
+    query_values: np.ndarray,
+    prepared_peers: PreparedSpearmanRows,
+    *,
+    row_indices: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Score one all-gene query against reusable peer ranks.
+
+    This is exactly equivalent to ``spearman_against_peers(query, selected_rows)`` for
+    the unmasked all-gene case, including ties, constants, and per-row NaN handling.
+    """
+    query_values = np.asarray(query_values, dtype=np.float64).reshape(-1)
+    values = prepared_peers.values
+    if values.shape[1] != query_values.size:
+        raise ValueError(
+            f"prepared peers have {values.shape[1]} columns but query has {query_values.size}"
+        )
+    if row_indices is None:
+        selected = np.arange(values.shape[0], dtype=np.int64)
+    else:
+        selected = np.asarray(row_indices, dtype=np.int64).reshape(-1)
+    scores = np.full(selected.size, np.nan, dtype=np.float64)
+    if selected.size == 0 or query_values.size < 2:
+        return scores
+
+    # Query NaNs change the evaluation columns and therefore the peer ranks. Preserve
+    # exact notebook semantics by falling back to the established implementation.
+    if not np.isfinite(query_values).all():
+        return spearman_against_peers(query_values, values[selected])
+
+    query_ranks = rankdata(query_values, method="average").astype(np.float64)
+    centered_query = query_ranks - query_ranks.mean()
+    query_norm = float(np.linalg.norm(centered_query))
+    if not query_norm > 0.0:
+        return scores
+    normalized_query = centered_query / query_norm
+
+    selected_valid = prepared_peers.valid_rows[selected]
+    if selected_valid.any():
+        with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+            scores[selected_valid] = (
+                prepared_peers.normalized_ranks[selected[selected_valid]]
+                @ normalized_query
+            )
+        scores[selected_valid] = np.clip(scores[selected_valid], -1.0, 1.0)
+
+    fallback_positions = np.flatnonzero(~prepared_peers.finite_rows[selected])
+    for output_position in fallback_positions:
+        scores[output_position] = spearman_scalar(
+            query_values,
+            values[int(selected[output_position])],
+        )
+    return scores
+
+
+def exact_mean_for_row_mask(
+    matrix: np.ndarray,
+    row_mask: np.ndarray,
+) -> Optional[np.ndarray]:
+    """Gene-wise finite mean over all selected rows, independent of any peer cap."""
+    matrix = np.atleast_2d(np.asarray(matrix, dtype=np.float64))
+    row_mask = np.asarray(row_mask, dtype=bool).reshape(-1)
+    if row_mask.size != matrix.shape[0]:
+        raise ValueError("row_mask length does not match matrix rows")
+    selected = matrix[row_mask]
+    if selected.shape[0] == 0:
+        return None
+    finite = np.isfinite(selected)
+    counts = finite.sum(axis=0)
+    if not np.any(counts > 0):
+        return None
+    sums = np.where(finite, selected, 0.0).sum(axis=0)
+    mean = np.full(matrix.shape[1], np.nan, dtype=np.float64)
+    valid = counts > 0
+    mean[valid] = sums[valid] / counts[valid]
+    return mean
+
+
+def finite_column_totals(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Finite sums and counts for reuse across many exclusion centroids."""
+    matrix = np.atleast_2d(np.asarray(matrix, dtype=np.float64))
+    finite = np.isfinite(matrix)
+    return (
+        np.where(finite, matrix, 0.0).sum(axis=0),
+        finite.sum(axis=0, dtype=np.int64),
+    )
+
+
+def exact_mean_excluding_row_mask(
+    matrix: np.ndarray,
+    excluded_row_mask: np.ndarray,
+    *,
+    total_sums: Optional[np.ndarray] = None,
+    total_counts: Optional[np.ndarray] = None,
+) -> Optional[np.ndarray]:
+    """Exact finite mean after excluding rows, using reusable context totals."""
+    matrix = np.atleast_2d(np.asarray(matrix, dtype=np.float64))
+    excluded_row_mask = np.asarray(excluded_row_mask, dtype=bool).reshape(-1)
+    if excluded_row_mask.size != matrix.shape[0]:
+        raise ValueError("excluded_row_mask length does not match matrix rows")
+    if total_sums is None or total_counts is None:
+        total_sums, total_counts = finite_column_totals(matrix)
+    else:
+        total_sums = np.asarray(total_sums, dtype=np.float64).reshape(-1)
+        total_counts = np.asarray(total_counts, dtype=np.int64).reshape(-1)
+    excluded_sums, excluded_counts = finite_column_totals(matrix[excluded_row_mask])
+    remaining_sums = total_sums - excluded_sums
+    remaining_counts = total_counts - excluded_counts
+    if not np.any(remaining_counts > 0):
+        return None
+    mean = np.full(matrix.shape[1], np.nan, dtype=np.float64)
+    valid = remaining_counts > 0
+    mean[valid] = remaining_sums[valid] / remaining_counts[valid]
+    return mean
 
 
 def direction_agreement_scalar(
@@ -239,6 +404,7 @@ def select_peer_indices(
     n_peers: int,
     max_peers: Optional[int],
     seed_key: str,
+    sampling_seed: int = DEFAULT_PEER_SAMPLING_SEED,
 ) -> np.ndarray:
     """Deterministically subsample peer row indices when a cap is configured.
 
@@ -251,7 +417,10 @@ def select_peer_indices(
         return np.empty(0, dtype=np.int64)
     if max_peers is None or int(max_peers) <= 0 or n_peers <= int(max_peers):
         return np.arange(n_peers, dtype=np.int64)
-    digest = hashlib.blake2b(str(seed_key).encode("utf-8"), digest_size=8).digest()
+    digest = hashlib.blake2b(
+        f"{int(sampling_seed)}|{seed_key}".encode("utf-8"),
+        digest_size=8,
+    ).digest()
     rng = np.random.default_rng(int.from_bytes(digest, "big"))
     chosen = rng.choice(n_peers, size=int(max_peers), replace=False)
     return np.sort(chosen).astype(np.int64)
@@ -314,6 +483,27 @@ def _self_test() -> None:
                         expected,
                     )
 
+        if np.isfinite(query).all():
+            prepared = prepare_spearman_rows(peers)
+            prepared_scores = spearman_against_prepared_peers(query, prepared)
+            assert np.allclose(
+                prepared_scores,
+                spearman_against_peers(query, peers),
+                atol=1e-12,
+                equal_nan=True,
+            )
+            selected_rows = np.asarray([0, 2, 5], dtype=np.int64)
+            assert np.allclose(
+                spearman_against_prepared_peers(
+                    query,
+                    prepared,
+                    row_indices=selected_rows,
+                ),
+                spearman_against_peers(query, peers[selected_rows]),
+                atol=1e-12,
+                equal_nan=True,
+            )
+
     assert spearman_against_peers(np.arange(5.0), np.empty((0, 5))).size == 0
     assert np.all(np.isnan(spearman_against_peers(np.arange(5.0), np.ones((2, 5)))))
     assert select_peer_indices(10, None, "k").tolist() == list(range(10))
@@ -325,6 +515,39 @@ def _self_test() -> None:
         capped, select_peer_indices(1000, 25, "cigs_mce|CVCL_0062|24|10")
     )
     assert not np.array_equal(capped, select_peer_indices(1000, 25, "other_key"))
+    assert not np.array_equal(
+        capped,
+        select_peer_indices(
+            1000,
+            25,
+            "cigs_mce|CVCL_0062|24|10",
+            sampling_seed=20260506,
+        ),
+    )
+    centroid_matrix = np.asarray(
+        [[1.0, 2.0, np.nan], [3.0, 4.0, 9.0], [100.0, 200.0, 300.0]]
+    )
+    eligible_mask = np.asarray([True, True, False])
+    exact_centroid = exact_mean_for_row_mask(centroid_matrix, eligible_mask)
+    assert np.allclose(exact_centroid, [2.0, 3.0, 9.0], equal_nan=True)
+    # Sampling changes only which individual peers are scored, never the centroid.
+    for cap in (1, 2, 512):
+        selected = select_peer_indices(2, cap, "centroid-test")
+        assert selected.size == min(cap, 2)
+        assert np.allclose(
+            exact_mean_for_row_mask(centroid_matrix, eligible_mask),
+            exact_centroid,
+            atol=0.0,
+            equal_nan=True,
+        )
+    context_sums, context_counts = finite_column_totals(centroid_matrix)
+    exclusion_centroid = exact_mean_excluding_row_mask(
+        centroid_matrix,
+        ~eligible_mask,
+        total_sums=context_sums,
+        total_counts=context_counts,
+    )
+    assert np.allclose(exclusion_centroid, exact_centroid, atol=1e-12, equal_nan=True)
     print("peer_baselines self-tests passed.")
 
 

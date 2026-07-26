@@ -57,8 +57,9 @@ baselines comparable to the published ones.
 
 ## W3: dose matching
 
-Dose-threshold sensitivity at 2×, 3×, and 5×, with the original inclusive 10× window
-retained as reference, plus an ECDF of the dose mismatch across matched pairs. The
+Dose-threshold sensitivity at exact dose equality, 2×, and 3×, with the original
+inclusive 10× window retained as a parity reference, plus an ECDF of the dose mismatch
+and an explicit matched-pair count at every threshold. The
 `cell_type + time_key` eligibility rule is recomputed at every threshold and still
 requires at least `MIN_CONTEXT_SHARED_DRUGS` shared compounds.
 
@@ -117,6 +118,9 @@ CPB_FORCE_RECOMPUTE=all jupyter lab                       # ignore every cache
 Note that changing `DATASET_ORDER` invalidates the upstream caches: `matched_pairs` and the
 metric tables were built for the previous dataset set, so force those stages (or delete
 their TSVs) when switching, otherwise later stages score against a stale match table.
+Peer-baseline stages additionally record a configuration fingerprint. Changing the peer
+cap, sampling seed, metric set, or engine version invalidates those caches automatically;
+all cache and task-result writes are published atomically.
 
 ```bash
 uv sync --locked
@@ -133,7 +137,11 @@ Then, in order:
 3. `scripts/precompute_replicate_signature_similarity.py`, then re-run
    `notebooks/replicate_deg_metrics.ipynb` (Tables 7, 8) and
    `notebooks/replicate_signature_similarity.ipynb` (Table 10). Reads and writes
-   `results/replicate_signature_similarity_sep_rep_combined/`.
+   `results/replicate_signature_similarity_sep_rep_combined/`. The notebooks write
+   `tables_7_8_peer_baseline_reviewer_table.tsv` and
+   `table_10_peer_baseline_reviewer_table.tsv`, retaining observed and centroid results
+   alongside peer means, SDs, fractions, corrected percentiles, deltas, and
+   compound-clustered BCa intervals.
 4. `notebooks/overlap_group_rep_retrieval_metrics_reviewer_additions.ipynb` — Table 9.
 5. `notebooks/overlap_group_rep_retrieval_metrics_spearman_addendum.ipynb` — adds Spearman
    and the exact null on top of step 4's saved output.
@@ -145,14 +153,29 @@ Steps 1, 2, and 4 each end with a rebuttal-ready per-dataset-pair table
 
 Replicate peer sets are much larger than cross-dataset ones — CIGS-MCE has 21,426
 replicate-supported conditions over 5,007 compounds — so per-peer scoring costs K× the
-centroid. `--max-baseline-peers` caps how many peers are scored, subsampling
-deterministically per condition; both the total and scored peer counts are recorded so a
-capped run is never mistaken for a full one. Start uncapped on one small dataset to see
-real peer counts in `n_peer_rows_total`.
+centroid. `--max-baseline-peers` defaults to 512 and caps only the individual-peer score
+distribution. The published centroid is always computed from every eligible peer, so
+changing the cap cannot change the legacy result. Sampling is deterministic under
+`--peer-sampling-seed` (default `20260505`); total metadata rows, available vector rows,
+and scored rows are all recorded.
 
-The cross-dataset notebooks set `MAX_BASELINE_PEERS = None` (score every peer) and cover
+The expensive path loads each line/time/dose context once per task, reuses it across
+conditions, and pre-ranks peer rows once for repeated all-gene Spearman scoring. Task
+shards are context-local with a default size of 250 conditions. The cross-dataset
+notebooks use the same 512-peer default and cover
 the `p05` DEG definition; add `"p05_lfc02"` to `PEER_BASELINE_DEFINITION_KEYS` for the
 `|logFC| > 0.2` variant at roughly double the peer-scoring cost.
+
+Before accepting a capped production run, compare 128/256/512/1024 against an uncapped
+reference. The validator enforces 0.01 tolerances for peer means/deltas, 0.02 for
+fractions/percentiles, and unchanged signs for compound-clustered delta intervals:
+
+```bash
+python scripts/validate_peer_baseline_convergence.py \
+  --run 128=results/peers_128 --run 256=results/peers_256 \
+  --run 512=results/peers_512 --run 1024=results/peers_1024 \
+  --run full=results/peers_full --reference-label full
+```
 
 The Spearman addendum deliberately avoids re-running scored work: it reloads
 `matched_sample_pairs.tsv` and `query_retrieval_metrics.tsv` rather than recomputing the
@@ -162,15 +185,16 @@ first and refuses to continue unless that backup contains both metrics.
 
 ## Status
 
-Table 9 results are computed. The Tables 4, 5, 6, 7, 8, and 10 code is written and
-unit-tested against synthetic fixtures but has not yet been run at scale.
+Table 9 results are computed. The optimized Tables 4, 5, 6, 7, 8, and 10 code is written
+and unit-tested against synthetic fixtures but has not yet been rerun at production scale.
 
 ## Verification
 
 - `python scripts/peer_baselines.py` — 200 randomized trials checking the vectorized
   Spearman and direction-agreement paths against scalar reference implementations, covering
   NaNs, tied ranks, constant rows, and gene masks; plus the add-one correction and the
-  determinism of peer subsampling.
+  determinism of peer subsampling. The prepared-rank engine is checked to `1e-12` parity,
+  and regression tests assert that peer caps never change the exact centroid.
 - Parity cells in each notebook section assert the recomputed source-centroid and observed
   columns reproduce the published ones to within 1e-6, and that the per-peer matrix
   averages exactly to the existing centroid.

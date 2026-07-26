@@ -23,7 +23,7 @@ DATASETS="${DATASETS:-all}"
 TOP_K="${TOP_K:-50}"
 MIN_REPLICATES_PER_CONDITION="${MIN_REPLICATES_PER_CONDITION:-2}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-25}"
-CONDITIONS_PER_TASK="${CONDITIONS_PER_TASK:-1000}"
+CONDITIONS_PER_TASK="${CONDITIONS_PER_TASK:-250}"
 MAX_CONCURRENT_TASKS="${MAX_CONCURRENT_TASKS:-32}"
 STRICT_MISSING="${STRICT_MISSING:-1}"
 TEST_ONE_LINE_PER_DATASET="${TEST_ONE_LINE_PER_DATASET:-0}"
@@ -32,7 +32,8 @@ COMPUTE_BASELINE_METRICS="${COMPUTE_BASELINE_METRICS:-0}"
 COMPUTE_DEG_METRICS="${COMPUTE_DEG_METRICS:-0}"
 COMPUTE_RETRIEVAL_METRICS="${COMPUTE_RETRIEVAL_METRICS:-0}"
 MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME="${MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME:-10}"
-MAX_BASELINE_PEERS="${MAX_BASELINE_PEERS:-}"
+MAX_BASELINE_PEERS="${MAX_BASELINE_PEERS:-512}"
+PEER_SAMPLING_SEED="${PEER_SAMPLING_SEED:-20260505}"
 QUICK_TEST_RUN="${QUICK_TEST_RUN:-0}"
 START_STAGE="${START_STAGE:-1}"
 END_STAGE="${END_STAGE:-3}"
@@ -51,7 +52,7 @@ if [ "${QUICK_TEST_RUN}" = "1" ]; then
     COMPUTE_BASELINE_METRICS=1
     COMPUTE_DEG_METRICS=1
     COMPUTE_RETRIEVAL_METRICS=1
-    if [ "${CONDITIONS_PER_TASK}" = "1000" ]; then
+    if [ "${CONDITIONS_PER_TASK}" = "250" ]; then
         CONDITIONS_PER_TASK=32
     fi
     if [ "${MAX_CONCURRENT_TASKS}" = "32" ]; then
@@ -73,6 +74,8 @@ validate_reused_prepare_outputs() {
         TEST_ONE_LINE_PER_DATASET="${TEST_ONE_LINE_PER_DATASET}" \
         TEST_MAX_CONDITIONS_PER_DATASET="${TEST_MAX_CONDITIONS_PER_DATASET}" \
         MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME="${MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME}" \
+        MAX_BASELINE_PEERS="${MAX_BASELINE_PEERS}" \
+        PEER_SAMPLING_SEED="${PEER_SAMPLING_SEED}" \
         python - <<'PY'
 import json
 import os
@@ -134,6 +137,8 @@ refresh_saved_metric_flags() {
         COMPUTE_DEG_METRICS="${COMPUTE_DEG_METRICS}" \
         COMPUTE_RETRIEVAL_METRICS="${COMPUTE_RETRIEVAL_METRICS}" \
         MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME="${MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME}" \
+        MAX_BASELINE_PEERS="${MAX_BASELINE_PEERS}" \
+        PEER_SAMPLING_SEED="${PEER_SAMPLING_SEED}" \
         python - <<'PY'
 import json
 import os
@@ -149,6 +154,9 @@ config["compute_baseline_metrics"] = os.environ["COMPUTE_BASELINE_METRICS"] == "
 config["compute_deg_metrics"] = os.environ["COMPUTE_DEG_METRICS"] == "1"
 config["compute_retrieval_metrics"] = os.environ["COMPUTE_RETRIEVAL_METRICS"] == "1"
 config["min_retrieval_compounds_per_line_time"] = int(os.environ["MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME"])
+config["max_baseline_peers"] = int(os.environ["MAX_BASELINE_PEERS"])
+config["peer_sampling_seed"] = int(os.environ["PEER_SAMPLING_SEED"])
+config["peer_baseline_engine_version"] = 2
 config_path.write_text(json.dumps(config, indent=2))
 PY
 }
@@ -298,6 +306,8 @@ PREP_CMD="UV_CACHE_DIR=${UV_CACHE_DIR} ${UV_BIN} run python ${PRECOMPUTE_SCRIPT}
     --min-replicates-per-condition ${MIN_REPLICATES_PER_CONDITION} \
     --progress-every ${PROGRESS_EVERY} \
     --min-retrieval-compounds-per-line-time ${MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME} \
+    --max-baseline-peers ${MAX_BASELINE_PEERS} \
+    --peer-sampling-seed ${PEER_SAMPLING_SEED} \
     --conditions-per-task ${CONDITIONS_PER_TASK}"
 if [ "${TEST_ONE_LINE_PER_DATASET}" = "1" ]; then
     PREP_CMD="${PREP_CMD} --test-one-line-per-dataset"
@@ -321,6 +331,7 @@ RUN_TASK_CMD="UV_CACHE_DIR=${UV_CACHE_DIR} OMP_NUM_THREADS=${NUMPY_THREADS} OPEN
     --task-id \${SLURM_ARRAY_TASK_ID} \
     --task-output-dir ${TASK_OUTPUT_DIR} \
     --top-k ${TOP_K} \
+    --peer-sampling-seed ${PEER_SAMPLING_SEED} \
     --min-retrieval-compounds-per-line-time ${MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME}"
 if [ "${COMPUTE_BASELINE_METRICS}" = "1" ]; then
     RUN_TASK_CMD="${RUN_TASK_CMD} --compute-baseline-metrics"
@@ -331,12 +342,8 @@ fi
 if [ "${COMPUTE_RETRIEVAL_METRICS}" = "1" ]; then
     RUN_TASK_CMD="${RUN_TASK_CMD} --compute-retrieval-metrics"
 fi
-# Caps how many same line / time / dose other-drug peers are scored individually for the
-# per-peer baselines. Unset scores every peer; the scoring stage records both the total
-# and scored peer counts either way. Only the scoring stage needs this.
-if [ -n "${MAX_BASELINE_PEERS}" ]; then
-    RUN_TASK_CMD="${RUN_TASK_CMD} --max-baseline-peers ${MAX_BASELINE_PEERS}"
-fi
+# The cap affects only individual-peer scoring; the legacy centroid always uses all peers.
+RUN_TASK_CMD="${RUN_TASK_CMD} --max-baseline-peers ${MAX_BASELINE_PEERS}"
 
 RESHARD_CMD="UV_CACHE_DIR=${UV_CACHE_DIR} ${UV_BIN} run python ${PRECOMPUTE_SCRIPT} reshard \
     --output-dir ${OUTPUT_DIR} \
@@ -369,11 +376,8 @@ if [ "${START_STAGE}" -le 1 ] && [ "${END_STAGE}" -ge 1 ]; then
         echo "  baseline metrics: enabled"
     fi
 
-    if [ -n "${MAX_BASELINE_PEERS}" ]; then
-        echo "  per-peer baseline cap: ${MAX_BASELINE_PEERS} peers per condition"
-    else
-        echo "  per-peer baseline cap: none (every peer scored)"
-    fi
+    echo "  per-peer baseline cap: ${MAX_BASELINE_PEERS} peers per condition"
+    echo "  per-peer sampling seed: ${PEER_SAMPLING_SEED}"
     if [ "${COMPUTE_DEG_METRICS}" = "1" ]; then
         echo "  DEG metrics: enabled"
     fi
