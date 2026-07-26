@@ -71,8 +71,7 @@ requires at least `MIN_CONTEXT_SHARED_DRUGS` shared compounds.
 | W1, W3 | 4, 5 | `notebooks/overlap_group_rep_deg_metrics_reviewer_additions.ipynb` | New notebook derived from `overlap_group_rep_deg_metrics.ipynb`; reuses 19 of its 24 code cells verbatim |
 | W1 | 6 | `notebooks/overlap_group_rep_signature_similarity.ipynb` | Section appended; all original cells unchanged |
 | W1 | 7, 8, 10 | `scripts/precompute_replicate_signature_similarity.py` | Per-peer baselines added; source-centroid path unchanged |
-| W1 | 9 | `notebooks/overlap_group_rep_retrieval_metrics_reviewer_additions.ipynb` | New notebook derived from `overlap_group_rep_retrieval_metrics.ipynb`; reuses 11 of its 16 code cells verbatim |
-| W1 | 9 | `notebooks/overlap_group_rep_retrieval_metrics_spearman_addendum.ipynb` | New notebook; adds Spearman and the exact null without repeating scored work |
+| W1 | 9 | `notebooks/overlap_group_rep_retrieval_metrics_reviewer_additions.ipynb` | New notebook derived from `overlap_group_rep_retrieval_metrics.ipynb`; scores negative-L2, cosine, and Spearman together and includes the exact retrieval null |
 
 Unchanged foundations these build on: `scripts/build_overlap_filtered_h5ads.py` produces
 the overlap-filtered `.h5ad` inputs every notebook reads, and
@@ -100,7 +99,7 @@ reloaded and which ran.
 |---|---|
 | `overlap_group_rep_deg_metrics_reviewer_additions` | `matched_pairs`, `deg_metrics`, `deg_ci`, `dose_ci`, `peer_baselines`, `peer_ci` |
 | `overlap_group_rep_signature_similarity` | `matched_pairs`, `signature_metrics`, `signature_ci`, `peer_baselines`, `peer_ci` |
-| `overlap_group_rep_retrieval_metrics_spearman_addendum` | `matched_pairs`, `retrieval_ablation`, `ablation_ci`, `null_calibration`, `null_ci` |
+| `overlap_group_rep_retrieval_metrics_reviewer_additions` | `matched_pairs`, `retrieval_ablation`, `ablation_ci`, `null_calibration`, `null_ci` |
 | `replicate_deg_metrics` | `replicate_deg_ci` |
 | `replicate_signature_similarity` | `replicate_signature_ci` |
 
@@ -142,9 +141,9 @@ Then, in order:
    `table_10_peer_baseline_reviewer_table.tsv`, retaining observed and centroid results
    alongside peer means, SDs, fractions, corrected percentiles, deltas, and
    compound-clustered BCa intervals.
-4. `notebooks/overlap_group_rep_retrieval_metrics_reviewer_additions.ipynb` — Table 9.
-5. `notebooks/overlap_group_rep_retrieval_metrics_spearman_addendum.ipynb` — adds Spearman
-   and the exact null on top of step 4's saved output.
+4. `notebooks/overlap_group_rep_retrieval_metrics_reviewer_additions.ipynb` — Table 9,
+   including negative-L2, cosine, Spearman, individual-signature baselines, and the exact
+   retrieval null in one run.
 
 Steps 1, 2, and 4 each end with a rebuttal-ready per-dataset-pair table
 (`peer_baseline_rebuttal_table.tsv`) carrying every baseline with its bootstrap interval.
