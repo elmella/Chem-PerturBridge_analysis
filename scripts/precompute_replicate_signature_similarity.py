@@ -953,6 +953,7 @@ def build_peer_matrix(
     finite_mask: Optional[np.ndarray],
     n_expected_columns: int,
     seed_key: str,
+    n_total_peers_override: Optional[int] = None,
 ) -> tuple[Optional[np.ndarray], int, int]:
     """Stack the peer vectors that `build_baseline_vector` would have averaged.
 
@@ -963,11 +964,19 @@ def build_peer_matrix(
     present_vectors = [
         np.asarray(vector, dtype=np.float64) for vector in vectors if vector is not None
     ]
-    n_total_peers = int(len(present_vectors))
-    if n_total_peers == 0:
-        return None, 0, 0
+    n_loaded_peers = int(len(present_vectors))
+    if n_loaded_peers == 0:
+        return None, int(n_total_peers_override or 0), 0
 
-    selected = select_peer_indices(n_total_peers, MAX_BASELINE_PEERS, seed_key)
+    # When the caller already applied the cap before loading, `n_total_peers_override`
+    # carries the true peer-set size so the recorded counts stay honest; subsampling again
+    # here would be a no-op at best and a different draw at worst.
+    if n_total_peers_override is None:
+        n_total_peers = n_loaded_peers
+        selected = select_peer_indices(n_total_peers, MAX_BASELINE_PEERS, seed_key)
+    else:
+        n_total_peers = int(n_total_peers_override)
+        selected = np.arange(n_loaded_peers, dtype=np.int64)
     matrix = np.vstack([present_vectors[int(index)] for index in selected]).astype(np.float64)
     if matrix.shape[1] == int(n_expected_columns):
         return matrix, n_total_peers, int(matrix.shape[0])
@@ -2080,6 +2089,18 @@ def compute_condition_metric_record_from_rows(
                 record["n_baseline_peer_rows"] = int(len(baseline_rows))
                 record["n_baseline_peer_compounds"] = int(baseline_rows["pubchem_cid"].astype(str).nunique())
 
+                # Cap before loading, not after: these rows are read twice (local and
+                # global gene sets), so subsampling afterwards would leave the dominant
+                # cost untouched. n_baseline_peer_rows above still records the full set.
+                n_total_baseline_peers = int(len(baseline_rows))
+                capped_positions = select_peer_indices(
+                    n_total_baseline_peers,
+                    MAX_BASELINE_PEERS,
+                    peer_seed_key,
+                )
+                baseline_rows = baseline_rows.iloc[capped_positions].reset_index(drop=True)
+                record["n_baseline_peer_rows_loaded"] = int(len(baseline_rows))
+
                 local_baseline_logfc_vectors, local_baseline_t_vectors = load_vectors_for_rows(
                     baseline_rows,
                     gene_keys=local_gene_keys,
@@ -2187,6 +2208,7 @@ def compute_condition_metric_record_from_rows(
                         finite_mask=finite_local_mask,
                         n_expected_columns=int(local_logfc_matrix.shape[1]),
                         seed_key=peer_seed_key,
+                        n_total_peers_override=n_total_baseline_peers,
                     )
                     record["n_peer_rows_total"] = int(n_total_peers)
                     record["n_peer_rows_scored"] = int(n_scored_peers)
