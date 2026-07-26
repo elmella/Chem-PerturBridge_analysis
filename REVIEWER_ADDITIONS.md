@@ -1,8 +1,8 @@
 # Reviewer additions
 
 Analyses added in response to the NeurIPS review, covering reviewer MDUy's **W1**
-(baseline geometry) and **W3** (permissive dose matching). Table numbers refer to the
-submitted paper.
+(baseline geometry), **W3** (permissive dose matching), and **W4** (uniform per-gene
+population standardization). Table numbers refer to the submitted paper.
 
 Nothing in the published analysis was modified in place. Every addition either lives in a
 new notebook derived from the original, or is appended as a self-contained section after
@@ -63,15 +63,51 @@ and an explicit matched-pair count at every threshold. The
 `cell_type + time_key` eligibility rule is recomputed at every threshold and still
 requires at least `MIN_CONTEXT_SHARED_DRUGS` shared compounds.
 
+## W4: per-gene population standardization
+
+W4 is an additive sensitivity analysis; it never replaces raw logFC. For every dataset
+and cell type, each gene is transformed over all eligible non-control grouped-condition
+signatures:
+
+```text
+z[source, cell, condition, gene] =
+    (logFC - population mean[source, cell, gene])
+    / population SD[source, cell, gene]
+```
+
+Population SD uses `ddof=0`. Eligibility requires a non-control row, a valid compound,
+finite time, and a finite positive dose. A gene is valid when it has at least two finite
+population values and a finite, nonzero SD. The first duplicate gene symbol is retained,
+matching the notebooks' `LineSource` behavior.
+
+This applies the same gene-wise population-axis procedure to every source. It is not a
+signature-global z-score (which would leave Spearman unchanged), does not pool datasets
+or cell types, and does not claim to reconstruct the Broad plate-level Level 4 pipeline.
+Source × cell type is the reproducible analogue available across all harmonized sources.
+
+W4 reports raw logFC beside `per_gene_population_zscore` for:
+
+- Table 4: DEG-restricted logFC Spearman under the fixed raw
+  `adj.P.Value < 0.05` masks. Adjusted p-values, DEG membership, overlap, and biological
+  direction remain raw.
+- Table 6: all-gene matched-signature Spearman.
+- Table 9: strict-condition logFC retrieval using negative-L2, cosine, and Spearman,
+  with the exact target-decoy null, source/target centroids, source/target individual
+  peers, and within-source positive controls.
+
+Within-source Tables 7, 8, and 10 and Table 5 direction agreement are intentionally
+outside W4 scope.
+
 ## File map
 
 | Reviewer point | Tables | File | Relationship to the published code |
 |---|---|---|---|
 | W1 shared machinery | all | `scripts/peer_baselines.py` | New module |
-| W1, W3 | 4, 5 | `notebooks/overlap_group_rep_deg_metrics_reviewer_additions.ipynb` | New notebook derived from `overlap_group_rep_deg_metrics.ipynb`; reuses 19 of its 24 code cells verbatim |
-| W1 | 6 | `notebooks/overlap_group_rep_signature_similarity.ipynb` | Section appended; all original cells unchanged |
+| W4 shared machinery | 4, 6, 9 | `scripts/population_zscore.py` | New streaming, source-context statistics and cache module |
+| W1, W3, W4 | 4, 5 | `notebooks/overlap_group_rep_deg_metrics_reviewer_additions.ipynb` | New notebook derived from `overlap_group_rep_deg_metrics.ipynb`; W4 section appended |
+| W1, W4 | 6 | `notebooks/overlap_group_rep_signature_similarity.ipynb` | Sections appended; all original cells unchanged |
 | W1 | 7, 8, 10 | `scripts/precompute_replicate_signature_similarity.py` | Per-peer baselines added; source-centroid path unchanged |
-| W1 | 9 | `notebooks/overlap_group_rep_retrieval_metrics_reviewer_additions.ipynb` | New notebook derived from `overlap_group_rep_retrieval_metrics.ipynb`; scores negative-L2, cosine, and Spearman together and includes the exact retrieval null |
+| W1, W4 | 9 | `notebooks/overlap_group_rep_retrieval_metrics_reviewer_additions.ipynb` | New notebook derived from `overlap_group_rep_retrieval_metrics.ipynb`; scores negative-L2, cosine, and Spearman together and includes the exact retrieval null |
 
 Unchanged foundations these build on: `scripts/build_overlap_filtered_h5ads.py` produces
 the overlap-filtered `.h5ad` inputs every notebook reads, and
@@ -97,9 +133,9 @@ reloaded and which ran.
 
 | Notebook | Stages |
 |---|---|
-| `overlap_group_rep_deg_metrics_reviewer_additions` | `matched_pairs`, `deg_metrics`, `deg_ci`, `dose_ci`, `peer_baselines`, `peer_ci` |
-| `overlap_group_rep_signature_similarity` | `matched_pairs`, `signature_metrics`, `signature_ci`, `peer_baselines`, `peer_ci` |
-| `overlap_group_rep_retrieval_metrics_reviewer_additions` | `matched_pairs`, `retrieval_ablation`, `ablation_ci`, `null_calibration`, `null_ci` |
+| `overlap_group_rep_deg_metrics_reviewer_additions` | `matched_pairs`, `deg_metrics`, `deg_ci`, `dose_ci`, `peer_baselines`, `peer_ci`, `w4_deg_metrics`, `w4_deg_ci` |
+| `overlap_group_rep_signature_similarity` | `matched_pairs`, `signature_metrics`, `signature_ci`, `peer_baselines`, `peer_ci`, `w4_signature_metrics`, `w4_signature_ci` |
+| `overlap_group_rep_retrieval_metrics_reviewer_additions` | `matched_pairs`, `retrieval_ablation`, `ablation_ci`, `null_calibration`, `null_ci`, `w4_retrieval_metrics`, `w4_retrieval_ci` |
 | `replicate_deg_metrics` | `replicate_deg_ci` |
 | `replicate_signature_similarity` | `replicate_signature_ci` |
 
@@ -120,6 +156,19 @@ their TSVs) when switching, otherwise later stages score against a stale match t
 Peer-baseline stages additionally record a configuration fingerprint. Changing the peer
 cap, sampling seed, metric set, or engine version invalidates those caches automatically;
 all cache and task-result writes are published atomically.
+
+W4 population-statistic caches are independent of notebook output caches and live at:
+
+```text
+results/w4_population_zscore_stats/<dataset>/<cell_type>.npz
+results/w4_population_zscore_stats/<dataset>/<cell_type>.cache.json
+```
+
+The source path, size, modification time, layer shape, gene order, eligibility mask,
+`ddof`, and W4 engine version are fingerprinted. The first W4 notebook scans each selected
+source-context once; later notebooks reload the same statistics. Subset runs therefore
+reuse only the selected source-context caches and write into the notebook's isolated
+subset output directory.
 
 ```bash
 uv sync --locked
@@ -147,6 +196,16 @@ Then, in order:
 
 Steps 1, 2, and 4 each end with a rebuttal-ready per-dataset-pair table
 (`peer_baseline_rebuttal_table.tsv`) carrying every baseline with its bootstrap interval.
+Their appended W4 sections additionally write:
+
+| Table | Primary W4 outputs |
+|---|---|
+| 4 | `w4_matched_sample_pair_deg_metrics.tsv`, `w4_deg_dataset_pair_summary.tsv`, `w4_deg_cluster_bca_ci.tsv`, `w4_table_4_standardization.tsv` |
+| 6 | `w4_matched_sample_pair_metrics.tsv`, `w4_dataset_pair_summary.tsv`, `w4_cluster_bca_ci.tsv`, `w4_table_6_standardization.tsv` |
+| 9 | `w4_retrieval_query_metrics.tsv`, `w4_retrieval_peer_scores.tsv`, `w4_retrieval_dataset_pair_summary.tsv`, `w4_retrieval_cluster_bca_ci.tsv`, `w4_table_9_standardization.tsv` |
+
+Each W4 output directory also contains `w4_population_stats_qc.tsv`, including population
+row counts, valid-gene counts, finite-count ranges, fingerprints, and shared cache paths.
 
 ### Compute notes
 
@@ -176,16 +235,11 @@ python scripts/validate_peer_baseline_convergence.py \
   --run full=results/peers_full --reference-label full
 ```
 
-The Spearman addendum deliberately avoids re-running scored work: it reloads
-`matched_sample_pairs.tsv` and `query_retrieval_metrics.tsv` rather than recomputing the
-dose matching and the main retrieval loop, and scores only the Spearman similarity before
-merging with the saved Euclidean and cosine rows. It backs up the existing ablation TSV
-first and refuses to continue unless that backup contains both metrics.
-
 ## Status
 
-Table 9 results are computed. The optimized Tables 4, 5, 6, 7, 8, and 10 code is written
-and unit-tested against synthetic fixtures but has not yet been rerun at production scale.
+The W1/W3 and W4 code is implemented and unit-tested against synthetic fixtures. W4 has
+also completed a backed, chunked scan of a real grouped-condition `.h5ad` source. The
+appended W4 notebook sections have not yet been run at production scale.
 
 ## Verification
 
@@ -202,3 +256,9 @@ and unit-tested against synthetic fixtures but has not yet been rerun at product
 - The Spearman helper was checked against `scipy.stats.spearmanr` to 1e-17 including tied
   ranks, and the exact-null calibration against simulation (mean mid-P transform 0.4952 on
   null data, where 0.5 is expected).
+- `python -m unittest discover -s tests -p 'test_population_zscore.py'` checks streaming
+  statistics against dense NumPy `axis=0, ddof=0`, NaNs, duplicate genes, zero variance,
+  insufficient observations, strict gene order, source-context isolation, z-score
+  mean/SD, centroid equivalence, cache reloads, and the add-one peer correction.
+- W4 notebook checks require identical raw and standardized matched-pair/query IDs,
+  unchanged Table 4 DEG counts, and identical Table 9 target-pool and positive counts.
