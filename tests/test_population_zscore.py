@@ -6,6 +6,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import anndata as ad
@@ -21,7 +22,10 @@ from scripts.precompute_population_zscore import (
 from scripts.population_zscore import (
     DATASET_CELL_TYPE_SCOPE,
     DATASET_SCOPE,
+    PER_GENE_DATASET_CELL_TYPE_VARIANT,
+    PER_GENE_DATASET_VARIANT,
     PopulationCacheReadiness,
+    PopulationStatsCatalog,
     align_population_stats,
     check_dataset_population_cache_readiness,
     dataset_stats_cache_path,
@@ -72,6 +76,335 @@ def write_fixture(
 
 
 class PopulationZScoreTests(unittest.TestCase):
+    def test_population_stats_catalog_owns_population_scope_and_readiness_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            source_paths = {
+                "CVCL_A": source_dir / "CVCL_A_de.h5ad",
+                "CVCL_B": source_dir / "CVCL_B.h5ad",
+            }
+            write_fixture(
+                source_paths["CVCL_A"],
+                np.asarray([[1.0, 10.0], [2.0, 20.0]]),
+                cell_type="CVCL_A",
+            )
+            write_fixture(
+                source_paths["CVCL_B"],
+                np.asarray([[3.0, 30.0], [4.0, 40.0]]),
+                cell_type="CVCL_B",
+            )
+
+            def resolve_line_path(dataset_name: str, cell_type: str) -> Path:
+                self.assertEqual(dataset_name, "source")
+                return source_paths[cell_type]
+
+            common_kwargs = {
+                "source_dataset_dirs": {"source": source_dir},
+                "matched_lines": {"source": ["CVCL_A"]},
+                "matched_dataset_names": ["source"],
+                "resolve_line_path": resolve_line_path,
+                "cache_root": root / "cache",
+            }
+
+            with patch(
+                "scripts.population_zscore.ensure_population_caches_ready"
+            ) as ensure_ready:
+                production = PopulationStatsCatalog(
+                    **common_kwargs,
+                    precompute_mode="stop",
+                    poll_seconds=7.0,
+                    timeout_seconds=90.0,
+                )
+            self.assertEqual(production.population_policy, "all_dataset_lines")
+            self.assertEqual(
+                production.dataset_population_source_paths("source"),
+                source_paths,
+            )
+            ensure_ready.assert_called_once_with(
+                dataset_sources={"source": source_paths},
+                cache_root=root / "cache",
+                wait=False,
+                poll_seconds=7.0,
+                timeout_seconds=90.0,
+            )
+
+            with patch(
+                "scripts.population_zscore.ensure_population_caches_ready"
+            ) as ensure_ready:
+                PopulationStatsCatalog(
+                    **common_kwargs,
+                    precompute_mode="wait",
+                    poll_seconds=5.0,
+                    timeout_seconds=120.0,
+                )
+            self.assertTrue(ensure_ready.call_args.kwargs["wait"])
+            self.assertEqual(ensure_ready.call_args.kwargs["poll_seconds"], 5.0)
+            self.assertEqual(
+                ensure_ready.call_args.kwargs["timeout_seconds"],
+                120.0,
+            )
+
+            with patch(
+                "scripts.population_zscore.ensure_population_caches_ready"
+            ) as ensure_ready:
+                with redirect_stdout(io.StringIO()):
+                    smoke = PopulationStatsCatalog(
+                        **common_kwargs,
+                        smoke_comparison_population=True,
+                        precompute_mode="lazy",
+                    )
+            ensure_ready.assert_not_called()
+            self.assertEqual(
+                smoke.population_policy,
+                "comparison_retained_lines_smoke",
+            )
+            self.assertEqual(
+                smoke.dataset_population_source_paths("source"),
+                {"CVCL_A": source_paths["CVCL_A"]},
+            )
+
+            with self.assertRaisesRegex(ValueError, "stop, wait, or lazy"):
+                PopulationStatsCatalog(
+                    **common_kwargs,
+                    precompute_mode="unknown",
+                )
+            with self.assertRaisesRegex(ValueError, "poll_seconds"):
+                PopulationStatsCatalog(
+                    **common_kwargs,
+                    precompute_mode="lazy",
+                    poll_seconds=0.0,
+                )
+            with self.assertRaisesRegex(KeyError, "no population source"):
+                PopulationStatsCatalog(
+                    source_dataset_dirs={"source": source_dir},
+                    matched_lines={"missing": ["CVCL_A"]},
+                    matched_dataset_names=["missing"],
+                    resolve_line_path=resolve_line_path,
+                    cache_root=root / "cache",
+                    precompute_mode="lazy",
+                )
+
+    def test_population_stats_catalog_caches_both_scopes_and_aligns_gene_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            source_paths = {
+                "CVCL_A": source_dir / "CVCL_A_de.h5ad",
+                "CVCL_B": source_dir / "CVCL_B_de.h5ad",
+            }
+            write_fixture(
+                source_paths["CVCL_A"],
+                np.asarray(
+                    [
+                        [1.0, 10.0, 100.0],
+                        [3.0, 30.0, 300.0],
+                        [5.0, 50.0, 500.0],
+                    ]
+                ),
+                cell_type="CVCL_A",
+                symbols=["A", "B", "C"],
+            )
+            write_fixture(
+                source_paths["CVCL_B"],
+                np.asarray(
+                    [
+                        [700.0, 7.0, 1000.0],
+                        [900.0, 9.0, 1400.0],
+                        [1100.0, 11.0, 1800.0],
+                    ]
+                ),
+                cell_type="CVCL_B",
+                symbols=["C", "A", "D"],
+            )
+            catalog = PopulationStatsCatalog(
+                source_dataset_dirs={"source": source_dir},
+                matched_lines={"source": ["CVCL_A", "CVCL_B"]},
+                matched_dataset_names=["source"],
+                resolve_line_path=lambda dataset, cell_type: source_paths[
+                    cell_type
+                ],
+                cache_root=root / "cache",
+                precompute_mode="lazy",
+            )
+            source_a = SimpleNamespace(
+                dataset_name="source",
+                cell_type="CVCL_A",
+                path=source_paths["CVCL_A"],
+                unique_gene_keys=np.asarray(["A", "B", "C"]),
+            )
+            source_b = SimpleNamespace(
+                dataset_name="source",
+                cell_type="CVCL_B",
+                path=source_paths["CVCL_B"],
+                unique_gene_keys=np.asarray(["C", "A", "D"]),
+            )
+
+            line_stats = catalog.get_stats(
+                source_a,
+                scale_variant=PER_GENE_DATASET_CELL_TYPE_VARIANT,
+            )
+            self.assertIs(
+                line_stats,
+                catalog.get_stats(
+                    source_a,
+                    scale_variant=PER_GENE_DATASET_CELL_TYPE_VARIANT,
+                ),
+            )
+
+            pooled_a = catalog.get_stats(
+                source_a,
+                scale_variant=PER_GENE_DATASET_VARIANT,
+            )
+            self.assertIs(
+                pooled_a,
+                catalog.get_stats(
+                    source_a,
+                    scale_variant=PER_GENE_DATASET_VARIANT,
+                ),
+            )
+            pooled_b = catalog.get_stats(
+                source_b,
+                scale_variant=PER_GENE_DATASET_VARIANT,
+            )
+
+            self.assertEqual(len(catalog.pooled_stats_by_dataset), 1)
+            self.assertEqual(len(catalog.stats_by_source), 3)
+            np.testing.assert_array_equal(
+                pooled_a.gene_keys,
+                source_a.unique_gene_keys,
+            )
+            np.testing.assert_array_equal(
+                pooled_b.gene_keys,
+                source_b.unique_gene_keys,
+            )
+            pooled = catalog.pooled_stats_by_dataset["source"]
+            for gene_key, aligned_position in zip(
+                pooled_b.gene_keys,
+                range(len(pooled_b.gene_keys)),
+            ):
+                pooled_position = int(
+                    np.flatnonzero(pooled.gene_keys == gene_key)[0]
+                )
+                self.assertEqual(
+                    pooled_b.means[aligned_position],
+                    pooled.means[pooled_position],
+                )
+
+            with self.assertRaisesRegex(ValueError, "Unknown W4 scale variant"):
+                catalog.get_stats(source_a, scale_variant="not-a-variant")
+
+    def test_population_stats_catalog_standardizes_full_and_aligned_values(self):
+        matrix = np.asarray(
+            [
+                [1.0, 10.0, 5.0],
+                [3.0, 30.0, 5.0],
+                [5.0, 50.0, 5.0],
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            source_path = source_dir / "CVCL_A_de.h5ad"
+            write_fixture(
+                source_path,
+                matrix,
+                cell_type="CVCL_A",
+                symbols=["A", "B", "C"],
+            )
+            catalog = PopulationStatsCatalog(
+                source_dataset_dirs={"source": source_dir},
+                matched_lines={"source": ["CVCL_A"]},
+                matched_dataset_names=["source"],
+                resolve_line_path=lambda dataset, cell_type: source_path,
+                cache_root=root / "cache",
+                precompute_mode="lazy",
+            )
+            source = SimpleNamespace(
+                dataset_name="source",
+                cell_type="CVCL_A",
+                path=source_path,
+                unique_gene_keys=np.asarray(["A", "B", "C"]),
+            )
+            stats = catalog.get_stats(
+                source,
+                scale_variant=PER_GENE_DATASET_CELL_TYPE_VARIANT,
+            )
+
+            expected_matrix = standardize_matrix(
+                matrix,
+                gene_keys=source.unique_gene_keys,
+                stats=stats,
+            )
+            expected_vector = standardize_vector(
+                matrix[0],
+                gene_keys=source.unique_gene_keys,
+                stats=stats,
+            )
+            np.testing.assert_allclose(
+                catalog.standardize_matrix(
+                    source,
+                    matrix,
+                    scale_variant=PER_GENE_DATASET_CELL_TYPE_VARIANT,
+                ),
+                expected_matrix,
+                equal_nan=True,
+            )
+            np.testing.assert_allclose(
+                catalog.standardize_vector(
+                    source,
+                    matrix[0],
+                    scale_variant=PER_GENE_DATASET_CELL_TYPE_VARIANT,
+                ),
+                expected_vector,
+                equal_nan=True,
+            )
+
+            positions = np.asarray([1, 0, 2], dtype=np.int64)
+            selected = matrix[:, positions].copy()
+            selected[1, 0] = np.nan
+            expected_aligned = expected_matrix[:, positions].copy()
+            expected_aligned[1, 0] = np.nan
+            np.testing.assert_allclose(
+                catalog.standardize_aligned_matrix(
+                    source,
+                    selected,
+                    positions,
+                    scale_variant=PER_GENE_DATASET_CELL_TYPE_VARIANT,
+                ),
+                expected_aligned,
+                equal_nan=True,
+            )
+            np.testing.assert_allclose(
+                catalog.standardize_aligned_vector(
+                    source,
+                    selected[0],
+                    positions,
+                    scale_variant=PER_GENE_DATASET_CELL_TYPE_VARIANT,
+                ),
+                expected_aligned[0],
+                equal_nan=True,
+            )
+            self.assertTrue(np.isnan(expected_aligned[:, 2]).all())
+
+            with self.assertRaisesRegex(ValueError, "Aligned vector width"):
+                catalog.standardize_aligned_vector(
+                    source,
+                    np.asarray([1.0]),
+                    positions,
+                    scale_variant=PER_GENE_DATASET_CELL_TYPE_VARIANT,
+                )
+            with self.assertRaisesRegex(ValueError, "Aligned matrix width"):
+                catalog.standardize_aligned_matrix(
+                    source,
+                    np.ones((2, 1)),
+                    positions,
+                    scale_variant=PER_GENE_DATASET_CELL_TYPE_VARIANT,
+                )
+
     def test_cache_readiness_is_metadata_only_and_tracks_both_scopes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

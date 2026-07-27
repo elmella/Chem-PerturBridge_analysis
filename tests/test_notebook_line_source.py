@@ -1,72 +1,17 @@
-import ast
-import json
 import tempfile
 import unittest
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 
-from scripts.cross_source_strata import SignatureStratum
-
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-LINE_SOURCE_NOTEBOOKS = (
-    REPO_ROOT / "notebooks" / "overlap_group_rep_signature_similarity.ipynb",
-    REPO_ROOT
-    / "notebooks"
-    / "overlap_group_rep_deg_metrics_reviewer_additions.ipynb",
-    REPO_ROOT
-    / "notebooks"
-    / "overlap_group_rep_retrieval_metrics_reviewer_additions.ipynb",
+from scripts.cross_source_core import (
+    LineSource,
+    first_available_layer,
+    line_source_stratum_arrays,
+    select_line_source_peers,
 )
-
-
-def coerce_control_mask(values: pd.Series) -> pd.Series:
-    normalized = values.astype("string").fillna("").astype(str).str.lower()
-    return normalized.isin({"true", "1", "yes"})
-
-
-def normalize_pubchem_cid_values(values: pd.Series) -> pd.Series:
-    return values.astype("string").fillna("").astype(str).str.strip()
-
-
-def format_numeric(value: float) -> str:
-    return np.format_float_positional(float(value), trim="-")
-
-
-def load_notebook_line_source(path: Path):
-    notebook = json.loads(path.read_text())
-    for cell in notebook["cells"]:
-        if cell.get("cell_type") != "code":
-            continue
-        source = "".join(cell.get("source", []))
-        if "class LineSource:" not in source:
-            continue
-        tree = ast.parse(source, filename=str(path))
-        class_node = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.ClassDef) and node.name == "LineSource"
-        )
-        namespace = {
-            "SignatureStratum": SignatureStratum,
-            "Path": Path,
-            "ad": ad,
-            "coerce_control_mask": coerce_control_mask,
-            "dataclass": dataclass,
-            "field": field,
-            "format_numeric": format_numeric,
-            "normalize_pubchem_cid_values": normalize_pubchem_cid_values,
-            "np": np,
-            "pd": pd,
-        }
-        module = ast.Module(body=[class_node], type_ignores=[])
-        exec(compile(module, str(path), "exec"), namespace)
-        return namespace["LineSource"]
-    raise AssertionError(f"No LineSource class found in {path}")
 
 
 def write_duplicate_compound_fixture(path: Path) -> None:
@@ -107,29 +52,70 @@ class NotebookLineSourceTests(unittest.TestCase):
             fixture_path = Path(directory) / "CVCL_TEST_de.h5ad"
             write_duplicate_compound_fixture(fixture_path)
 
-            for notebook_path in LINE_SOURCE_NOTEBOOKS:
-                with self.subTest(notebook=notebook_path.name):
-                    line_source_type = load_notebook_line_source(notebook_path)
-                    source = line_source_type(
-                        dataset_name="source",
-                        cell_type="CVCL_TEST",
-                        path=fixture_path,
-                    )
-                    try:
-                        first = source.get_baseline_vector("row_a1", "logFC")
-                        second = source.get_baseline_vector("row_a2", "logFC")
-                        np.testing.assert_allclose(first, [3.0, 5.0])
-                        np.testing.assert_allclose(second, first)
-                        self.assertEqual(
-                            source.baseline_peer_count("row_a1"),
-                            2,
-                        )
-                        self.assertEqual(
-                            source.baseline_peer_count("row_a2"),
-                            2,
-                        )
-                    finally:
-                        source.close()
+            source = LineSource(
+                dataset_name="source",
+                cell_type="CVCL_TEST",
+                path=fixture_path,
+            )
+            try:
+                first = source.get_baseline_vector("row_a1", "logFC")
+                second = source.get_baseline_vector("row_a2", "logFC")
+                np.testing.assert_allclose(first, [3.0, 5.0])
+                np.testing.assert_allclose(second, first)
+                self.assertEqual(
+                    source.baseline_peer_count("row_a1"),
+                    2,
+                )
+                self.assertEqual(
+                    source.baseline_peer_count("row_a2"),
+                    2,
+                )
+            finally:
+                source.close()
+
+    def test_shared_peer_selection_reuses_the_centroid_stratum(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / "CVCL_TEST_de.h5ad"
+            write_duplicate_compound_fixture(fixture_path)
+            source = LineSource(
+                dataset_name="source",
+                cell_type="CVCL_TEST",
+                path=fixture_path,
+            )
+            try:
+                selection = select_line_source_peers(
+                    source,
+                    "row_a1",
+                    pubchem_cid="A",
+                    dose_key="0.05",
+                    time_key="24",
+                    max_peers=None,
+                    sampling_seed=2025,
+                )
+                self.assertEqual(selection.total_count, 2)
+                self.assertEqual(selection.selected_count, 2)
+                np.testing.assert_allclose(
+                    selection.stratum.values[selection.row_indices],
+                    [[1.0, 3.0], [5.0, 7.0]],
+                )
+                compounds, values = line_source_stratum_arrays(
+                    source,
+                    dose_key="0.05",
+                    time_key="24",
+                )
+                np.testing.assert_array_equal(
+                    compounds,
+                    selection.stratum.compounds,
+                )
+                self.assertIs(values, selection.stratum.values)
+                self.assertEqual(
+                    first_available_layer(source, ["missing", "logFC"]),
+                    "logFC",
+                )
+                with self.assertRaisesRegex(KeyError, "available layers"):
+                    first_available_layer(source, ["missing"])
+            finally:
+                source.close()
 
 
 if __name__ == "__main__":

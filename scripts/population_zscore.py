@@ -29,7 +29,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Mapping, Optional, Sequence, Union
+from typing import Callable, Iterator, Mapping, Optional, Sequence, Union
 
 import anndata as ad
 import fcntl
@@ -45,6 +45,14 @@ DATASET_CELL_TYPE_SCOPE = "dataset_cell_type"
 DATASET_SCOPE = "dataset"
 DATASET_WIDE_CELL_TYPE = "__all_cell_types__"
 DATASET_WIDE_CACHE_NAMESPACE = "dataset_wide"
+PER_GENE_DATASET_CELL_TYPE_VARIANT = (
+    "per_gene_population_zscore_dataset_cell_type"
+)
+PER_GENE_DATASET_VARIANT = "per_gene_population_zscore_dataset"
+POPULATION_SCALE_VARIANTS = (
+    PER_GENE_DATASET_CELL_TYPE_VARIANT,
+    PER_GENE_DATASET_VARIANT,
+)
 
 
 def infer_line_cell_type(path: Union[str, Path]) -> str:
@@ -1539,3 +1547,252 @@ def stats_qc_record(stats: PopulationGeneStats) -> dict[str, object]:
         "fingerprint": stats.fingerprint,
         "cache_path": str(stats.cache_path),
     }
+
+
+class PopulationStatsCatalog:
+    """Own W4 population policy, readiness, fitted statistics, and alignment.
+
+    All three cross-source notebooks use this catalog. Metric-specific notebooks
+    retain their own query construction and scoring, while this module owns the
+    definition and lifecycle of the population standardization itself.
+    """
+
+    def __init__(
+        self,
+        *,
+        source_dataset_dirs: Mapping[str, Path],
+        matched_lines: Mapping[str, Sequence[str]],
+        matched_dataset_names: Sequence[str],
+        resolve_line_path: Callable[[str, str], Path],
+        cache_root: Path,
+        smoke_comparison_population: bool = False,
+        precompute_mode: str = "wait",
+        poll_seconds: float = 30.0,
+        timeout_seconds: float = 12.0 * 60.0 * 60.0,
+    ) -> None:
+        precompute_mode = str(precompute_mode).strip().lower()
+        if precompute_mode not in {"stop", "wait", "lazy"}:
+            raise ValueError("precompute_mode must be stop, wait, or lazy")
+        if float(poll_seconds) <= 0.0:
+            raise ValueError("poll_seconds must be positive")
+        if float(timeout_seconds) <= 0.0:
+            raise ValueError("timeout_seconds must be positive")
+
+        self.source_dataset_dirs = {
+            str(dataset_name): Path(path)
+            for dataset_name, path in source_dataset_dirs.items()
+        }
+        self.matched_lines = {
+            str(dataset_name): sorted(
+                {str(cell_type) for cell_type in cell_types}
+            )
+            for dataset_name, cell_types in matched_lines.items()
+        }
+        self.matched_dataset_names = [
+            str(dataset_name) for dataset_name in matched_dataset_names
+        ]
+        self.resolve_line_path = resolve_line_path
+        self.cache_root = Path(cache_root)
+        self.smoke_comparison_population = bool(
+            smoke_comparison_population
+        )
+        self.precompute_mode = precompute_mode
+        self.poll_seconds = float(poll_seconds)
+        self.timeout_seconds = float(timeout_seconds)
+        self.stats_by_source: dict[
+            tuple[str, str, str],
+            PopulationGeneStats,
+        ] = {}
+        self.pooled_stats_by_dataset: dict[str, PopulationGeneStats] = {}
+
+        unknown = sorted(
+            set(self.matched_dataset_names) - set(self.source_dataset_dirs)
+        )
+        if unknown:
+            raise KeyError(
+                f"Matched datasets have no population source directory: {unknown}"
+            )
+        if self.smoke_comparison_population:
+            print(
+                "WARNING: W4 smoke population enabled; results are execution "
+                "checks, not production reviewer estimates.",
+                flush=True,
+            )
+        elif self.precompute_mode != "lazy":
+            ensure_population_caches_ready(
+                dataset_sources={
+                    dataset_name: self.dataset_population_source_paths(
+                        dataset_name
+                    )
+                    for dataset_name in self.matched_dataset_names
+                },
+                cache_root=self.cache_root,
+                wait=self.precompute_mode == "wait",
+                poll_seconds=self.poll_seconds,
+                timeout_seconds=self.timeout_seconds,
+            )
+
+    @property
+    def population_policy(self) -> str:
+        return (
+            "comparison_retained_lines_smoke"
+            if self.smoke_comparison_population
+            else "all_dataset_lines"
+        )
+
+    def dataset_population_source_paths(
+        self,
+        dataset_name: str,
+    ) -> dict[str, Path]:
+        dataset_name = str(dataset_name)
+        if dataset_name not in self.source_dataset_dirs:
+            raise KeyError(
+                f"No population source directory for dataset {dataset_name!r}"
+            )
+        if not self.smoke_comparison_population:
+            return discover_dataset_population_sources(
+                self.source_dataset_dirs[dataset_name]
+            )
+        cell_types = self.matched_lines.get(dataset_name, [])
+        return {
+            cell_type: Path(
+                self.resolve_line_path(dataset_name, cell_type)
+            )
+            for cell_type in cell_types
+        }
+
+    def get_stats(
+        self,
+        source,
+        *,
+        scale_variant: str,
+    ) -> PopulationGeneStats:
+        scale_variant = str(scale_variant)
+        if scale_variant not in POPULATION_SCALE_VARIANTS:
+            raise ValueError(
+                f"Unknown W4 scale variant: {scale_variant!r}; expected "
+                f"one of {POPULATION_SCALE_VARIANTS}"
+            )
+        key = (
+            scale_variant,
+            str(source.dataset_name),
+            str(source.cell_type),
+        )
+        if key not in self.stats_by_source:
+            if scale_variant == PER_GENE_DATASET_CELL_TYPE_VARIANT:
+                stats = load_or_fit_population_stats(
+                    source_path=source.path,
+                    dataset_name=source.dataset_name,
+                    cell_type=source.cell_type,
+                    cache_root=self.cache_root,
+                )
+            else:
+                dataset_name = str(source.dataset_name)
+                if dataset_name not in self.pooled_stats_by_dataset:
+                    self.pooled_stats_by_dataset[dataset_name] = (
+                        load_or_fit_dataset_population_stats(
+                            source_paths=self.dataset_population_source_paths(
+                                dataset_name
+                            ),
+                            dataset_name=dataset_name,
+                            cache_root=self.cache_root,
+                        )
+                    )
+                stats = align_population_stats(
+                    self.pooled_stats_by_dataset[dataset_name],
+                    np.asarray(source.unique_gene_keys).astype(str),
+                )
+            expected_gene_keys = np.asarray(
+                source.unique_gene_keys
+            ).astype(str)
+            if not np.array_equal(stats.gene_keys, expected_gene_keys):
+                raise AssertionError(
+                    f"W4 gene order disagrees with LineSource for {key}"
+                )
+            self.stats_by_source[key] = stats
+        return self.stats_by_source[key]
+
+    def standardize_vector(
+        self,
+        source,
+        values: np.ndarray,
+        *,
+        scale_variant: str,
+    ) -> np.ndarray:
+        return standardize_vector(
+            values,
+            gene_keys=source.unique_gene_keys,
+            stats=self.get_stats(source, scale_variant=scale_variant),
+        )
+
+    def standardize_matrix(
+        self,
+        source,
+        values: np.ndarray,
+        *,
+        scale_variant: str,
+    ) -> np.ndarray:
+        return standardize_matrix(
+            values,
+            gene_keys=source.unique_gene_keys,
+            stats=self.get_stats(source, scale_variant=scale_variant),
+        )
+
+    def standardize_aligned_vector(
+        self,
+        source,
+        values: np.ndarray,
+        source_gene_positions: np.ndarray,
+        *,
+        scale_variant: str,
+    ) -> np.ndarray:
+        stats = self.get_stats(source, scale_variant=scale_variant)
+        positions = np.asarray(source_gene_positions, dtype=np.int64)
+        selected = np.asarray(values, dtype=np.float64).reshape(-1)
+        if selected.size != positions.size:
+            raise ValueError(
+                "Aligned vector width does not match source_gene_positions"
+            )
+        standardized = np.full(selected.shape, np.nan, dtype=np.float64)
+        valid = stats.valid_mask[positions] & np.isfinite(selected)
+        with np.errstate(
+            invalid="ignore",
+            divide="ignore",
+            over="ignore",
+        ):
+            standardized[valid] = (
+                selected[valid] - stats.means[positions][valid]
+            ) / stats.population_sds[positions][valid]
+        standardized[~np.isfinite(standardized)] = np.nan
+        return standardized
+
+    def standardize_aligned_matrix(
+        self,
+        source,
+        values: np.ndarray,
+        source_gene_positions: np.ndarray,
+        *,
+        scale_variant: str,
+    ) -> np.ndarray:
+        stats = self.get_stats(source, scale_variant=scale_variant)
+        positions = np.asarray(source_gene_positions, dtype=np.int64)
+        selected = np.atleast_2d(np.asarray(values, dtype=np.float64))
+        if selected.shape[1] != positions.size:
+            raise ValueError(
+                "Aligned matrix width does not match source_gene_positions"
+            )
+        standardized = np.full(selected.shape, np.nan, dtype=np.float64)
+        valid_genes = stats.valid_mask[positions]
+        with np.errstate(
+            invalid="ignore",
+            divide="ignore",
+            over="ignore",
+        ):
+            standardized[:, valid_genes] = (
+                selected[:, valid_genes]
+                - stats.means[positions][None, valid_genes]
+            ) / stats.population_sds[positions][None, valid_genes]
+        standardized[
+            ~np.isfinite(selected) | ~np.isfinite(standardized)
+        ] = np.nan
+        return standardized

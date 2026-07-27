@@ -4,11 +4,11 @@ Analyses added in response to the NeurIPS review, covering reviewer MDUy's **W1*
 (baseline geometry), **W3** (permissive dose matching), and **W4** (uniform per-gene
 population standardization). Table numbers refer to the submitted paper.
 
-Nothing in the published analysis was modified in place. Every addition either lives in a
-new notebook derived from the original, or is appended as a self-contained section after
-all existing cells. Each addition opens with a parity check that asserts the recomputed
-observed and published-baseline values reproduce the original columns, so any change in a
-reported delta comes from the new baseline alone.
+The reviewer notebooks preserve the published metric definitions and add explicit parity
+checks before reporting new baseline deltas. Shared cross-source mechanics are now routed
+through one module so the DEG, signature-similarity, and retrieval notebooks cannot drift
+in dataset policy, dose matching, source lookup, shared-gene handling, or cache
+invalidation while retaining separate metric-specific scoring.
 
 ## W1: baseline geometry
 
@@ -116,6 +116,7 @@ outside W4 scope.
 
 | Reviewer point | Tables | File | Relationship to the published code |
 |---|---|---|---|
+| Cross-source shared core | 4, 5, 6, 9 | `scripts/cross_source_core.py` | Canonical dataset profiles, matching, source catalog, shared-gene scope, and cache fingerprints |
 | W1 shared machinery | all | `scripts/peer_baselines.py` | New module |
 | W4 shared machinery | 4, 6, 9 | `scripts/population_zscore.py` | Streaming, locked statistics and cache module for both population scopes |
 | W4 precompute | 4, 6, 9 | `scripts/precompute_population_zscore.py` | Prepares both shared statistic scopes once before the notebooks |
@@ -170,6 +171,36 @@ cap, sampling seed, and engine versions are fingerprinted. Changing any of these
 automatically invalidates incompatible stage outputs. Peer-baseline work is additionally
 checkpointed by dataset-pair/cell/time/dose context, so an interrupted run resumes from
 completed context shards. All cache and task-result writes are published atomically.
+
+The three cross-source notebooks import `scripts/cross_source_core.py`; notebook cells no
+longer retain shadow copies of the shared implementations. A single
+`prepare_cross_source_scope(...)` call owns canonical indexing, mutual-nearest dose
+matching, the matched-pair cache and fingerprint, matched-line scope, shared-gene scope,
+and `LineSourceCatalog` lifecycle. It defers line-level H5AD loading until matches are
+known. For each cell type that contributes a match, the shared-gene intersection still
+includes every active dataset that contains that cell type, preserving the original
+analytical gene universe. Metric caches inventory every line file that can affect that
+metric: the full shared-gene scope for DEG/signature scoring and the matched
+query/candidate scope for retrieval.
+
+W4 setup likewise uses one `PopulationStatsCatalog` from
+`scripts/population_zscore.py`. It owns production-versus-smoke population membership,
+precompute readiness/wait policy, dataset/cell-type and pooled-dataset statistic caches,
+gene alignment, and standardization. The notebooks retain only their metric-specific W4
+record construction and reporting.
+
+Dataset membership is also explicit rather than being controlled by commented list
+entries. The `signature` profile includes GDPx2 and DILImap for Table 6. The `deg` and
+`retrieval` profiles omit those two sources until their required layer capability is
+verified; all remaining production datasets have the same canonical order. A selected
+dataset that produces no retained comparison remains visible in the initial inventory
+but is excluded from W4 precompute readiness, fitting, fingerprints, and QC.
+
+Because the shared match schema and source-aware fingerprints replace the earlier
+notebook-local versions, the first run after this change intentionally invalidates the
+old matched-pair and downstream metric/CI caches. Subsequent runs reload the new caches
+normally. Restart the notebook kernel before running so no pre-refactor function
+bindings remain in memory.
 
 Dataset selection and output isolation can be controlled without editing notebook cells:
 
