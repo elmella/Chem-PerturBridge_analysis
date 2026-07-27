@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import time
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence
 
@@ -22,11 +24,14 @@ from scripts.cluster_bootstrap_ci import (
     summarize_ci_half_width_ranges,
 )
 from scripts.cross_source_parallel import (
+    append_progress_log,
     atomic_write_frame,
     atomic_write_json,
     file_record,
     output_directory_lock,
+    sha256_file,
 )
+from scripts.notebook_cache import stable_json_fingerprint
 from scripts.population_zscore import PER_GENE_DATASET_VARIANT
 
 
@@ -129,6 +134,50 @@ W4_SIGNATURE_METRICS = (
     "w4_target_peer_spearman_logfc_pair_fraction_below_observed",
     "w4_target_peer_spearman_logfc_pair_corrected_percentile",
 )
+W4_IDENTITY_COLUMNS = (
+    "dataset_a",
+    "dataset_b",
+    "cell_type",
+    "time_key",
+    "pubchem_cid",
+    "matched_condition_key",
+    "left_obs_id",
+    "right_obs_id",
+)
+RETRIEVAL_IDENTITY_COLUMNS = (
+    "dataset_a",
+    "dataset_b",
+    "direction",
+    "cell_type",
+    "time_key",
+    "query_pubchem_cid",
+    "representation",
+    "retrieval_variant",
+    "similarity_metric",
+    "scale_variant",
+)
+
+
+def _summary_input_columns(label: str) -> set[str]:
+    prefix = f"{PER_GENE_DATASET_VARIANT}__"
+    if label == "DEG":
+        return {
+            *cross_source_core.MATCH_PAIR_IDENTITY_COLUMNS,
+            *W4_IDENTITY_COLUMNS,
+            *DOSE_METRICS,
+            *(f"{prefix}{metric}" for metric in W4_DEG_METRICS),
+        }
+    if label == "signature":
+        return {
+            *W4_IDENTITY_COLUMNS,
+            *(f"{prefix}{metric}" for metric in W4_SIGNATURE_METRICS),
+        }
+    if label == "retrieval":
+        return {
+            *RETRIEVAL_IDENTITY_COLUMNS,
+            *RETRIEVAL_CI_METRICS,
+        }
+    raise ValueError(f"Unknown summary input label: {label!r}")
 
 
 def _require_columns(
@@ -142,11 +191,26 @@ def _require_columns(
         raise KeyError(f"{label} is missing required columns: {missing}")
 
 
-def _read_metrics(path: Path, *, label: str) -> pd.DataFrame:
+def _read_metrics(
+    path: Path,
+    *,
+    label: str,
+    columns: Optional[Iterable[str]] = None,
+) -> pd.DataFrame:
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"{label} metrics do not exist: {path}")
-    frame = pd.read_csv(path, sep="\t", low_memory=False)
+    usecols = None
+    if columns is not None:
+        requested = set(columns)
+        header = pd.read_csv(path, sep="\t", nrows=0).columns.tolist()
+        usecols = [column for column in header if column in requested]
+    frame = pd.read_csv(
+        path,
+        sep="\t",
+        low_memory=False,
+        usecols=usecols,
+    )
     if frame.empty:
         raise ValueError(f"{label} metrics are empty: {path}")
     return frame
@@ -254,6 +318,9 @@ def _w4_ci(
     n_boot: int,
     seed: int,
     summary_level: str,
+    workers: int = 1,
+    bootstrap_batch_size: int = 64,
+    progress: bool = False,
 ) -> pd.DataFrame:
     drug = _drug_summary(frame, metrics)
     return cluster_bca_nested_mean_ci_table(
@@ -266,6 +333,10 @@ def _w4_ci(
         n_boot=n_boot,
         seed=seed,
         summary_level=summary_level,
+        workers=workers,
+        bootstrap_batch_size=bootstrap_batch_size,
+        progress=progress,
+        progress_desc=summary_level,
     )
 
 
@@ -274,6 +345,9 @@ def build_retrieval_ci(
     *,
     n_boot: int,
     seed: int,
+    workers: int = 1,
+    bootstrap_batch_size: int = 64,
+    progress: bool = False,
 ) -> pd.DataFrame:
     required = (
         "dataset_a",
@@ -333,6 +407,10 @@ def build_retrieval_ci(
         n_boot=n_boot,
         seed=seed,
         summary_level="reviewer_minimal_retrieval_dataset_pair",
+        workers=workers,
+        bootstrap_batch_size=bootstrap_batch_size,
+        progress=progress,
+        progress_desc="retrieval BCa",
     )
 
 
@@ -395,7 +473,15 @@ def _dose_coverage(
 
     def coverage(keys: list[str]) -> pd.DataFrame:
         if matches.empty:
-            return pd.DataFrame(columns=keys)
+            return pd.DataFrame(
+                columns=[
+                    *keys,
+                    "n_matched_sample_pairs",
+                    "n_matching_conditions",
+                    "n_matching_drugs",
+                    "n_eligible_contexts",
+                ]
+            )
         result = (
             matches.groupby(keys, as_index=False)
             .agg(
@@ -445,7 +531,35 @@ def _dose_metric_summaries(
     scored: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if scored.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        mean_columns = [f"mean_{metric}" for metric in DOSE_METRICS]
+        drug = pd.DataFrame(
+            columns=[
+                *DRUG_LINE_TIME_COLUMNS,
+                "n_scored_sample_pairs",
+                "n_matching_conditions_scored",
+                *mean_columns,
+            ]
+        )
+        pair = pd.DataFrame(
+            columns=[
+                "dataset_a",
+                "dataset_b",
+                "n_scored_sample_pairs",
+                "n_scored_drug_line_times",
+                *mean_columns,
+            ]
+        )
+        line = pd.DataFrame(
+            columns=[
+                "dataset_a",
+                "dataset_b",
+                "cell_type",
+                "n_scored_sample_pairs",
+                "n_scored_drug_line_times",
+                *mean_columns,
+            ]
+        )
+        return drug, pair, line
     aggregation: dict[str, tuple[str, str]] = {
         "n_scored_sample_pairs": ("left_obs_id", "size"),
         "n_matching_conditions_scored": (
@@ -509,6 +623,9 @@ def build_dose_outputs(
     datasets: Sequence[str],
     n_boot: int,
     seed: int,
+    workers: int = 1,
+    bootstrap_batch_size: int = 64,
+    progress: bool = False,
 ) -> dict[str, pd.DataFrame]:
     identity = list(cross_source_core.MATCH_PAIR_IDENTITY_COLUMNS)
     _require_columns(
@@ -596,6 +713,10 @@ def build_dose_outputs(
                         n_boot=n_boot,
                         seed=seed,
                         summary_level="dose_threshold_dataset_pair",
+                        workers=workers,
+                        bootstrap_batch_size=bootstrap_batch_size,
+                        progress=progress,
+                        progress_desc=f"dose {label} pair BCa",
                     ),
                     cluster_bca_nested_mean_ci_table(
                         drug,
@@ -614,6 +735,10 @@ def build_dose_outputs(
                         summary_level=(
                             "dose_threshold_dataset_pair_line"
                         ),
+                        workers=workers,
+                        bootstrap_batch_size=bootstrap_batch_size,
+                        progress=progress,
+                        progress_desc=f"dose {label} line BCa",
                     ),
                 ],
                 ignore_index=True,
@@ -649,7 +774,7 @@ def build_dose_outputs(
     line_summary = pd.concat(line_frames, ignore_index=True).sort_values(
         ["threshold_order", "dataset_a", "dataset_b", "cell_type"]
     )
-    totals = (
+    observed_totals = (
         pair_summary.groupby(
             ["threshold_order", "dose_threshold", "max_fold_difference"],
             as_index=False,
@@ -657,6 +782,28 @@ def build_dose_outputs(
         .sum()
         .sort_values("threshold_order")
         .reset_index(drop=True)
+    )
+    totals = pd.DataFrame(
+        [
+            {
+                "threshold_order": order,
+                "dose_threshold": label,
+                "max_fold_difference": max_fold,
+            }
+            for label, order, max_fold in DOSE_THRESHOLD_SPECS
+        ]
+    ).merge(
+        observed_totals,
+        on=[
+            "threshold_order",
+            "dose_threshold",
+            "max_fold_difference",
+        ],
+        how="left",
+        validate="one_to_one",
+    )
+    totals["n_matched_sample_pairs"] = (
+        totals["n_matched_sample_pairs"].fillna(0).astype(int)
     )
     if np.any(
         np.diff(totals["n_matched_sample_pairs"].to_numpy(dtype=float)) < 0
@@ -745,6 +892,136 @@ def build_dose_outputs(
     }
 
 
+def _summary_run_fingerprint(
+    *,
+    args: argparse.Namespace,
+    datasets: Sequence[str],
+) -> str:
+    input_paths = (
+        Path(args.deg_metrics).resolve(),
+        Path(args.signature_metrics).resolve(),
+        Path(args.retrieval_metrics).resolve(),
+    )
+    overlap_paths = [
+        (
+            Path(args.overlap_dir)
+            / f"{dataset}_overlap_filtered.h5ad"
+        ).resolve()
+        for dataset in datasets
+    ]
+    code_paths = (
+        Path(__file__).resolve(),
+        REPO_ROOT / "scripts" / "cluster_bootstrap_ci.py",
+        REPO_ROOT / "scripts" / "cross_source_core.py",
+    )
+    return stable_json_fingerprint(
+        {
+            "analysis": "reviewer-minimal-summary-v2",
+            "datasets": list(datasets),
+            "bootstrap_iterations": int(args.bootstrap_iterations),
+            "bootstrap_seed": int(args.bootstrap_seed),
+            "bootstrap_batch_size": int(args.bootstrap_batch_size),
+            "inputs": [file_record(path) for path in input_paths],
+            "overlap_inputs": [
+                file_record(path) for path in overlap_paths
+            ],
+            "code": [
+                file_record(path, content_hash=True)
+                for path in code_paths
+            ],
+        }
+    )
+
+
+def _stage_marker_path(
+    checkpoint_dir: Path,
+    stage: str,
+) -> Path:
+    return Path(checkpoint_dir) / f"{stage}.complete.json"
+
+
+def _validate_summary_stage(
+    *,
+    output_dir: Path,
+    checkpoint_dir: Path,
+    stage: str,
+    fingerprint: str,
+    filenames: Sequence[str],
+) -> bool:
+    marker_path = _stage_marker_path(checkpoint_dir, stage)
+    try:
+        marker = json.loads(marker_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return False
+    if (
+        marker.get("stage") != stage
+        or marker.get("fingerprint") != fingerprint
+        or marker.get("filenames") != list(filenames)
+    ):
+        return False
+    records = marker.get("outputs")
+    if not isinstance(records, list) or len(records) != len(filenames):
+        return False
+    by_name = {
+        str(record.get("filename")): record
+        for record in records
+        if isinstance(record, dict)
+    }
+    for filename in filenames:
+        path = Path(output_dir) / filename
+        record = by_name.get(filename)
+        if record is None or not path.is_file():
+            return False
+        if int(path.stat().st_size) != int(record.get("size", -1)):
+            return False
+        if sha256_file(path) != str(record.get("sha256", "")):
+            return False
+    return True
+
+
+def _publish_summary_stage(
+    *,
+    output_dir: Path,
+    checkpoint_dir: Path,
+    stage: str,
+    fingerprint: str,
+    frames: Mapping[str, pd.DataFrame],
+) -> None:
+    for filename, frame in frames.items():
+        atomic_write_frame(Path(output_dir) / filename, frame)
+    records = []
+    for filename, frame in frames.items():
+        path = Path(output_dir) / filename
+        records.append(
+            {
+                "filename": filename,
+                "rows": int(len(frame)),
+                "columns": frame.columns.tolist(),
+                "size": int(path.stat().st_size),
+                "sha256": sha256_file(path),
+            }
+        )
+    atomic_write_json(
+        _stage_marker_path(checkpoint_dir, stage),
+        {
+            "stage": stage,
+            "fingerprint": fingerprint,
+            "filenames": list(frames),
+            "outputs": records,
+            "completed_at_unix": time.time(),
+        },
+    )
+
+
+def _observed_dataset_frame(path: Path) -> pd.DataFrame:
+    return pd.read_csv(
+        path,
+        sep="\t",
+        usecols=["dataset_a", "dataset_b"],
+        low_memory=False,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -771,6 +1048,29 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=BOOTSTRAP_RANDOM_SEED,
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Threads used across independent BCa metrics.",
+    )
+    parser.add_argument(
+        "--bootstrap-batch-size",
+        type=int,
+        default=64,
+        help="Number of bootstrap draws prepared per deterministic batch.",
+    )
+    parser.add_argument(
+        "--progress",
+        choices=("auto", "always", "off"),
+        default="auto",
+        help="Show per-metric tqdm progress; stage events are always logged.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute completed summary stages.",
+    )
     return parser
 
 
@@ -778,84 +1078,232 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     if args.bootstrap_iterations < 20:
         raise ValueError("--bootstrap-iterations must be at least 20")
-    deg = _read_metrics(args.deg_metrics, label="DEG")
-    signature = _read_metrics(
-        args.signature_metrics,
-        label="signature",
-    )
-    retrieval = _read_metrics(
-        args.retrieval_metrics,
-        label="retrieval",
-    )
-    datasets = _dataset_order(
-        args.datasets,
-        (deg, signature, retrieval),
+    if args.workers < 1:
+        raise ValueError("--workers must be positive")
+    if args.bootstrap_batch_size < 1:
+        raise ValueError("--bootstrap-batch-size must be positive")
+    output_dir = Path(args.output_dir).resolve()
+    progress_log = output_dir / "progress.log"
+    progress_enabled = (
+        args.progress == "always"
+        or (args.progress == "auto" and sys.stderr.isatty())
     )
 
-    deg_w4, deg_metrics = _w4_long_frame(
-        deg,
-        metric_candidates=W4_DEG_METRICS,
-        required_metrics=("w4_observed_deg_lfc_spearman_sym_p05",),
-        label="DEG W4 metrics",
+    def report(message: str) -> None:
+        append_progress_log(
+            progress_log,
+            analysis="reviewer-summary",
+            message=message,
+        )
+        print(f"[reviewer-summary] {message}", flush=True)
+
+    retrieval_filenames = (
+        "reviewer_minimal_retrieval_cluster_bca_ci.tsv",
+        "reviewer_minimal_retrieval_ci_ranges.tsv",
     )
-    signature_w4, signature_metrics = _w4_long_frame(
-        signature,
-        metric_candidates=W4_SIGNATURE_METRICS,
-        required_metrics=("w4_observed_spearman_logfc",),
-        label="signature W4 metrics",
+    deg_filenames = (
+        "w4_deg_cluster_bca_ci.tsv",
+        "dose_threshold_deg_metric_summary.tsv",
+        "dose_threshold_deg_metric_line_summary.tsv",
+        "dose_threshold_deg_cluster_bca_ci.tsv",
+        "dose_threshold_overall_matched_pair_counts.tsv",
+        "dose_mismatch_distribution.tsv",
     )
-    outputs = {
-        "reviewer_minimal_retrieval_cluster_bca_ci.tsv": (
-            build_retrieval_ci(
+    signature_filenames = ("w4_signature_cluster_bca_ci.tsv",)
+    output_filenames = (
+        *retrieval_filenames,
+        *deg_filenames,
+        *signature_filenames,
+    )
+
+    with output_directory_lock(output_dir):
+        report(
+            f"starting bootstrap_iterations={args.bootstrap_iterations:,} "
+            f"workers={args.workers} batch_size={args.bootstrap_batch_size}"
+        )
+        if str(args.datasets).strip().lower() == "all":
+            report("inferring datasets from slim identity columns")
+            dataset_frames = [
+                _observed_dataset_frame(Path(path))
+                for path in (
+                    args.deg_metrics,
+                    args.signature_metrics,
+                    args.retrieval_metrics,
+                )
+            ]
+        else:
+            dataset_frames = []
+        datasets = _dataset_order(args.datasets, dataset_frames)
+        del dataset_frames
+        fingerprint = _summary_run_fingerprint(
+            args=args,
+            datasets=datasets,
+        )
+        checkpoint_dir = output_dir / "checkpoints" / fingerprint
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        report(f"fingerprint={fingerprint} datasets={','.join(datasets)}")
+
+        def run_stage(
+            stage: str,
+            filenames: Sequence[str],
+            compute,
+        ) -> None:
+            if (
+                not args.force
+                and _validate_summary_stage(
+                    output_dir=output_dir,
+                    checkpoint_dir=checkpoint_dir,
+                    stage=stage,
+                    fingerprint=fingerprint,
+                    filenames=filenames,
+                )
+            ):
+                report(f"stage={stage} cached files={len(filenames)}")
+                return
+            started = time.monotonic()
+            report(f"stage={stage} started")
+            try:
+                frames = compute()
+                if list(frames) != list(filenames):
+                    raise RuntimeError(
+                        f"Stage {stage} returned files {list(frames)!r}; "
+                        f"expected {list(filenames)!r}"
+                    )
+                _publish_summary_stage(
+                    output_dir=output_dir,
+                    checkpoint_dir=checkpoint_dir,
+                    stage=stage,
+                    fingerprint=fingerprint,
+                    frames=frames,
+                )
+            except BaseException as exc:
+                report(
+                    f"stage={stage} failed error={type(exc).__name__}: {exc}"
+                )
+                raise
+            report(
+                f"stage={stage} completed files={len(filenames)} "
+                f"elapsed={time.monotonic() - started:.1f}s"
+            )
+
+        def compute_retrieval() -> dict[str, pd.DataFrame]:
+            started = time.monotonic()
+            retrieval = _read_metrics(
+                args.retrieval_metrics,
+                label="retrieval",
+                columns=_summary_input_columns("retrieval"),
+            )
+            report(
+                f"stage=retrieval loaded rows={len(retrieval):,} "
+                f"columns={len(retrieval.columns)} "
+                f"elapsed={time.monotonic() - started:.1f}s"
+            )
+            ci = build_retrieval_ci(
                 retrieval,
                 n_boot=args.bootstrap_iterations,
                 seed=args.bootstrap_seed,
+                workers=args.workers,
+                bootstrap_batch_size=args.bootstrap_batch_size,
+                progress=progress_enabled,
             )
-        ),
-        "w4_deg_cluster_bca_ci.tsv": _w4_ci(
-            deg_w4,
-            metrics=deg_metrics,
-            n_boot=args.bootstrap_iterations,
-            seed=args.bootstrap_seed,
-            summary_level="w4_deg_dataset_pair",
-        ),
-        "w4_signature_cluster_bca_ci.tsv": _w4_ci(
-            signature_w4,
-            metrics=signature_metrics,
-            n_boot=args.bootstrap_iterations,
-            seed=args.bootstrap_seed,
-            summary_level="w4_signature_dataset_pair",
-        ),
-    }
-    outputs[
-        "reviewer_minimal_retrieval_ci_ranges.tsv"
-    ] = summarize_ci_half_width_ranges(
-        outputs["reviewer_minimal_retrieval_cluster_bca_ci.tsv"]
-    )
-    outputs.update(
-        build_dose_outputs(
-            deg,
-            overlap_dir=args.overlap_dir,
-            datasets=datasets,
-            n_boot=args.bootstrap_iterations,
-            seed=args.bootstrap_seed,
-        )
-    )
+            return {
+                retrieval_filenames[0]: ci,
+                retrieval_filenames[1]: summarize_ci_half_width_ranges(ci),
+            }
 
-    output_dir = Path(args.output_dir).resolve()
-    with output_directory_lock(output_dir):
-        for filename, frame in outputs.items():
-            atomic_write_frame(output_dir / filename, frame)
+        def compute_deg() -> dict[str, pd.DataFrame]:
+            started = time.monotonic()
+            deg = _read_metrics(
+                args.deg_metrics,
+                label="DEG",
+                columns=_summary_input_columns("DEG"),
+            )
+            report(
+                f"stage=deg loaded rows={len(deg):,} "
+                f"columns={len(deg.columns)} "
+                f"elapsed={time.monotonic() - started:.1f}s"
+            )
+            deg_w4, deg_metrics = _w4_long_frame(
+                deg,
+                metric_candidates=W4_DEG_METRICS,
+                required_metrics=(
+                    "w4_observed_deg_lfc_spearman_sym_p05",
+                ),
+                label="DEG W4 metrics",
+            )
+            frames = {
+                deg_filenames[0]: _w4_ci(
+                    deg_w4,
+                    metrics=deg_metrics,
+                    n_boot=args.bootstrap_iterations,
+                    seed=args.bootstrap_seed,
+                    summary_level="w4_deg_dataset_pair",
+                    workers=args.workers,
+                    bootstrap_batch_size=args.bootstrap_batch_size,
+                    progress=progress_enabled,
+                )
+            }
+            frames.update(
+                build_dose_outputs(
+                    deg,
+                    overlap_dir=args.overlap_dir,
+                    datasets=datasets,
+                    n_boot=args.bootstrap_iterations,
+                    seed=args.bootstrap_seed,
+                    workers=args.workers,
+                    bootstrap_batch_size=args.bootstrap_batch_size,
+                    progress=progress_enabled,
+                )
+            )
+            return frames
+
+        def compute_signature() -> dict[str, pd.DataFrame]:
+            started = time.monotonic()
+            signature = _read_metrics(
+                args.signature_metrics,
+                label="signature",
+                columns=_summary_input_columns("signature"),
+            )
+            report(
+                f"stage=signature loaded rows={len(signature):,} "
+                f"columns={len(signature.columns)} "
+                f"elapsed={time.monotonic() - started:.1f}s"
+            )
+            signature_w4, signature_metrics = _w4_long_frame(
+                signature,
+                metric_candidates=W4_SIGNATURE_METRICS,
+                required_metrics=("w4_observed_spearman_logfc",),
+                label="signature W4 metrics",
+            )
+            return {
+                signature_filenames[0]: _w4_ci(
+                    signature_w4,
+                    metrics=signature_metrics,
+                    n_boot=args.bootstrap_iterations,
+                    seed=args.bootstrap_seed,
+                    summary_level="w4_signature_dataset_pair",
+                    workers=args.workers,
+                    bootstrap_batch_size=args.bootstrap_batch_size,
+                    progress=progress_enabled,
+                )
+            }
+
+        run_stage("retrieval", retrieval_filenames, compute_retrieval)
+        run_stage("deg", deg_filenames, compute_deg)
+        run_stage("signature", signature_filenames, compute_signature)
         atomic_write_json(
             output_dir / "run_metadata.json",
             {
                 "analysis": "reviewer-minimal-summary",
+                "fingerprint": fingerprint,
                 "datasets": datasets,
                 "bootstrap_iterations": args.bootstrap_iterations,
                 "bootstrap_seed": args.bootstrap_seed,
+                "bootstrap_batch_size": args.bootstrap_batch_size,
+                "workers": args.workers,
                 "w4_scale_variant": PER_GENE_DATASET_VARIANT,
                 "inputs": [
-                    file_record(Path(path).resolve(), content_hash=True)
+                    file_record(Path(path).resolve())
                     for path in (
                         args.deg_metrics,
                         args.signature_metrics,
@@ -868,17 +1316,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                             Path(args.overlap_dir)
                             / f"{dataset}_overlap_filtered.h5ad"
                         ).resolve(),
-                        content_hash=True,
                     )
                     for dataset in datasets
                 ],
-                "outputs": sorted(outputs),
+                "outputs": sorted(output_filenames),
             },
         )
-    print(
-        f"[reviewer-summary] wrote {len(outputs)} tables to {output_dir}",
-        flush=True,
-    )
+        report(
+            f"completed files={len(output_filenames)} output_dir={output_dir}"
+        )
     return 0
 
 

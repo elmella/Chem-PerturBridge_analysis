@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -35,6 +36,9 @@ from scripts.run_overlap_group_rep_signature_similarity import (
     main as run_signature,
 )
 from scripts.summarize_reviewer_minimal_metrics import (
+    DOSE_METRICS,
+    _dose_coverage,
+    _dose_metric_summaries,
     main as summarize_reviewer_metrics,
 )
 
@@ -198,6 +202,42 @@ def _common_arguments(
 
 
 class ParallelScoringScriptTests(unittest.TestCase):
+    def test_empty_dose_scores_keep_merge_key_schema(self):
+        drug, pair, line = _dose_metric_summaries(pd.DataFrame())
+        self.assertTrue(drug.empty)
+        pair_coverage = pd.DataFrame(
+            {
+                "dataset_a": ["tahoe"],
+                "dataset_b": ["sciplex"],
+                "n_matched_sample_pairs": [10],
+            }
+        )
+        merged = pair_coverage.merge(
+            pair.drop(
+                columns="n_scored_sample_pairs",
+                errors="ignore",
+            ),
+            on=["dataset_a", "dataset_b"],
+            how="left",
+            validate="one_to_one",
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertTrue(
+            {
+                f"mean_{metric}" for metric in DOSE_METRICS
+            }.issubset(merged.columns)
+        )
+        self.assertTrue(
+            {"dataset_a", "dataset_b", "cell_type"}.issubset(line.columns)
+        )
+        empty_pair_coverage, empty_line_coverage = _dose_coverage(
+            pd.DataFrame(),
+            pd.DataFrame(),
+        )
+        for coverage in (empty_pair_coverage, empty_line_coverage):
+            self.assertIn("n_matched_sample_pairs", coverage.columns)
+            self.assertIn("n_eligible_contexts", coverage.columns)
+
     def test_summary_cli_can_be_launched_by_path(self):
         script_path = REPO_ROOT / "scripts" / "summarize_reviewer_minimal_metrics.py"
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -263,33 +303,34 @@ class ParallelScoringScriptTests(unittest.TestCase):
             )
 
             summary_output = root / "summary"
-            self.assertEqual(
-                summarize_reviewer_metrics(
-                    [
-                        "--deg-metrics",
-                        str(deg_output / "fixture" / DEG_FINAL),
-                        "--signature-metrics",
-                        str(
-                            signature_output
-                            / "fixture"
-                            / SIGNATURE_FINAL
-                        ),
-                        "--retrieval-metrics",
-                        str(
-                            retrieval_output
-                            / "fixture"
-                            / RETRIEVAL_FINAL
-                        ),
-                        "--overlap-dir",
-                        str(overlap_dir),
-                        "--datasets",
-                        ",".join(DATASETS),
-                        "--output-dir",
-                        str(summary_output),
-                        "--bootstrap-iterations",
-                        "50",
-                    ]
+            summary_arguments = [
+                "--deg-metrics",
+                str(deg_output / "fixture" / DEG_FINAL),
+                "--signature-metrics",
+                str(
+                    signature_output
+                    / "fixture"
+                    / SIGNATURE_FINAL
                 ),
+                "--retrieval-metrics",
+                str(
+                    retrieval_output
+                    / "fixture"
+                    / RETRIEVAL_FINAL
+                ),
+                "--overlap-dir",
+                str(overlap_dir),
+                "--datasets",
+                ",".join(DATASETS),
+                "--output-dir",
+                str(summary_output),
+                "--bootstrap-iterations",
+                "50",
+                "--progress",
+                "off",
+            ]
+            self.assertEqual(
+                summarize_reviewer_metrics(summary_arguments),
                 0,
             )
             expected_outputs = (
@@ -349,6 +390,61 @@ class ParallelScoringScriptTests(unittest.TestCase):
                     >= 0
                 ).all()
             )
+
+            markers = sorted(
+                (summary_output / "checkpoints").glob(
+                    "*/*.complete.json"
+                )
+            )
+            self.assertEqual(len(markers), 3)
+            marker_mtimes = {
+                path.name: path.stat().st_mtime_ns for path in markers
+            }
+            self.assertEqual(
+                summarize_reviewer_metrics(summary_arguments),
+                0,
+            )
+            self.assertEqual(
+                marker_mtimes,
+                {
+                    path.name: path.stat().st_mtime_ns
+                    for path in markers
+                },
+            )
+            progress_log = (
+                summary_output / "progress.log"
+            ).read_text()
+            self.assertIn("stage=retrieval cached", progress_log)
+            self.assertIn("stage=deg cached", progress_log)
+            self.assertIn("stage=signature cached", progress_log)
+
+            retrieval_marker = next(
+                path
+                for path in markers
+                if path.name == "retrieval.complete.json"
+            )
+            previous_retrieval_marker_mtime = (
+                retrieval_marker.stat().st_mtime_ns
+            )
+            time.sleep(0.01)
+            (
+                summary_output
+                / "reviewer_minimal_retrieval_cluster_bca_ci.tsv"
+            ).write_text("corrupt\n")
+            self.assertEqual(
+                summarize_reviewer_metrics(summary_arguments),
+                0,
+            )
+            self.assertGreater(
+                retrieval_marker.stat().st_mtime_ns,
+                previous_retrieval_marker_mtime,
+            )
+            repaired_retrieval = pd.read_csv(
+                summary_output
+                / "reviewer_minimal_retrieval_cluster_bca_ci.tsv",
+                sep="\t",
+            )
+            self.assertIn("metric", repaired_retrieval.columns)
 
     def test_reviewer_minimal_requires_only_logfc_source_layers(self):
         with tempfile.TemporaryDirectory() as directory:
