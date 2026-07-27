@@ -65,14 +65,17 @@ requires at least `MIN_CONTEXT_SHARED_DRUGS` shared compounds.
 
 ## W4: per-gene population standardization
 
-W4 is an additive sensitivity analysis; it never replaces raw logFC. For every dataset
-and cell type, each gene is transformed over all eligible non-control grouped-condition
-signatures:
+W4 is an additive sensitivity analysis; it never replaces raw logFC. Two population
+scopes are now reported for every gene:
 
 ```text
-z[source, cell, condition, gene] =
+per_gene_population_zscore_dataset_cell_type =
     (logFC - population mean[source, cell, gene])
     / population SD[source, cell, gene]
+
+per_gene_population_zscore_dataset =
+    (logFC - population mean[source, gene])
+    / population SD[source, gene]
 ```
 
 Population SD uses `ddof=0`. Eligibility requires a non-control row, a valid compound,
@@ -81,11 +84,20 @@ population values and a finite, nonzero SD. The first duplicate gene symbol is r
 matching the notebooks' `LineSource` behavior.
 
 This applies the same gene-wise population-axis procedure to every source. It is not a
-signature-global z-score (which would leave Spearman unchanged), does not pool datasets
-or cell types, and does not claim to reconstruct the Broad plate-level Level 4 pipeline.
-Source × cell type is the reproducible analogue available across all harmonized sources.
+signature-global z-score (which would leave Spearman unchanged), never pools different
+datasets, and does not claim to reconstruct the Broad plate-level Level 4 pipeline. The
+dataset × cell-type result preserves cell-context-specific populations; the dataset-wide
+result pools that dataset's eligible cell types and tests whether the conclusion depends
+on the narrower population definition.
 
-W4 reports raw logFC beside `per_gene_population_zscore` for:
+Dataset-wide fitting discovers every line-level H5AD in the configured dataset source
+directory, not only the cell types retained by cross-source matching. The precompute
+command and all three notebooks use the same discovery helper, so a subset analysis
+still applies the same full-dataset population statistics as production.
+
+W4 reports raw logFC beside both
+`per_gene_population_zscore_dataset_cell_type` and
+`per_gene_population_zscore_dataset` for:
 
 - Table 4: DEG-restricted logFC Spearman under the fixed raw
   `adj.P.Value < 0.05` masks. Adjusted p-values, DEG membership, overlap, and biological
@@ -105,7 +117,8 @@ outside W4 scope.
 | Reviewer point | Tables | File | Relationship to the published code |
 |---|---|---|---|
 | W1 shared machinery | all | `scripts/peer_baselines.py` | New module |
-| W4 shared machinery | 4, 6, 9 | `scripts/population_zscore.py` | New streaming, source-context statistics and cache module |
+| W4 shared machinery | 4, 6, 9 | `scripts/population_zscore.py` | Streaming, locked statistics and cache module for both population scopes |
+| W4 precompute | 4, 6, 9 | `scripts/precompute_population_zscore.py` | Prepares both shared statistic scopes once before the notebooks |
 | W1, W3, W4 | 4, 5 | `notebooks/overlap_group_rep_deg_metrics_reviewer_additions.ipynb` | New notebook derived from `overlap_group_rep_deg_metrics.ipynb`; W4 section appended |
 | W1, W4 | 6 | `notebooks/overlap_group_rep_signature_similarity.ipynb` | Sections appended; all original cells unchanged |
 | W1 | 7, 8, 10 | `scripts/precompute_replicate_signature_similarity.py` | Per-peer baselines added; source-centroid path unchanged |
@@ -137,7 +150,7 @@ reloaded and which ran.
 |---|---|
 | `overlap_group_rep_deg_metrics_reviewer_additions` | `matched_pairs`, `deg_metrics`, `deg_ci`, `dose_ci`, `peer_baselines`, `peer_ci`, `w4_deg_metrics`, `w4_deg_ci` |
 | `overlap_group_rep_signature_similarity` | `matched_pairs`, `signature_metrics`, `signature_ci`, `peer_baselines`, `peer_ci`, `w4_signature_metrics`, `w4_signature_ci` |
-| `overlap_group_rep_retrieval_metrics_reviewer_additions` | `matched_pairs`, `retrieval_ablation`, `ablation_ci`, `null_calibration`, `null_ci`, `w4_retrieval_metrics`, `w4_retrieval_ci` |
+| `overlap_group_rep_retrieval_metrics_reviewer_additions` | `matched_pairs`, `primary_retrieval`, `retrieval_ablation`, `focused_retrieval`, `ablation_ci`, `null_calibration`, `null_ci`, `w4_retrieval_metrics`, `w4_retrieval_ci` |
 | `replicate_deg_metrics` | `replicate_deg_ci` |
 | `replicate_signature_similarity` | `replicate_signature_ci` |
 
@@ -152,25 +165,34 @@ CPB_FORCE_RECOMPUTE=peer_baselines,peer_ci jupyter lab    # or from the shell
 CPB_FORCE_RECOMPUTE=all jupyter lab                       # ignore every cache
 ```
 
-Note that changing `DATASET_ORDER` invalidates the upstream caches: `matched_pairs` and the
-metric tables were built for the previous dataset set, so force those stages (or delete
-their TSVs) when switching, otherwise later stages score against a stale match table.
-Peer-baseline stages additionally record a configuration fingerprint. Changing the peer
-cap, sampling seed, metric set, or engine version invalidates those caches automatically;
-all cache and task-result writes are published atomically.
+Dataset selection, matched-row identities, source-file size/mtime, metric settings, peer
+cap, sampling seed, and engine versions are fingerprinted. Changing any of these
+automatically invalidates incompatible stage outputs. Peer-baseline work is additionally
+checkpointed by dataset-pair/cell/time/dose context, so an interrupted run resumes from
+completed context shards. All cache and task-result writes are published atomically.
+
+Dataset selection and output isolation can be controlled without editing notebook cells:
+
+```bash
+CPB_DATASET_SUBSET=tahoe,sciplex CPB_RUN_TAG=quick_test jupyter lab
+CPB_RUN_TAG=cigs_production jupyter lab  # full configured dataset list
+```
 
 W4 population-statistic caches are independent of notebook output caches and live at:
 
 ```text
 results/w4_population_zscore_stats/<dataset>/<cell_type>.npz
 results/w4_population_zscore_stats/<dataset>/<cell_type>.cache.json
+results/w4_population_zscore_stats/dataset_wide/<dataset>.npz
+results/w4_population_zscore_stats/dataset_wide/<dataset>.cache.json
 ```
 
 The source path, size, modification time, layer shape, gene order, eligibility mask,
-`ddof`, and W4 engine version are fingerprinted. The first W4 notebook scans each selected
-source-context once; later notebooks reload the same statistics. Subset runs therefore
-reuse only the selected source-context caches and write into the notebook's isolated
-subset output directory.
+`ddof`, population scope, and W4 engine version are fingerprinted. Per-line sufficient
+statistics are scanned once; dataset-wide statistics are obtained by finite-aware Chan
+merges after aligning gene keys, without rereading or concatenating the H5AD matrices.
+Per-cache file locks prevent concurrently running notebooks from fitting the same source
+twice.
 
 The Table 6 W4 scorer additionally keeps a bounded in-memory cache of each active
 dataset/cell/time/dose/shared-gene stratum after standardization and Spearman-rank
@@ -181,15 +203,26 @@ capped peer rows from that prepared object; centroid calculations still use ever
 uv sync --locked
 source .venv/bin/activate
 python scripts/peer_baselines.py   # self-tests for the shared module
+python scripts/precompute_population_zscore.py \
+  --all-configured \
+  --scope both \
+  --row-chunk-size 1024 \
+  --qc-output results/w4_population_zscore_stats/precompute_qc.tsv
 ```
 
-Then, in order:
+After the W4 precompute finishes, the three cross-source notebooks below construct
+different metric families and may run concurrently:
 
 1. `notebooks/overlap_group_rep_deg_metrics_reviewer_additions.ipynb` — Tables 4 and 5,
    plus the W3 dose sensitivity. Writes to `results/overlap_group_rep_deg_metrics/`.
 2. `notebooks/overlap_group_rep_signature_similarity.ipynb` — Table 6. Writes to
    `results/overlap_signature_similarity_group_rep/`.
-3. `scripts/precompute_replicate_signature_similarity.py`, then re-run
+3. `notebooks/overlap_group_rep_retrieval_metrics_reviewer_additions.ipynb` — Table 9,
+   including negative-L2, cosine, Spearman, individual-signature baselines, and the exact
+   retrieval null in one run.
+
+The separate within-source workflow may also run concurrently: run
+`scripts/precompute_replicate_signature_similarity.py`, then re-run
    `notebooks/replicate_deg_metrics.ipynb` (Tables 7, 8) and
    `notebooks/replicate_signature_similarity.ipynb` (Table 10). Reads and writes
    `results/replicate_signature_similarity_sep_rep_combined/`. The notebooks write
@@ -197,11 +230,7 @@ Then, in order:
    `table_10_peer_baseline_reviewer_table.tsv`, retaining observed and centroid results
    alongside peer means, SDs, fractions, corrected percentiles, deltas, and
    compound-clustered BCa intervals.
-4. `notebooks/overlap_group_rep_retrieval_metrics_reviewer_additions.ipynb` — Table 9,
-   including negative-L2, cosine, Spearman, individual-signature baselines, and the exact
-   retrieval null in one run.
-
-Steps 1, 2, and 4 each end with a rebuttal-ready per-dataset-pair table
+The three cross-source notebooks each end with a rebuttal-ready per-dataset-pair table
 (`peer_baseline_rebuttal_table.tsv`) carrying every baseline with its bootstrap interval.
 Their appended W4 sections additionally write:
 

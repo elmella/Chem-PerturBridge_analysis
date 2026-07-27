@@ -1,13 +1,30 @@
+import io
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 
+import scripts.population_zscore as population_zscore_module
 from scripts.peer_baselines import summarize_peer_scores
+from scripts.precompute_population_zscore import (
+    build_parser as build_precompute_parser,
+    run as run_precompute,
+)
 from scripts.population_zscore import (
+    DATASET_CELL_TYPE_SCOPE,
+    DATASET_SCOPE,
+    align_population_stats,
+    dataset_stats_cache_path,
+    discover_dataset_population_sources,
+    load_or_fit_dataset_population_stats,
     load_or_fit_population_stats,
     standardize_matrix,
     standardize_vector,
@@ -52,6 +69,254 @@ def write_fixture(
 
 
 class PopulationZScoreTests(unittest.TestCase):
+    def test_dataset_source_discovery_matches_notebook_filename_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(
+                root / "CVCL_A_de.h5ad",
+                np.asarray([[1.0], [2.0]]),
+                cell_type="CVCL_A",
+            )
+            write_fixture(
+                root / "CVCL_B.h5ad",
+                np.asarray([[3.0], [4.0]]),
+                cell_type="CVCL_B",
+            )
+            (root / "ignore.txt").write_text("not an h5ad")
+
+            sources = discover_dataset_population_sources(root)
+
+            self.assertEqual(list(sources), ["CVCL_A", "CVCL_B"])
+            self.assertEqual(sources["CVCL_A"], root / "CVCL_A_de.h5ad")
+            self.assertEqual(sources["CVCL_B"], root / "CVCL_B.h5ad")
+
+    def test_precompute_cli_discovers_lines_and_builds_both_scopes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            write_fixture(
+                source_dir / "CVCL_A_de.h5ad",
+                np.asarray([[1.0, 10.0], [2.0, 20.0]]),
+                cell_type="CVCL_A",
+            )
+            write_fixture(
+                source_dir / "CVCL_B.h5ad",
+                np.asarray([[3.0, 30.0], [4.0, 40.0]]),
+                cell_type="CVCL_B",
+            )
+            cache_root = root / "cache"
+            qc_path = root / "qc.tsv"
+            args = build_precompute_parser().parse_args(
+                [
+                    "--dataset-dir",
+                    f"source={source_dir}",
+                    "--cache-root",
+                    str(cache_root),
+                    "--qc-output",
+                    str(qc_path),
+                    "--row-chunk-size",
+                    "1",
+                ]
+            )
+            with redirect_stdout(io.StringIO()):
+                qc = run_precompute(args)
+
+            self.assertEqual(len(qc), 3)
+            self.assertEqual(
+                set(qc["scope"]),
+                {DATASET_CELL_TYPE_SCOPE, DATASET_SCOPE},
+            )
+            self.assertTrue(qc_path.exists())
+            self.assertTrue(
+                dataset_stats_cache_path(cache_root, "source").exists()
+            )
+
+    def test_dataset_population_pools_lines_with_different_gene_orders_and_sets(self):
+        first_matrix = np.asarray(
+            [
+                [1.0, 10.0, 100.0],
+                [3.0, 30.0, 300.0],
+            ]
+        )
+        second_matrix = np.asarray(
+            [
+                [500.0, 5.0, 1000.0],
+                [700.0, 7.0, 1400.0],
+                [900.0, 9.0, 1800.0],
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_source = root / "CVCL_A_de.h5ad"
+            second_source = root / "CVCL_B_de.h5ad"
+            cache_root = root / "cache"
+            write_fixture(
+                first_source,
+                first_matrix,
+                cell_type="CVCL_A",
+                symbols=["A", "B", "C"],
+            )
+            write_fixture(
+                second_source,
+                second_matrix,
+                cell_type="CVCL_B",
+                symbols=["C", "A", "D"],
+            )
+
+            stats = load_or_fit_dataset_population_stats(
+                # Reversed insertion order verifies canonical source ordering.
+                source_paths={
+                    "CVCL_B": second_source,
+                    "CVCL_A": first_source,
+                },
+                dataset_name="source",
+                cache_root=cache_root,
+                row_chunk_size=2,
+                verbose=False,
+            )
+
+            pooled = np.asarray(
+                [
+                    [1.0, 10.0, 100.0, np.nan],
+                    [3.0, 30.0, 300.0, np.nan],
+                    [5.0, np.nan, 500.0, 1000.0],
+                    [7.0, np.nan, 700.0, 1400.0],
+                    [9.0, np.nan, 900.0, 1800.0],
+                ]
+            )
+            np.testing.assert_array_equal(stats.gene_keys, ["A", "B", "C", "D"])
+            np.testing.assert_array_equal(
+                stats.finite_counts,
+                np.isfinite(pooled).sum(axis=0),
+            )
+            np.testing.assert_allclose(
+                stats.means,
+                np.nanmean(pooled, axis=0),
+            )
+            np.testing.assert_allclose(
+                stats.population_sds,
+                np.nanstd(pooled, axis=0, ddof=0),
+            )
+            self.assertEqual(stats.scope, DATASET_SCOPE)
+            self.assertEqual(stats.population_row_count, 5)
+            self.assertEqual(
+                stats.cache_path,
+                dataset_stats_cache_path(cache_root, "source"),
+            )
+
+            aligned = align_population_stats(
+                stats,
+                np.asarray(["C", "A", "D"]),
+            )
+            standardized = standardize_matrix(
+                second_matrix,
+                gene_keys=np.asarray(["C", "A", "D"]),
+                stats=aligned,
+            )
+            expected = (
+                second_matrix
+                - np.asarray([500.0, 5.0, 1400.0])[None, :]
+            ) / np.asarray(
+                [
+                    np.nanstd(pooled[:, 2], ddof=0),
+                    np.nanstd(pooled[:, 0], ddof=0),
+                    np.nanstd(pooled[:, 3], ddof=0),
+                ]
+            )[None, :]
+            np.testing.assert_allclose(standardized, expected, atol=1e-12)
+
+            with patch(
+                "scripts.population_zscore.fit_dataset_population_stats",
+                side_effect=AssertionError("dataset cache should have reloaded"),
+            ):
+                cached = load_or_fit_dataset_population_stats(
+                    source_paths={
+                        "CVCL_A": first_source,
+                        "CVCL_B": second_source,
+                    },
+                    dataset_name="source",
+                    cache_root=cache_root,
+                    verbose=False,
+                )
+            self.assertEqual(cached.fingerprint, stats.fingerprint)
+            np.testing.assert_allclose(cached.means, stats.means)
+
+    def test_dataset_population_transform_alignment_remains_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "CVCL_A_de.h5ad"
+            matrix = np.asarray([[1.0, 10.0], [2.0, 20.0], [4.0, 40.0]])
+            write_fixture(
+                source,
+                matrix,
+                cell_type="CVCL_A",
+                symbols=["A", "B"],
+            )
+            stats = load_or_fit_dataset_population_stats(
+                source_paths={"CVCL_A": source},
+                dataset_name="source",
+                cache_root=root / "cache",
+                verbose=False,
+            )
+            with self.assertRaisesRegex(ValueError, "absent"):
+                align_population_stats(stats, np.asarray(["A", "MISSING"]))
+
+            aligned = align_population_stats(stats, np.asarray(["B", "A"]))
+            with self.assertRaisesRegex(ValueError, "Gene keys do not match"):
+                standardize_vector(
+                    matrix[0],
+                    gene_keys=np.asarray(["A", "B"]),
+                    stats=aligned,
+                )
+
+    def test_concurrent_first_load_fits_source_context_once(self):
+        matrix = np.asarray(
+            [
+                [1.0, 10.0],
+                [2.0, 20.0],
+                [4.0, 40.0],
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.h5ad"
+            cache_root = root / "cache"
+            write_fixture(source, matrix, cell_type="CVCL_TEST")
+
+            fit_count = 0
+            fit_count_lock = threading.Lock()
+            start = threading.Barrier(2)
+            real_fit = population_zscore_module.fit_population_stats
+
+            def counted_fit(**kwargs):
+                nonlocal fit_count
+                with fit_count_lock:
+                    fit_count += 1
+                time.sleep(0.1)
+                return real_fit(**kwargs)
+
+            def load():
+                start.wait(timeout=5)
+                return load_or_fit_population_stats(
+                    source_path=source,
+                    dataset_name="source",
+                    cell_type="CVCL_TEST",
+                    cache_root=cache_root,
+                    row_chunk_size=2,
+                    verbose=False,
+                )
+
+            with patch(
+                "scripts.population_zscore.fit_population_stats",
+                side_effect=counted_fit,
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    first, second = list(executor.map(lambda _: load(), range(2)))
+
+            self.assertEqual(fit_count, 1)
+            self.assertEqual(first.fingerprint, second.fingerprint)
+
     def test_streaming_matches_dense_population_statistics_and_cache_reload(self):
         matrix = np.asarray(
             [

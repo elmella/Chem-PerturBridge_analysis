@@ -1,12 +1,21 @@
-"""Source-by-cell-type per-gene population z-score standardization.
+"""Per-gene population z-score standardization.
 
 W4 asks whether heterogeneous source scales explain weak cross-source agreement.  The
-analysis therefore fits one population mean and population standard deviation per gene
-within each dataset/cell-type line file, using all eligible non-control grouped-condition
-logFC signatures.  Cross-source match labels are never used while fitting.
+analysis supports two explicit populations:
 
-Statistics are cached independently of notebook outputs so a line is scanned at most once
-and the same transform is shared by the signature, DEG, and retrieval notebooks.
+``dataset_cell_type``
+    One mean and population standard deviation per gene within a line-level source file.
+``dataset``
+    One mean and population standard deviation per gene pooled across all supplied
+    line-level files for a dataset.
+
+Both use all eligible non-control grouped-condition logFC signatures.  Cross-source match
+labels are never used while fitting.  Dataset-wide statistics are merged from the
+line-level sufficient statistics, so source matrices are not scanned a second time.
+
+Statistics are cached independently of notebook outputs and shared by the signature, DEG,
+and retrieval notebooks.  The historical dataset/cell-type cache layout is retained for
+backward compatibility; dataset-wide caches use a separate namespace.
 """
 
 from __future__ import annotations
@@ -15,11 +24,14 @@ import hashlib
 import json
 import os
 import re
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Mapping, Optional, Sequence, Union
 
 import anndata as ad
+import fcntl
 import numpy as np
 import pandas as pd
 
@@ -28,6 +40,50 @@ ENGINE_VERSION = 1
 DEFAULT_ROW_CHUNK_SIZE = 256
 MIN_FINITE_OBSERVATIONS = 2
 INVALID_STRING_VALUES = {"", "nan", "none", "<na>"}
+DATASET_CELL_TYPE_SCOPE = "dataset_cell_type"
+DATASET_SCOPE = "dataset"
+DATASET_WIDE_CELL_TYPE = "__all_cell_types__"
+DATASET_WIDE_CACHE_NAMESPACE = "dataset_wide"
+
+
+def infer_line_cell_type(path: Union[str, Path]) -> str:
+    """Infer the notebook cell-type key from a line-level H5AD filename."""
+    stem = Path(path).stem
+    return stem[:-3] if stem.endswith("_de") else stem
+
+
+def discover_dataset_population_sources(
+    dataset_dir: Union[str, Path],
+    *,
+    recursive: bool = False,
+) -> dict[str, Path]:
+    """Discover every line-level H5AD contributing to a dataset-wide population.
+
+    The precompute command and all three notebooks call this same function so the
+    meaning and fingerprint of the dataset-wide population cannot silently differ.
+    """
+    dataset_dir = Path(dataset_dir)
+    if not dataset_dir.is_dir():
+        raise FileNotFoundError(
+            f"Dataset population directory does not exist: {dataset_dir}"
+        )
+    paths = sorted(
+        dataset_dir.rglob("*.h5ad") if recursive else dataset_dir.glob("*.h5ad")
+    )
+    if not paths:
+        raise FileNotFoundError(f"No .h5ad files found in {dataset_dir}")
+
+    sources: dict[str, Path] = {}
+    for path in paths:
+        cell_type = infer_line_cell_type(path)
+        existing = sources.get(cell_type)
+        if existing is not None and existing.resolve() != path.resolve():
+            raise ValueError(
+                f"Conflicting population sources for cell type {cell_type}: "
+                f"{existing} and {path}"
+            )
+        sources[cell_type] = path
+    return dict(sorted(sources.items()))
 
 
 @dataclass(frozen=True)
@@ -42,6 +98,7 @@ class PopulationGeneStats:
     population_row_count: int
     fingerprint: str
     cache_path: Path
+    scope: str = DATASET_CELL_TYPE_SCOPE
 
     def __post_init__(self) -> None:
         gene_keys = np.asarray(self.gene_keys).astype(str)
@@ -60,6 +117,8 @@ class PopulationGeneStats:
             raise ValueError("Population-gene statistic arrays have inconsistent lengths")
         if len(gene_keys) and len(set(gene_keys.tolist())) != len(gene_keys):
             raise ValueError("PopulationGeneStats.gene_keys must be unique")
+        if self.scope not in {DATASET_CELL_TYPE_SCOPE, DATASET_SCOPE}:
+            raise ValueError(f"Unsupported population scope: {self.scope!r}")
         expected_valid = (
             (finite_counts >= MIN_FINITE_OBSERVATIONS)
             & np.isfinite(means)
@@ -139,6 +198,7 @@ def _safe_component(value: str) -> str:
 
 
 def stats_cache_path(cache_root: Path, dataset_name: str, cell_type: str) -> Path:
+    """Historical dataset/cell-type cache path (kept backward-compatible)."""
     return (
         Path(cache_root)
         / _safe_component(dataset_name)
@@ -146,8 +206,36 @@ def stats_cache_path(cache_root: Path, dataset_name: str, cell_type: str) -> Pat
     )
 
 
+def dataset_stats_cache_path(cache_root: Path, dataset_name: str) -> Path:
+    """Return the cache path for a dataset-wide pooled population."""
+    return (
+        Path(cache_root)
+        / DATASET_WIDE_CACHE_NAMESPACE
+        / f"{_safe_component(dataset_name)}.npz"
+    )
+
+
 def _metadata_path(cache_path: Path) -> Path:
     return cache_path.with_suffix(".cache.json")
+
+
+@contextmanager
+def _exclusive_cache_lock(cache_path: Path) -> Iterator[None]:
+    """Serialize first-time fits of one source-context cache.
+
+    Atomic replacement protects readers from partial files, but without a lock two
+    notebooks that miss the same cache can both scan a large source before either one
+    publishes it.  The persistent, tiny ``.lock`` file is intentional; the kernel lock
+    itself is released automatically when the file handle closes.
+    """
+    lock_path = Path(cache_path).with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def _source_fingerprint(
@@ -183,6 +271,29 @@ def _source_fingerprint(
         "eligibility_policy": (
             "non_control+valid_pubchem+finite_time+finite_positive_dose+matching_cell_type"
         ),
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _dataset_fingerprint(
+    *,
+    dataset_name: str,
+    source_stats: Sequence[PopulationGeneStats],
+) -> str:
+    payload = {
+        "engine_version": ENGINE_VERSION,
+        "scope": DATASET_SCOPE,
+        "dataset_name": str(dataset_name),
+        "ddof": 0,
+        "minimum_finite_observations": MIN_FINITE_OBSERVATIONS,
+        "sources": [
+            {
+                "cell_type": stats.cell_type,
+                "fingerprint": stats.fingerprint,
+            }
+            for stats in source_stats
+        ],
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -227,6 +338,98 @@ def _merge_batch_statistics(
     counts[:] = combined_counts
 
 
+def _merge_summary_statistics(
+    counts: np.ndarray,
+    means: np.ndarray,
+    m2: np.ndarray,
+    *,
+    incoming_counts: np.ndarray,
+    incoming_means: np.ndarray,
+    incoming_m2: np.ndarray,
+) -> None:
+    """In-place finite-aware Chan merge of already summarized gene populations."""
+    incoming_counts = np.asarray(incoming_counts, dtype=np.int64)
+    incoming_means = np.asarray(incoming_means, dtype=np.float64)
+    incoming_m2 = np.asarray(incoming_m2, dtype=np.float64)
+    if not (
+        counts.shape
+        == means.shape
+        == m2.shape
+        == incoming_counts.shape
+        == incoming_means.shape
+        == incoming_m2.shape
+    ):
+        raise ValueError("Summary-statistic arrays must have identical shapes")
+
+    present = incoming_counts > 0
+    if not np.any(present):
+        return
+    previous_counts = counts.copy()
+    combined_counts = previous_counts + incoming_counts
+    both = (previous_counts > 0) & present
+    new_only = (previous_counts == 0) & present
+
+    means[new_only] = incoming_means[new_only]
+    m2[new_only] = incoming_m2[new_only]
+    if np.any(both):
+        delta = incoming_means[both] - means[both]
+        means[both] += (
+            delta * incoming_counts[both] / combined_counts[both]
+        )
+        m2[both] += (
+            incoming_m2[both]
+            + delta
+            * delta
+            * previous_counts[both]
+            * incoming_counts[both]
+            / combined_counts[both]
+        )
+    counts[:] = combined_counts
+
+
+def _stats_from_accumulators(
+    *,
+    dataset_name: str,
+    cell_type: str,
+    gene_keys: np.ndarray,
+    counts: np.ndarray,
+    means: np.ndarray,
+    m2: np.ndarray,
+    population_row_count: int,
+    fingerprint: str,
+    cache_path: Path,
+    scope: str,
+) -> PopulationGeneStats:
+    counts = np.asarray(counts, dtype=np.int64)
+    means = np.asarray(means, dtype=np.float64).copy()
+    m2 = np.asarray(m2, dtype=np.float64)
+    population_sds = np.full(len(gene_keys), np.nan, dtype=np.float64)
+    observed = counts > 0
+    population_sds[observed] = np.sqrt(
+        np.maximum(m2[observed], 0.0) / counts[observed]
+    )
+    means[~observed] = np.nan
+    valid_mask = (
+        (counts >= MIN_FINITE_OBSERVATIONS)
+        & np.isfinite(means)
+        & np.isfinite(population_sds)
+        & (population_sds > 0.0)
+    )
+    return PopulationGeneStats(
+        dataset_name=str(dataset_name),
+        cell_type=str(cell_type),
+        gene_keys=gene_keys,
+        finite_counts=counts,
+        means=means,
+        population_sds=population_sds,
+        valid_mask=valid_mask,
+        population_row_count=int(population_row_count),
+        fingerprint=fingerprint,
+        cache_path=cache_path,
+        scope=scope,
+    )
+
+
 def fit_population_stats(
     *,
     source_path: Path,
@@ -235,6 +438,8 @@ def fit_population_stats(
     cache_path: Path,
     layer_name: str = "logFC",
     row_chunk_size: int = DEFAULT_ROW_CHUNK_SIZE,
+    verbose: bool = False,
+    progress_interval_seconds: float = 60.0,
 ) -> PopulationGeneStats:
     source_path = Path(source_path)
     cache_path = Path(cache_path)
@@ -261,43 +466,63 @@ def fit_population_stats(
         counts = np.zeros(n_genes, dtype=np.int64)
         means = np.zeros(n_genes, dtype=np.float64)
         m2 = np.zeros(n_genes, dtype=np.float64)
+        started_at = time.monotonic()
+        last_report_at = started_at
+        if verbose:
+            print(
+                f"[w4_stats] fitting {dataset_name}/{cell_type}: "
+                f"{adata.n_obs:,} source rows in chunks of {row_chunk_size:,}",
+                flush=True,
+            )
         for start in range(0, adata.n_obs, row_chunk_size):
             stop = min(start + row_chunk_size, adata.n_obs)
             local_eligible = eligible_mask[start:stop]
-            if not np.any(local_eligible):
-                continue
-            raw = np.asarray(
-                adata.layers[layer_name][start:stop, :],
-                dtype=np.float64,
-            )
-            batch = raw[local_eligible][:, gene_positions]
-            _merge_batch_statistics(counts, means, m2, batch)
+            if np.any(local_eligible):
+                raw = np.asarray(
+                    adata.layers[layer_name][start:stop, :],
+                    dtype=np.float64,
+                )
+                batch = raw[local_eligible][:, gene_positions]
+                _merge_batch_statistics(counts, means, m2, batch)
+            now = time.monotonic()
+            if verbose and (
+                stop == adata.n_obs
+                or now - last_report_at >= float(progress_interval_seconds)
+            ):
+                elapsed = max(now - started_at, 1e-12)
+                rows_per_second = stop / elapsed
+                remaining_seconds = (
+                    (adata.n_obs - stop) / rows_per_second
+                    if rows_per_second > 0.0
+                    else float("nan")
+                )
+                eta = (
+                    f"{remaining_seconds / 60.0:.1f}m"
+                    if np.isfinite(remaining_seconds)
+                    else "unknown"
+                )
+                print(
+                    f"[w4_stats] fitting {dataset_name}/{cell_type}: "
+                    f"{stop:,}/{adata.n_obs:,} rows "
+                    f"({100.0 * stop / max(adata.n_obs, 1):.1f}%), "
+                    f"{rows_per_second:,.1f} rows/s, ETA {eta}",
+                    flush=True,
+                )
+                last_report_at = now
     finally:
         adata.file.close()
 
-    population_sds = np.full(len(gene_keys), np.nan, dtype=np.float64)
-    observed = counts > 0
-    population_sds[observed] = np.sqrt(
-        np.maximum(m2[observed], 0.0) / counts[observed]
-    )
-    means[~observed] = np.nan
-    valid_mask = (
-        (counts >= MIN_FINITE_OBSERVATIONS)
-        & np.isfinite(means)
-        & np.isfinite(population_sds)
-        & (population_sds > 0.0)
-    )
-    return PopulationGeneStats(
+    return _stats_from_accumulators(
         dataset_name=str(dataset_name),
         cell_type=str(cell_type),
         gene_keys=gene_keys,
-        finite_counts=counts,
+        counts=counts,
         means=means,
-        population_sds=population_sds,
-        valid_mask=valid_mask,
+        m2=m2,
         population_row_count=int(eligible_mask.sum()),
         fingerprint=fingerprint,
         cache_path=cache_path,
+        scope=DATASET_CELL_TYPE_SCOPE,
     )
 
 
@@ -311,6 +536,7 @@ def _write_cache(stats: PopulationGeneStats) -> None:
     )
     metadata = {
         "engine_version": ENGINE_VERSION,
+        "scope": stats.scope,
         "dataset_name": stats.dataset_name,
         "cell_type": stats.cell_type,
         "population_row_count": stats.population_row_count,
@@ -345,6 +571,7 @@ def _load_cache(
     expected_fingerprint: str,
     dataset_name: str,
     cell_type: str,
+    expected_scope: str = DATASET_CELL_TYPE_SCOPE,
 ) -> Optional[PopulationGeneStats]:
     metadata_path = _metadata_path(cache_path)
     try:
@@ -352,6 +579,8 @@ def _load_cache(
     except (FileNotFoundError, json.JSONDecodeError):
         return None
     if metadata.get("fingerprint") != expected_fingerprint or not cache_path.exists():
+        return None
+    if metadata.get("scope", DATASET_CELL_TYPE_SCOPE) != expected_scope:
         return None
     try:
         with np.load(cache_path, allow_pickle=False) as values:
@@ -366,6 +595,7 @@ def _load_cache(
                 population_row_count=int(metadata["population_row_count"]),
                 fingerprint=str(expected_fingerprint),
                 cache_path=cache_path,
+                scope=expected_scope,
             )
     except (KeyError, OSError, ValueError):
         return None
@@ -420,17 +650,38 @@ def load_or_fit_population_stats(
                 )
             return cached
 
-    stats = fit_population_stats(
-        source_path=source_path,
-        dataset_name=dataset_name,
-        cell_type=cell_type,
-        cache_path=cache_path,
-        layer_name=layer_name,
-        row_chunk_size=row_chunk_size,
-    )
-    if stats.fingerprint != fingerprint:
-        raise AssertionError("Source changed while population statistics were being fitted")
-    _write_cache(stats)
+    with _exclusive_cache_lock(cache_path):
+        # Another notebook may have completed this exact source-context while this
+        # process waited for the lock.  Recheck before scanning the layer.
+        if not force:
+            cached = _load_cache(
+                cache_path=cache_path,
+                expected_fingerprint=fingerprint,
+                dataset_name=dataset_name,
+                cell_type=cell_type,
+            )
+            if cached is not None:
+                if verbose:
+                    print(
+                        f"[w4_stats] reloaded after waiting {dataset_name}/{cell_type}: "
+                        f"{cached.n_valid_genes:,}/{cached.n_genes:,} valid genes"
+                    )
+                return cached
+
+        stats = fit_population_stats(
+            source_path=source_path,
+            dataset_name=dataset_name,
+            cell_type=cell_type,
+            cache_path=cache_path,
+            layer_name=layer_name,
+            row_chunk_size=row_chunk_size,
+            verbose=verbose,
+        )
+        if stats.fingerprint != fingerprint:
+            raise AssertionError(
+                "Source changed while population statistics were being fitted"
+            )
+        _write_cache(stats)
     if verbose:
         print(
             f"[w4_stats] computed {dataset_name}/{cell_type}: "
@@ -438,6 +689,250 @@ def load_or_fit_population_stats(
             f"{stats.n_valid_genes:,}/{stats.n_genes:,} valid genes"
         )
     return stats
+
+
+def _canonical_source_paths(
+    source_paths: Union[Mapping[str, Path], Sequence[tuple[str, Path]]],
+) -> list[tuple[str, Path]]:
+    items = (
+        list(source_paths.items())
+        if isinstance(source_paths, Mapping)
+        else list(source_paths)
+    )
+    if not items:
+        raise ValueError("At least one dataset line source is required")
+    normalized = sorted(
+        ((str(cell_type), Path(path)) for cell_type, path in items),
+        key=lambda item: (item[0], str(item[1].resolve())),
+    )
+    cell_types = [cell_type for cell_type, _ in normalized]
+    if len(set(cell_types)) != len(cell_types):
+        raise ValueError("Dataset-wide source cell types must be unique")
+    return normalized
+
+
+def fit_dataset_population_stats(
+    *,
+    dataset_name: str,
+    source_stats: Sequence[PopulationGeneStats],
+    cache_path: Path,
+    fingerprint: Optional[str] = None,
+) -> PopulationGeneStats:
+    """Pool line-level sufficient statistics with gene-key-aware Chan merges."""
+    source_stats = list(source_stats)
+    if not source_stats:
+        raise ValueError("At least one line-level PopulationGeneStats is required")
+    for stats in source_stats:
+        if stats.dataset_name != str(dataset_name):
+            raise ValueError(
+                f"Cannot pool {stats.dataset_name!r} into dataset {dataset_name!r}"
+            )
+        if stats.scope != DATASET_CELL_TYPE_SCOPE:
+            raise ValueError("Dataset-wide pooling requires line-level statistics")
+
+    # Sorted union makes the pooled gene order independent of line-file input order.
+    gene_keys = np.asarray(
+        sorted(
+            {
+                str(gene_key)
+                for stats in source_stats
+                for gene_key in stats.gene_keys
+            }
+        ),
+        dtype=str,
+    )
+    gene_to_position = {
+        str(gene_key): position for position, gene_key in enumerate(gene_keys)
+    }
+    counts = np.zeros(len(gene_keys), dtype=np.int64)
+    means = np.zeros(len(gene_keys), dtype=np.float64)
+    m2 = np.zeros(len(gene_keys), dtype=np.float64)
+
+    for stats in source_stats:
+        positions = np.fromiter(
+            (gene_to_position[str(gene_key)] for gene_key in stats.gene_keys),
+            dtype=np.int64,
+            count=stats.n_genes,
+        )
+        incoming_counts = np.zeros(len(gene_keys), dtype=np.int64)
+        incoming_means = np.zeros(len(gene_keys), dtype=np.float64)
+        incoming_m2 = np.zeros(len(gene_keys), dtype=np.float64)
+        present = stats.finite_counts > 0
+        present_positions = positions[present]
+        incoming_counts[present_positions] = stats.finite_counts[present]
+        incoming_means[present_positions] = stats.means[present]
+        incoming_m2[present_positions] = (
+            np.square(stats.population_sds[present])
+            * stats.finite_counts[present]
+        )
+        _merge_summary_statistics(
+            counts,
+            means,
+            m2,
+            incoming_counts=incoming_counts,
+            incoming_means=incoming_means,
+            incoming_m2=incoming_m2,
+        )
+
+    expected_fingerprint = fingerprint or _dataset_fingerprint(
+        dataset_name=dataset_name,
+        source_stats=source_stats,
+    )
+    return _stats_from_accumulators(
+        dataset_name=dataset_name,
+        cell_type=DATASET_WIDE_CELL_TYPE,
+        gene_keys=gene_keys,
+        counts=counts,
+        means=means,
+        m2=m2,
+        population_row_count=sum(
+            stats.population_row_count for stats in source_stats
+        ),
+        fingerprint=expected_fingerprint,
+        cache_path=cache_path,
+        scope=DATASET_SCOPE,
+    )
+
+
+def load_or_fit_dataset_population_stats(
+    *,
+    source_paths: Union[Mapping[str, Path], Sequence[tuple[str, Path]]],
+    dataset_name: str,
+    cache_root: Path,
+    layer_name: str = "logFC",
+    row_chunk_size: int = DEFAULT_ROW_CHUNK_SIZE,
+    force: bool = False,
+    force_source_stats: bool = False,
+    verbose: bool = True,
+) -> PopulationGeneStats:
+    """Load or fit per-gene statistics pooled across a dataset's line files.
+
+    ``source_paths`` maps each cell type to its line-level ``.h5ad``.  Line-level
+    caches are loaded or fitted first, then their sufficient statistics are aligned by
+    gene key and merged.  Source matrices are therefore scanned at most once.
+    """
+    canonical_sources = _canonical_source_paths(source_paths)
+    source_stats = [
+        load_or_fit_population_stats(
+            source_path=source_path,
+            dataset_name=dataset_name,
+            cell_type=cell_type,
+            cache_root=cache_root,
+            layer_name=layer_name,
+            row_chunk_size=row_chunk_size,
+            force=force_source_stats,
+            verbose=verbose,
+        )
+        for cell_type, source_path in canonical_sources
+    ]
+    fingerprint = _dataset_fingerprint(
+        dataset_name=dataset_name,
+        source_stats=source_stats,
+    )
+    cache_path = dataset_stats_cache_path(cache_root, dataset_name)
+
+    if not force:
+        cached = _load_cache(
+            cache_path=cache_path,
+            expected_fingerprint=fingerprint,
+            dataset_name=dataset_name,
+            cell_type=DATASET_WIDE_CELL_TYPE,
+            expected_scope=DATASET_SCOPE,
+        )
+        if cached is not None:
+            if verbose:
+                print(
+                    f"[w4_stats:dataset] reloaded {dataset_name}: "
+                    f"{cached.population_row_count:,} rows across "
+                    f"{len(source_stats):,} cell types, "
+                    f"{cached.n_valid_genes:,}/{cached.n_genes:,} valid genes"
+                )
+            return cached
+
+    with _exclusive_cache_lock(cache_path):
+        if not force:
+            cached = _load_cache(
+                cache_path=cache_path,
+                expected_fingerprint=fingerprint,
+                dataset_name=dataset_name,
+                cell_type=DATASET_WIDE_CELL_TYPE,
+                expected_scope=DATASET_SCOPE,
+            )
+            if cached is not None:
+                if verbose:
+                    print(
+                        f"[w4_stats:dataset] reloaded after waiting {dataset_name}: "
+                        f"{cached.n_valid_genes:,}/{cached.n_genes:,} valid genes"
+                    )
+                return cached
+
+        stats = fit_dataset_population_stats(
+            dataset_name=dataset_name,
+            source_stats=source_stats,
+            cache_path=cache_path,
+            fingerprint=fingerprint,
+        )
+        _write_cache(stats)
+
+    if verbose:
+        print(
+            f"[w4_stats:dataset] computed {dataset_name}: "
+            f"{stats.population_row_count:,} rows across "
+            f"{len(source_stats):,} cell types, "
+            f"{stats.n_valid_genes:,}/{stats.n_genes:,} valid genes"
+        )
+    return stats
+
+
+def align_population_stats(
+    stats: PopulationGeneStats,
+    gene_keys: np.ndarray,
+) -> PopulationGeneStats:
+    """Return statistics in an exact requested gene order.
+
+    This is primarily useful for applying dataset-wide union statistics to one
+    line-level matrix.  Missing or duplicate requested keys are errors; genes are never
+    silently dropped or reordered.
+    """
+    requested = np.asarray(gene_keys).astype(str)
+    if requested.ndim != 1:
+        raise ValueError("gene_keys must be one-dimensional")
+    if len(set(requested.tolist())) != len(requested):
+        raise ValueError("Requested gene_keys must be unique")
+    source_positions = {
+        str(gene_key): position
+        for position, gene_key in enumerate(stats.gene_keys)
+    }
+    missing = [
+        str(gene_key)
+        for gene_key in requested
+        if str(gene_key) not in source_positions
+    ]
+    if missing:
+        preview = ", ".join(missing[:5])
+        suffix = "..." if len(missing) > 5 else ""
+        raise ValueError(
+            f"{len(missing)} requested genes are absent from cached "
+            f"{stats.scope} statistics: {preview}{suffix}"
+        )
+    positions = np.fromiter(
+        (source_positions[str(gene_key)] for gene_key in requested),
+        dtype=np.int64,
+        count=len(requested),
+    )
+    return PopulationGeneStats(
+        dataset_name=stats.dataset_name,
+        cell_type=stats.cell_type,
+        gene_keys=requested,
+        finite_counts=stats.finite_counts[positions],
+        means=stats.means[positions],
+        population_sds=stats.population_sds[positions],
+        valid_mask=stats.valid_mask[positions],
+        population_row_count=stats.population_row_count,
+        fingerprint=stats.fingerprint,
+        cache_path=stats.cache_path,
+        scope=stats.scope,
+    )
 
 
 def _validate_gene_alignment(gene_keys: np.ndarray, stats: PopulationGeneStats) -> None:
@@ -500,6 +995,7 @@ def stats_qc_record(stats: PopulationGeneStats) -> dict[str, object]:
     return {
         "dataset_name": stats.dataset_name,
         "cell_type": stats.cell_type,
+        "scope": stats.scope,
         "population_row_count": stats.population_row_count,
         "n_genes": stats.n_genes,
         "n_valid_genes": stats.n_valid_genes,
