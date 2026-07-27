@@ -31,4 +31,15 @@ def score_task(
     result = frame.copy()
     result["task_id"] = task.task_id
     result["doubled"] = pd.to_numeric(result["value"]) * 2
+    if task.task_id in {
+        int(value) for value in config.get("optional_metric_task_ids", [])
+    }:
+        result["optional_metric"] = result["doubled"] + 100
+    if task.task_id in {
+        int(value) for value in config.get(
+            "incompatible_metric_task_ids",
+            [],
+        )
+    }:
+        result["different_optional_metric"] = result["doubled"] + 200
     return result, diagnostic_frame([])

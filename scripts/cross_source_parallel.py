@@ -498,7 +498,59 @@ def _merge_checkpoint_kind(
     output_path: Path,
     kind: str,
 ) -> tuple[int, list[str]]:
-    expected_columns: Optional[list[str]] = None
+    checkpoint_schemas: list[tuple[int, list[str]]] = []
+    for task in sorted(tasks, key=lambda item: item.task_id):
+        validated = validate_checkpoint(
+            checkpoint_dir,
+            task,
+            analysis=analysis,
+            fingerprint=fingerprint,
+            load=False,
+        )
+        if validated is None:
+            raise RuntimeError(
+                f"Task {task.task_id} checkpoint became invalid during merge"
+            )
+        frame = validated[0 if kind == "metric" else 1]
+        columns = frame.columns.tolist()
+        if columns:
+            checkpoint_schemas.append((task.task_id, columns))
+
+    expected_columns: list[str] = []
+    if checkpoint_schemas:
+        schema_task_id, expected_columns = max(
+            checkpoint_schemas,
+            key=lambda item: len(item[1]),
+        )
+        if len(expected_columns) != len(set(expected_columns)):
+            raise ValueError(
+                f"Task {schema_task_id} {kind} schema contains duplicate columns"
+            )
+        expected_set = set(expected_columns)
+        for task_id, columns in checkpoint_schemas:
+            if len(columns) != len(set(columns)):
+                raise ValueError(
+                    f"Task {task_id} {kind} schema contains duplicate columns"
+                )
+            if not set(columns).issubset(expected_set):
+                raise ValueError(
+                    f"Task {task_id} {kind} schema is not a subset of the "
+                    f"largest schema from task {schema_task_id}: {columns!r} "
+                    f"versus {expected_columns!r}"
+                )
+            columns_set = set(columns)
+            ordered_subset = [
+                column
+                for column in expected_columns
+                if column in columns_set
+            ]
+            if ordered_subset != columns:
+                raise ValueError(
+                    f"Task {task_id} {kind} schema has an incompatible column "
+                    f"order relative to task {schema_task_id}: {columns!r} "
+                    f"versus {expected_columns!r}"
+                )
+
     total_rows = 0
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -523,13 +575,8 @@ def _merge_checkpoint_kind(
             columns = frame.columns.tolist()
             if not columns and len(frame) == 0:
                 continue
-            if expected_columns is None:
-                expected_columns = columns
-            elif columns != expected_columns:
-                raise ValueError(
-                    f"Task {task.task_id} {kind} schema {columns!r} does not "
-                    f"match {expected_columns!r}"
-                )
+            if columns != expected_columns:
+                frame = frame.reindex(columns=expected_columns)
             frame.to_csv(
                 temporary,
                 sep="\t",
@@ -545,7 +592,96 @@ def _merge_checkpoint_kind(
     finally:
         if temporary.exists():
             temporary.unlink()
-    return total_rows, expected_columns or []
+    return total_rows, expected_columns
+
+
+def merge_checkpointed_results(
+    *,
+    analysis: str,
+    tasks: Sequence[TaskSpec],
+    output_dir: Path,
+    fingerprint: str,
+    final_metrics_name: str,
+    elapsed_seconds: float = 0.0,
+    merge_only: bool = False,
+) -> tuple[Path, Path, int, int]:
+    """Validate and atomically merge an existing set of task checkpoints."""
+    output_dir = Path(output_dir)
+    checkpoint_dir = output_dir / "checkpoints" / fingerprint
+    invalid = [
+        task.task_id
+        for task in tasks
+        if validate_checkpoint(
+            checkpoint_dir,
+            task,
+            analysis=analysis,
+            fingerprint=fingerprint,
+            load=False,
+        )
+        is None
+    ]
+    if invalid:
+        raise RuntimeError(
+            f"{len(invalid)} task checkpoints are incomplete or invalid: "
+            f"{invalid[:10]}"
+        )
+
+    metrics_path = output_dir / final_metrics_name
+    diagnostics_path = output_dir / "diagnostics.tsv"
+    merge_token = f"{os.getpid()}-{time.monotonic_ns()}"
+    staged_metrics_path = output_dir / (
+        f".{metrics_path.name}.merge-{merge_token}"
+    )
+    staged_diagnostics_path = output_dir / (
+        f".{diagnostics_path.name}.merge-{merge_token}"
+    )
+    try:
+        n_metrics, metric_columns = _merge_checkpoint_kind(
+            tasks=tasks,
+            checkpoint_dir=checkpoint_dir,
+            analysis=analysis,
+            fingerprint=fingerprint,
+            output_path=staged_metrics_path,
+            kind="metric",
+        )
+        n_diagnostics, diagnostic_columns = _merge_checkpoint_kind(
+            tasks=tasks,
+            checkpoint_dir=checkpoint_dir,
+            analysis=analysis,
+            fingerprint=fingerprint,
+            output_path=staged_diagnostics_path,
+            kind="diagnostic",
+        )
+        if n_metrics == 0:
+            raise ValueError(
+                f"[{analysis}] every task completed, but no metric rows were scored"
+            )
+        # Publish the primary result last. If validation or either staged merge fails,
+        # an existing final result remains untouched.
+        os.replace(staged_diagnostics_path, diagnostics_path)
+        os.replace(staged_metrics_path, metrics_path)
+    finally:
+        for staged_path in (staged_metrics_path, staged_diagnostics_path):
+            if staged_path.exists():
+                staged_path.unlink()
+    atomic_write_json(
+        output_dir / "run_manifest.json",
+        {
+            "analysis": analysis,
+            "fingerprint": fingerprint,
+            "n_tasks": len(tasks),
+            "n_metric_rows": n_metrics,
+            "n_diagnostic_rows": n_diagnostics,
+            "metric_columns": metric_columns,
+            "diagnostic_columns": diagnostic_columns,
+            "metrics_file": metrics_path.name,
+            "diagnostics_file": diagnostics_path.name,
+            "progress_log_file": PROGRESS_LOG_NAME,
+            "elapsed_seconds": float(elapsed_seconds),
+            "merge_only": bool(merge_only),
+        },
+    )
+    return metrics_path, diagnostics_path, n_metrics, n_diagnostics
 
 
 def run_checkpointed_tasks(
@@ -714,77 +850,18 @@ def run_checkpointed_tasks(
         if progress_bar is not None:
             progress_bar.close()
 
-    invalid = [
-        task.task_id
-        for task in tasks
-        if validate_checkpoint(
-            checkpoint_dir,
-            task,
-            analysis=analysis,
-            fingerprint=fingerprint,
-            load=False,
-        )
-        is None
-    ]
-    if invalid:
-        raise RuntimeError(
-            f"{len(invalid)} task checkpoints are incomplete or invalid: "
-            f"{invalid[:10]}"
-        )
-
-    metrics_path = output_dir / final_metrics_name
-    diagnostics_path = output_dir / "diagnostics.tsv"
-    merge_token = f"{os.getpid()}-{time.monotonic_ns()}"
-    staged_metrics_path = output_dir / (
-        f".{metrics_path.name}.merge-{merge_token}"
-    )
-    staged_diagnostics_path = output_dir / (
-        f".{diagnostics_path.name}.merge-{merge_token}"
-    )
-    try:
-        n_metrics, metric_columns = _merge_checkpoint_kind(
-            tasks=tasks,
-            checkpoint_dir=checkpoint_dir,
-            analysis=analysis,
-            fingerprint=fingerprint,
-            output_path=staged_metrics_path,
-            kind="metric",
-        )
-        n_diagnostics, diagnostic_columns = _merge_checkpoint_kind(
-            tasks=tasks,
-            checkpoint_dir=checkpoint_dir,
-            analysis=analysis,
-            fingerprint=fingerprint,
-            output_path=staged_diagnostics_path,
-            kind="diagnostic",
-        )
-        if n_metrics == 0:
-            raise ValueError(
-                f"[{analysis}] every task completed, but no metric rows were scored"
-            )
-        # Publish the primary result last. If validation or either staged merge fails,
-        # an existing final result remains untouched.
-        os.replace(staged_diagnostics_path, diagnostics_path)
-        os.replace(staged_metrics_path, metrics_path)
-    finally:
-        for staged_path in (staged_metrics_path, staged_diagnostics_path):
-            if staged_path.exists():
-                staged_path.unlink()
-    atomic_write_json(
-        output_dir / "run_manifest.json",
-        {
-            "analysis": analysis,
-            "fingerprint": fingerprint,
-            "n_tasks": len(tasks),
-            "n_metric_rows": n_metrics,
-            "n_diagnostic_rows": n_diagnostics,
-            "metric_columns": metric_columns,
-            "diagnostic_columns": diagnostic_columns,
-            "metrics_file": metrics_path.name,
-            "diagnostics_file": diagnostics_path.name,
-            "progress_log_file": progress_log_path.name,
-            "elapsed_seconds": time.monotonic() - started,
-        },
+    (
+        metrics_path,
+        diagnostics_path,
+        n_metrics,
+        n_diagnostics,
+    ) = merge_checkpointed_results(
+        analysis=analysis,
+        tasks=tasks,
+        output_dir=output_dir,
+        fingerprint=fingerprint,
+        final_metrics_name=final_metrics_name,
+        elapsed_seconds=time.monotonic() - started,
     )
     report(
         f"merged {n_metrics:,} rows -> {metrics_path}; "
@@ -880,6 +957,18 @@ def add_common_arguments(
         "--force",
         action="store_true",
         help="Recompute every task even when compatible checkpoints exist.",
+    )
+    parser.add_argument(
+        "--merge-only",
+        nargs="?",
+        const="planned",
+        default=None,
+        metavar="FINGERPRINT",
+        help=(
+            "Skip input validation and scoring, then merge an already completed "
+            "checkpoint run. Without a value, use planned_run.json; otherwise "
+            "merge the supplied fingerprint."
+        ),
     )
 
 
@@ -1234,6 +1323,50 @@ def materialize_task_plan(
     return manifest_path
 
 
+def load_task_manifest(output_dir: Path) -> list[TaskSpec]:
+    """Reload the deterministic task plan needed to merge old checkpoints."""
+    manifest_path = Path(output_dir) / "task_manifest.tsv"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Cannot merge existing checkpoints without {manifest_path}"
+        )
+    frame = _read_tsv(manifest_path)
+    required = {"task_id", "task_key", "input_file", "n_input_rows"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(
+            f"Task manifest {manifest_path} is missing columns: {missing}"
+        )
+    tasks: list[TaskSpec] = []
+    for row in frame.to_dict(orient="records"):
+        try:
+            raw_key = json.loads(str(row["task_key"]))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Task manifest contains invalid task_key JSON: "
+                f"{row['task_key']!r}"
+            ) from exc
+        if not isinstance(raw_key, list):
+            raise ValueError(
+                f"Task manifest task_key must be a JSON list: {raw_key!r}"
+            )
+        tasks.append(
+            TaskSpec(
+                task_id=int(row["task_id"]),
+                key=tuple(str(value) for value in raw_key),
+                input_file=Path(str(row["input_file"])).name,
+                n_input_rows=int(row["n_input_rows"]),
+            )
+        )
+    tasks.sort(key=lambda task: task.task_id)
+    task_ids = [task.task_id for task in tasks]
+    if not tasks or len(task_ids) != len(set(task_ids)):
+        raise ValueError(
+            f"Task manifest {manifest_path} is empty or has duplicate task IDs"
+        )
+    return tasks
+
+
 def materialize_overlap_metadata(scope: PreparedScope) -> dict[str, str]:
     metadata_dir = scope.paths.output_dir / "overlap_metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
@@ -1370,6 +1503,76 @@ def run_analysis(
         dataset_order=dataset_order,
     )
     with output_directory_lock(paths.output_dir):
+        if args.merge_only is not None:
+            merge_started = time.monotonic()
+            tasks = load_task_manifest(paths.output_dir)
+            requested_fingerprint = str(args.merge_only)
+            if requested_fingerprint == "planned":
+                planned_path = paths.output_dir / "planned_run.json"
+                try:
+                    planned = json.loads(planned_path.read_text())
+                except FileNotFoundError as exc:
+                    raise FileNotFoundError(
+                        f"--merge-only requires the existing {planned_path}"
+                    ) from exc
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Cannot parse planned run metadata in {planned_path}"
+                    ) from exc
+                if planned.get("analysis") != analysis:
+                    raise ValueError(
+                        f"Planned run analysis {planned.get('analysis')!r} "
+                        f"does not match {analysis!r}"
+                    )
+                fingerprint = str(planned.get("fingerprint", ""))
+                planned_task_count = int(planned.get("n_tasks", -1))
+                if planned_task_count != len(tasks):
+                    raise ValueError(
+                        f"Planned run expects {planned_task_count} tasks, but "
+                        f"the task manifest contains {len(tasks)}"
+                    )
+            else:
+                fingerprint = requested_fingerprint
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", fingerprint):
+                raise ValueError(
+                    f"Unsafe or empty checkpoint fingerprint: {fingerprint!r}"
+                )
+            progress_log_path = paths.output_dir / PROGRESS_LOG_NAME
+            append_progress_log(
+                progress_log_path,
+                analysis=analysis,
+                message=(
+                    f"merge-only fingerprint={fingerprint} "
+                    f"tasks={len(tasks):,}"
+                ),
+            )
+            (
+                metrics_path,
+                diagnostics_path,
+                n_metrics,
+                n_diagnostics,
+            ) = merge_checkpointed_results(
+                analysis=analysis,
+                tasks=tasks,
+                output_dir=paths.output_dir,
+                fingerprint=fingerprint,
+                final_metrics_name=final_metrics_name,
+                elapsed_seconds=time.monotonic() - merge_started,
+                merge_only=True,
+            )
+            message = (
+                f"merge-only completed {n_metrics:,} rows -> {metrics_path}; "
+                f"diagnostics={n_diagnostics:,}"
+            )
+            append_progress_log(
+                progress_log_path,
+                analysis=analysis,
+                message=message,
+            )
+            if args.progress != "off":
+                print(f"[{analysis}] {message}", flush=True)
+            return metrics_path, diagnostics_path
+
         scope = prepare_scope(args, profile=analysis)
         tasks, task_frames = build_tasks(
             scope.matched_pairs,
@@ -1436,8 +1639,10 @@ __all__ = [
     "finalize_worker_config",
     "make_worker_catalog",
     "make_worker_w4_catalog",
+    "load_task_manifest",
     "materialize_overlap_metadata",
     "materialize_task_plan",
+    "merge_checkpointed_results",
     "output_directory_lock",
     "prepare_scope",
     "read_task_input",

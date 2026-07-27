@@ -12,12 +12,15 @@ import pandas as pd
 
 from scripts.cross_source_parallel import (
     build_tasks,
+    load_task_manifest,
     materialize_task_plan,
+    merge_checkpointed_results,
     output_directory_lock,
     run_checkpointed_tasks,
     task_paths,
     validate_checkpoint,
 )
+from scripts.run_overlap_group_rep_deg_metrics import main as deg_main
 
 
 class CrossSourceParallelTests(unittest.TestCase):
@@ -60,11 +63,13 @@ class CrossSourceParallelTests(unittest.TestCase):
         force: bool = False,
         config_updates=None,
         progress_mode: str = "auto",
+        analysis: str = "fake",
+        final_metrics_name: str = "fake.tsv",
     ):
         tasks, config = self._plan(root)
         config.update(config_updates or {})
         outputs = run_checkpointed_tasks(
-            analysis="fake",
+            analysis=analysis,
             scorer_module="tests.parallel_fake_scorer",
             tasks=tasks,
             worker_config=config,
@@ -72,7 +77,7 @@ class CrossSourceParallelTests(unittest.TestCase):
             fingerprint="fake-v1",
             workers=workers,
             force=force,
-            final_metrics_name="fake.tsv",
+            final_metrics_name=final_metrics_name,
             progress_mode=progress_mode,
         )
         return tasks, outputs
@@ -91,6 +96,128 @@ class CrossSourceParallelTests(unittest.TestCase):
             result = pd.read_csv(serial_path, sep="\t")
             self.assertEqual(result["context"].tolist(), ["b", "b", "a", "a"])
             self.assertEqual(result["doubled"].tolist(), [6, 8, 2, 4])
+
+    def test_merge_fills_compatible_optional_shard_columns_with_nan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, (metrics_path, _) = self._run(
+                root,
+                workers=1,
+                config_updates={"optional_metric_task_ids": [3]},
+            )
+            result = pd.read_csv(metrics_path, sep="\t")
+            self.assertEqual(
+                result.columns.tolist(),
+                [
+                    "context",
+                    "value",
+                    "task_id",
+                    "doubled",
+                    "optional_metric",
+                ],
+            )
+            self.assertEqual(
+                result.loc[result["task_id"] == 3, "optional_metric"].tolist(),
+                [102],
+            )
+            self.assertTrue(
+                result.loc[
+                    result["task_id"] != 3,
+                    "optional_metric",
+                ].isna().all()
+            )
+
+    def test_merge_rejects_incompatible_optional_shard_schemas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                ValueError,
+                "is not a subset of the largest schema",
+            ):
+                self._run(
+                    Path(directory),
+                    workers=1,
+                    config_updates={
+                        "optional_metric_task_ids": [3],
+                        "incompatible_metric_task_ids": [4],
+                    },
+                )
+
+    def test_existing_checkpoints_can_be_merged_without_scoring(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, (metrics_path, diagnostics_path) = self._run(
+                root,
+                workers=1,
+                config_updates={"optional_metric_task_ids": [3]},
+            )
+            expected_metrics = metrics_path.read_bytes()
+            metrics_path.unlink()
+            diagnostics_path.unlink()
+
+            tasks = load_task_manifest(root)
+            (
+                recovered_metrics,
+                recovered_diagnostics,
+                n_metrics,
+                n_diagnostics,
+            ) = merge_checkpointed_results(
+                analysis="fake",
+                tasks=tasks,
+                output_dir=root,
+                fingerprint="fake-v1",
+                final_metrics_name="fake.tsv",
+                merge_only=True,
+            )
+
+            self.assertEqual(recovered_metrics.read_bytes(), expected_metrics)
+            self.assertTrue(recovered_diagnostics.is_file())
+            self.assertEqual(n_metrics, 4)
+            self.assertEqual(n_diagnostics, 0)
+            run_manifest = json.loads(
+                (root / "run_manifest.json").read_text()
+            )
+            self.assertTrue(run_manifest["merge_only"])
+
+    def test_deg_merge_only_uses_planned_fingerprint_without_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = Path(directory) / "results"
+            production_root = output_root / "production"
+            tasks, (metrics_path, diagnostics_path) = self._run(
+                production_root,
+                workers=1,
+                analysis="deg",
+                final_metrics_name="deg_scored_metrics.tsv",
+                config_updates={"optional_metric_task_ids": [3]},
+            )
+            metrics_path.unlink()
+            diagnostics_path.unlink()
+            (production_root / "planned_run.json").write_text(
+                json.dumps(
+                    {
+                        "analysis": "deg",
+                        "fingerprint": "fake-v1",
+                        "n_tasks": len(tasks),
+                    }
+                )
+            )
+
+            exit_code = deg_main(
+                [
+                    "--output-dir",
+                    str(output_root),
+                    "--merge-only",
+                    "--progress",
+                    "off",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            recovered = pd.read_csv(
+                production_root / "deg_scored_metrics.tsv",
+                sep="\t",
+            )
+            self.assertIn("optional_metric", recovered.columns)
+            self.assertEqual(len(recovered), 4)
 
     def test_run_persists_incremental_progress_log(self):
         with tempfile.TemporaryDirectory() as directory:
