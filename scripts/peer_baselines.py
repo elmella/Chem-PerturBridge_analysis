@@ -31,6 +31,7 @@ from scipy.stats import rankdata
 __all__ = [
     "DEFAULT_PEER_SAMPLING_SEED",
     "PEER_SUMMARY_FIELDS",
+    "different_compound_peer_mask",
     "summarize_peer_scores",
     "empty_peer_score_summary",
     "spearman_scalar",
@@ -68,6 +69,35 @@ class PreparedSpearmanRows:
     normalized_ranks: np.ndarray
     finite_rows: np.ndarray
     valid_rows: np.ndarray
+
+
+def different_compound_peer_mask(
+    dose_keys: np.ndarray,
+    compounds: np.ndarray,
+    *,
+    dose_key: str,
+    excluded_compound: str,
+    valid_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Select same-dose, different-compound peers from the supplied population.
+
+    Retrieval analyses pass their overlap-filtered candidate arrays here, ensuring that
+    individual signatures and their centroid are evaluated over the same population.
+    """
+    dose_keys = np.asarray(dose_keys).astype(str).reshape(-1)
+    compounds = np.asarray(compounds).astype(str).reshape(-1)
+    if dose_keys.shape != compounds.shape:
+        raise ValueError("dose_keys and compounds must have the same shape")
+    peer_mask = (
+        (dose_keys == str(dose_key))
+        & (compounds != str(excluded_compound))
+    )
+    if valid_mask is not None:
+        valid_mask = np.asarray(valid_mask, dtype=bool).reshape(-1)
+        if valid_mask.shape != peer_mask.shape:
+            raise ValueError("valid_mask must match dose_keys and compounds")
+        peer_mask &= valid_mask
+    return peer_mask
 
 
 def summarize_peer_scores(

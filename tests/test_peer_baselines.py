@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from scripts.peer_baselines import (
+    different_compound_peer_mask,
     exact_mean_excluding_row_mask,
     exact_mean_for_row_mask,
     finite_column_totals,
@@ -14,6 +15,24 @@ from scripts.peer_baselines import (
 
 
 class PeerBaselineTests(unittest.TestCase):
+    def test_retrieval_peer_mask_stays_within_the_supplied_candidate_pool(self):
+        retrieval_mask = different_compound_peer_mask(
+            np.asarray(["0.05", "0.05"]),
+            np.asarray(["A", "B"]),
+            dose_key="0.05",
+            excluded_compound="A",
+        )
+        full_source_mask = different_compound_peer_mask(
+            np.asarray(["0.05", "0.05", "0.05", "0.05", "0.05"]),
+            np.asarray(["A", "B", "C", "D", "A"]),
+            dose_key="0.05",
+            excluded_compound="A",
+        )
+
+        np.testing.assert_array_equal(retrieval_mask, [False, True])
+        self.assertEqual(int(retrieval_mask.sum()), 1)
+        self.assertEqual(int(full_source_mask.sum()), 3)
+
     def test_prepared_spearman_matches_reference_with_ties_constants_and_nans(self):
         rng = np.random.default_rng(20260505)
         peers = np.round(rng.normal(size=(12, 80)), decimals=1)

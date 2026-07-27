@@ -93,7 +93,9 @@ W4 reports raw logFC beside `per_gene_population_zscore` for:
 - Table 6: all-gene matched-signature Spearman.
 - Table 9: strict-condition logFC retrieval using negative-L2, cosine, and Spearman,
   with the exact target-decoy null, source/target centroids, source/target individual
-  peers, and within-source positive controls.
+  peers, and within-source positive controls. For each similarity metric, a retrieval
+  centroid is the mean of the exact same overlap-filtered, metric-valid peer matrix used
+  for the corresponding individual-peer distribution.
 
 Within-source Tables 7, 8, and 10 and Table 5 direction agreement are intentionally
 outside W4 scope.
@@ -169,6 +171,11 @@ The source path, size, modification time, layer shape, gene order, eligibility m
 source-context once; later notebooks reload the same statistics. Subset runs therefore
 reuse only the selected source-context caches and write into the notebook's isolated
 subset output directory.
+
+The Table 6 W4 scorer additionally keeps a bounded in-memory cache of each active
+dataset/cell/time/dose/shared-gene stratum after standardization and Spearman-rank
+preparation. Each stratum is prepared once, and each compound selects its deterministic
+capped peer rows from that prepared object; centroid calculations still use every peer.
 
 ```bash
 uv sync --locked
@@ -261,4 +268,6 @@ appended W4 notebook sections have not yet been run at production scale.
   insufficient observations, strict gene order, source-context isolation, z-score
   mean/SD, centroid equivalence, cache reloads, and the add-one peer correction.
 - W4 notebook checks require identical raw and standardized matched-pair/query IDs,
-  unchanged Table 4 DEG counts, and identical Table 9 target-pool and positive counts.
+  unchanged Table 4 DEG counts, identical Table 9 target-pool and positive counts, and
+  affine equivalence between each checked standardized retrieval-pool centroid and the
+  standardized raw centroid of that same peer matrix.
