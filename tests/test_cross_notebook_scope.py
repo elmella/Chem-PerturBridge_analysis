@@ -366,6 +366,105 @@ class CrossNotebookScopeTests(unittest.TestCase):
             retrieval_code,
         )
 
+    def test_w4_expensive_stages_are_resumable_and_reuse_prepared_arrays(self):
+        expected_stage_fragments = {
+            "deg": (
+                "cross_source_core.W4ContextArrayCache()",
+                "cross_source_core.MatchedPairShardPlan.build(",
+                'OUTPUT_DIR / ".checkpoints" / "w4_deg_metrics"',
+                "resumable_context_frame(",
+            ),
+            "signature": (
+                "cross_source_core.W4ContextArrayCache()",
+                "cross_source_core.MatchedPairShardPlan.build(",
+                'OUTPUT_DIR / ".checkpoints" / "w4_signature_metrics"',
+                "resumable_context_frame(",
+            ),
+            "retrieval": (
+                "cross_source_core.MatchedPairShardPlan.build(",
+                'OUTPUT_DIR / ".checkpoints" / "w4_retrieval_metrics"',
+                "resumable_context_frame(",
+                "within_similarity_matrix",
+                "source_peer_scores = within_similarity_matrix[",
+                "target_peer_scores = query_scores[target_peer_mask]",
+                "within_scores = within_similarity_matrix[",
+                "W4_RETRIEVAL_MAX_WITHIN_MATRIX_BYTES",
+                "bounded per-query fallback",
+            ),
+        }
+        for path, profile in NOTEBOOK_PROFILES.items():
+            with self.subTest(notebook=path.name):
+                code = notebook_code(path)
+                for fragment in expected_stage_fragments[profile]:
+                    self.assertIn(fragment, code)
+
+        retrieval_code = notebook_code(
+            next(
+                path
+                for path, profile in NOTEBOOK_PROFILES.items()
+                if profile == "retrieval"
+            )
+        )
+        w4_cell = next(
+            cell
+            for cell in notebook_cells(
+                next(
+                    path
+                    for path, profile in NOTEBOOK_PROFILES.items()
+                    if profile == "retrieval"
+                )
+            )
+            if "def build_w4_retrieval_metrics_active_scope" in cell
+        )
+        self.assertNotIn(
+            "target_peer_scores = score_vector_against_matrix(",
+            w4_cell,
+        )
+        self.assertIn("w4-retrieval-v5", retrieval_code)
+
+    def test_expensive_raw_pairwise_stages_use_row_level_resume_shards(self):
+        expected_fragments = {
+            "deg": (
+                'OUTPUT_DIR / ".checkpoints" / "deg_metrics"',
+                'OUTPUT_DIR / ".checkpoints" / "peer_baselines"',
+                "DEG_METRIC_CHECKPOINT_ROWS",
+                "PEER_BASELINE_CHECKPOINT_ROWS",
+                "cross_source_core.ContextArrayCache()",
+            ),
+            "signature": (
+                'OUTPUT_DIR / ".checkpoints" / "signature_metrics"',
+                'OUTPUT_DIR / ".checkpoints" / "peer_baselines"',
+                "SIGNATURE_METRIC_CHECKPOINT_ROWS",
+                "PEER_BASELINE_CHECKPOINT_ROWS",
+                "cross_source_core.ContextArrayCache()",
+            ),
+        }
+        for path, profile in NOTEBOOK_PROFILES.items():
+            if profile not in expected_fragments:
+                continue
+            with self.subTest(notebook=path.name):
+                code = notebook_code(path)
+                for fragment in expected_fragments[profile]:
+                    self.assertIn(fragment, code)
+
+    def test_expensive_raw_retrieval_stages_resume_by_context(self):
+        retrieval_code = notebook_code(
+            next(
+                path
+                for path, profile in NOTEBOOK_PROFILES.items()
+                if profile == "retrieval"
+            )
+        )
+        for stage in (
+            "primary_retrieval",
+            "retrieval_ablation",
+            "focused_retrieval",
+        ):
+            self.assertIn(
+                f'OUTPUT_DIR / ".checkpoints" / "{stage}"',
+                retrieval_code,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -49,6 +49,7 @@ __all__ = [
     "FORCE_ALL",
     "cache_summary",
     "cached_frame",
+    "IncrementalContextFrameStore",
     "file_inventory",
     "file_inventory_fingerprint",
     "format_progress",
@@ -571,6 +572,171 @@ def _atomic_write_frame(path: Path, frame: pd.DataFrame) -> None:
     finally:
         if temporary_path.exists():
             temporary_path.unlink()
+
+
+class IncrementalContextFrameStore:
+    """Atomic context shards for notebook loops that cannot be callbacks.
+
+    ``resumable_context_frame`` remains the preferred interface. This adapter exists
+    for large notebook cells whose metric implementation is an established top-level
+    context loop: callers skip completed keys, save the rows produced by each context,
+    and assemble all shards before publishing the conventional stage TSV.
+    """
+
+    def __init__(
+        self,
+        stage: str,
+        shard_root: Path,
+        context_keys: Iterable[Any],
+        *,
+        fingerprint: str,
+        string_columns: Optional[Sequence[str]] = None,
+    ) -> None:
+        self.stage = str(stage)
+        self.fingerprint = str(fingerprint)
+        self.string_columns = (
+            CACHE_STRING_COLUMNS
+            if string_columns is None
+            else tuple(string_columns)
+        )
+        self.force = FORCE_ALL or self.stage in FORCE_RECOMPUTE
+        self.keys = list(context_keys)
+        self._key_hashes: dict[str, Any] = {}
+        for key in self.keys:
+            key_hash = stable_json_fingerprint(key)
+            if key_hash in self._key_hashes:
+                raise ValueError(
+                    f"[{self.stage}] duplicate context key: {key!r}; "
+                    f"first seen as {self._key_hashes[key_hash]!r}"
+                )
+            self._key_hashes[key_hash] = key
+
+        self.run_fingerprint = stable_json_fingerprint(
+            {
+                "stage": self.stage,
+                "fingerprint": self.fingerprint,
+                "context_key_hashes": sorted(self._key_hashes),
+            }
+        )
+        self.run_directory = Path(shard_root) / self.run_fingerprint
+        self.run_directory.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(
+            self.run_directory / "manifest.json",
+            json.dumps(
+                {
+                    "stage": self.stage,
+                    "fingerprint": self.fingerprint,
+                    "run_fingerprint": self.run_fingerprint,
+                    "n_contexts": len(self.keys),
+                    "context_key_hashes": sorted(self._key_hashes),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+        )
+
+    def _paths(self, key: Any) -> tuple[str, Path, Path]:
+        key_hash = stable_json_fingerprint(key)
+        if key_hash not in self._key_hashes:
+            raise KeyError(f"[{self.stage}] unknown context key: {key!r}")
+        return (
+            key_hash,
+            self.run_directory / f"{key_hash}.tsv",
+            self.run_directory / f"{key_hash}.cache.json",
+        )
+
+    def _metadata(self, key: Any) -> Optional[dict[str, Any]]:
+        key_hash, shard_path, metadata_path = self._paths(key)
+        if not shard_path.exists() or not metadata_path.exists():
+            return None
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+        if (
+            metadata.get("stage") != self.stage
+            or metadata.get("fingerprint") != self.fingerprint
+            or metadata.get("run_fingerprint") != self.run_fingerprint
+            or metadata.get("context_key_hash") != key_hash
+            or not isinstance(metadata.get("columns"), list)
+        ):
+            return None
+        return metadata
+
+    def is_complete(self, key: Any) -> bool:
+        """Return whether ``key`` has a compatible atomic shard."""
+        return not self.force and self._metadata(key) is not None
+
+    def save(self, key: Any, frame: pd.DataFrame) -> None:
+        """Atomically replace the shard for ``key``."""
+        if not isinstance(frame, pd.DataFrame):
+            raise TypeError(
+                f"[{self.stage}] context {key!r} returned "
+                f"{type(frame).__name__}, not a DataFrame"
+            )
+        key_hash, shard_path, metadata_path = self._paths(key)
+        _atomic_write_frame(shard_path, frame)
+        _atomic_write_text(
+            metadata_path,
+            json.dumps(
+                {
+                    "stage": self.stage,
+                    "fingerprint": self.fingerprint,
+                    "run_fingerprint": self.run_fingerprint,
+                    "context_key": _json_ready(key),
+                    "context_key_hash": key_hash,
+                    "columns": frame.columns.tolist(),
+                    "n_rows": int(len(frame)),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+        )
+
+    def assemble(self) -> pd.DataFrame:
+        """Load all completed shards in the caller's context order."""
+        frames: list[pd.DataFrame] = []
+        expected_columns: Optional[list[str]] = None
+        for key in self.keys:
+            metadata = self._metadata(key)
+            if metadata is None:
+                raise RuntimeError(
+                    f"[{self.stage}] context {key!r} has not been checkpointed"
+                )
+            _, shard_path, _ = self._paths(key)
+            columns = metadata["columns"]
+            try:
+                frame = _read_tsv(
+                    shard_path,
+                    string_columns=self.string_columns,
+                    columns=columns,
+                )
+            except (OSError, ValueError, pd.errors.ParserError) as exc:
+                raise RuntimeError(
+                    f"[{self.stage}] could not reload context {key!r}"
+                ) from exc
+            if frame.columns.tolist() != columns or len(frame) != int(
+                metadata.get("n_rows", -1)
+            ):
+                raise RuntimeError(
+                    f"[{self.stage}] context {key!r} failed shard validation"
+                )
+            if columns:
+                if expected_columns is None:
+                    expected_columns = columns
+                elif columns != expected_columns:
+                    raise RuntimeError(
+                        f"[{self.stage}] context {key!r} has columns {columns!r}; "
+                        f"expected {expected_columns!r}"
+                    )
+            frames.append(frame)
+
+        nonempty_schema_frames = [frame for frame in frames if len(frame.columns) > 0]
+        if not nonempty_schema_frames:
+            return pd.DataFrame()
+        return pd.concat(nonempty_schema_frames, ignore_index=True, sort=False)
 
 
 def resumable_context_frame(

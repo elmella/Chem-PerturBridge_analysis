@@ -10,7 +10,9 @@ from scripts.cross_source_core import (
     MATCH_PAIR_COLUMNS,
     MATCH_PAIR_IDENTITY_COLUMNS,
     LineSourceCatalog,
+    MatchedPairShardPlan,
     MatchSettings,
+    W4ContextArrayCache,
     analysis_output_dir,
     build_dataset_index,
     build_groups,
@@ -52,6 +54,94 @@ def synthetic_index(dataset_name: str, doses: list[float]) -> dict[str, object]:
 
 
 class CrossSourceCoreTests(unittest.TestCase):
+    def test_w4_context_cache_reuses_exact_arrays_and_clears_between_contexts(self):
+        rng = np.random.default_rng(42)
+        raw_stratum = rng.normal(size=(24, 17))
+        means = rng.normal(size=17)
+        sds = rng.uniform(0.5, 2.0, size=17)
+        selected = np.asarray([1, 4, 9, 15, 20], dtype=np.int64)
+        calls = {"stratum": 0, "scores": 0}
+
+        def build_standardized_stratum():
+            calls["stratum"] += 1
+            return (raw_stratum - means[None, :]) / sds[None, :]
+
+        def build_scores():
+            calls["scores"] += 1
+            return np.arange(selected.size, dtype=np.float64)
+
+        cache = W4ContextArrayCache()
+        cache.activate(("dataset_cell_type", "A", "B", "line", "24", "10", "10"))
+        standardized = cache.standardized_stratum(
+            ("A", "line", "24", "10"),
+            build_standardized_stratum,
+        )
+        cached_again = cache.standardized_stratum(
+            ("A", "line", "24", "10"),
+            build_standardized_stratum,
+        )
+        scores = cache.peer_scores(("query", "source"), build_scores)
+        cached_scores = cache.peer_scores(("query", "source"), build_scores)
+
+        expected_selected = (
+            raw_stratum[selected] - means[None, :]
+        ) / sds[None, :]
+        np.testing.assert_allclose(
+            standardized[selected],
+            expected_selected,
+            atol=0.0,
+        )
+        self.assertIs(standardized, cached_again)
+        self.assertIs(scores, cached_scores)
+        self.assertEqual(calls, {"stratum": 1, "scores": 1})
+
+        cache.activate(("dataset", "A", "B", "line", "24", "10", "10"))
+        cache.standardized_stratum(
+            ("A", "line", "24", "10"),
+            build_standardized_stratum,
+        )
+        cache.peer_scores(("query", "source"), build_scores)
+        self.assertEqual(calls, {"stratum": 2, "scores": 2})
+
+    def test_matched_pair_shard_plan_preserves_order_scales_and_all_rows(self):
+        pairs = pd.DataFrame(
+            {
+                "dataset_a": ["A", "A", "A", "C"],
+                "dataset_b": ["B", "B", "B", "D"],
+                "cell_type": ["line", "line", "line", "other"],
+                "row_id": ["r0", "r1", "r2", "r3"],
+            }
+        )
+        plan = MatchedPairShardPlan.build(
+            pairs,
+            context_columns=["dataset_a", "dataset_b", "cell_type"],
+            scale_variants=["dataset_cell_type", "dataset"],
+            max_rows=2,
+        )
+
+        self.assertEqual(len(plan.groups), 2)
+        self.assertEqual(len(plan.shards), 6)
+        self.assertEqual(
+            plan.shards[0].key,
+            ("dataset_cell_type", "A", "B", "line", "rows=0:2"),
+        )
+        self.assertEqual(
+            plan.frame(plan.shards[0])["row_id"].tolist(),
+            ["r0", "r1"],
+        )
+        self.assertEqual(
+            plan.frame(plan.shards[1])["row_id"].tolist(),
+            ["r2"],
+        )
+        for scale_variant in ("dataset_cell_type", "dataset"):
+            observed = [
+                row_id
+                for shard in plan.shards
+                if shard.scale_variant == scale_variant
+                for row_id in plan.frame(shard)["row_id"].tolist()
+            ]
+            self.assertEqual(observed, ["r0", "r1", "r2", "r3"])
+
     def test_dataset_profiles_have_one_explicit_source_of_truth(self):
         signature = production_dataset_order("signature")
         deg = production_dataset_order("deg")

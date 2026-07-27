@@ -8,6 +8,7 @@ import pandas as pd
 from scripts.notebook_cache import (
     CACHE_STATUS,
     FORCE_RECOMPUTE,
+    IncrementalContextFrameStore,
     ProgressReporter,
     cached_frame,
     file_inventory_fingerprint,
@@ -204,6 +205,49 @@ class NotebookCacheTests(unittest.TestCase):
             self.assertEqual(invalidated_calls, ["a", "b", "c"])
             self.assertEqual(rebuilt["left_obs_id"].tolist(), ["a", "b", "c"])
             self.assertEqual(CACHE_STATUS["peer_contexts"], "computed")
+
+    def test_incremental_context_store_skips_saved_contexts_and_assembles_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            keys = [("A", "B", "line1"), ("A", "C", "line2")]
+            first = IncrementalContextFrameStore(
+                "retrieval",
+                root,
+                keys,
+                fingerprint="retrieval-v1",
+            )
+            self.assertFalse(first.is_complete(keys[0]))
+            first.save(
+                keys[0],
+                pd.DataFrame({"query_obs_id": ["001"], "score": [0.5]}),
+            )
+            self.assertTrue(first.is_complete(keys[0]))
+            with self.assertRaisesRegex(RuntimeError, "has not been checkpointed"):
+                first.assemble()
+
+            resumed = IncrementalContextFrameStore(
+                "retrieval",
+                root,
+                keys,
+                fingerprint="retrieval-v1",
+            )
+            self.assertTrue(resumed.is_complete(keys[0]))
+            self.assertFalse(resumed.is_complete(keys[1]))
+            resumed.save(
+                keys[1],
+                pd.DataFrame({"query_obs_id": ["002"], "score": [0.7]}),
+            )
+            assembled = resumed.assemble()
+            self.assertEqual(assembled["query_obs_id"].tolist(), ["001", "002"])
+
+            invalidated = IncrementalContextFrameStore(
+                "retrieval",
+                root,
+                keys,
+                fingerprint="retrieval-v2",
+            )
+            self.assertFalse(invalidated.is_complete(keys[0]))
+            self.assertFalse(invalidated.is_complete(keys[1]))
 
     def test_progress_format_and_rate_limited_reporter(self) -> None:
         self.assertEqual(

@@ -48,6 +48,92 @@ been run from the repository root.
 4. `notebooks/overlap_group_rep_deg_metrics.ipynb`, `notebooks/overlap_group_rep_signature_similarity.ipynb` and `notebooks/overlap_group_rep_retrieval_metrics.ipynb` to plot cross-dataset agreement.
 5. `SKIP_EXISTING_DATASETS=1 EXISTING_RESULTS_DIR=./results/replicate_signature_similarity_sep_rep OUTPUT_DIR=./results/replicate_signature_similarity_sep_rep_combined COMPUTE_BASELINE_METRICS=1 COMPUTE_DEG_METRICS=1 scripts/slurm/run_replicate_signature_similarity.sh`, `notebooks/replicate_signature_similarity.ipynb` and `notebooks/replicate_deg_metrics.ipynb` to compute the cross-replicate agreement.
 
+### Parallel reviewer scoring
+
+The expensive matched-pair scoring from the three reviewer notebooks can be run
+without modifying the notebooks:
+
+```bash
+uv run python scripts/run_overlap_group_rep_deg_metrics.py
+uv run python scripts/run_overlap_group_rep_signature_similarity.py
+uv run python scripts/run_overlap_group_rep_retrieval_metrics.py
+```
+
+Each command defaults to two spawned workers. Use `--workers 1` for a serial
+debug run, `--datasets tahoe,sciplex` for a subset, and `--run-tag NAME` for an
+isolated named run. The primary outputs are:
+
+- `deg_scored_metrics.tsv`
+- `signature_scored_metrics.tsv`
+- `retrieval_scored_metrics.tsv`
+
+They are written below `results/parallel_cross_source/<analysis>/<run>/`.
+Task inputs, completion markers, checkpoints, diagnostics, and run metadata stay
+beside the primary TSV. Compatible completed shards are reused automatically;
+`--force` recomputes them.
+
+Every scorer also appends timestamped events to `progress.log` in its run
+directory. In an interactive terminal, one coordinator-owned tqdm bar reports
+completed and cached checkpoint tasks. Retrieval workers additionally report
+the active context, scale, similarity metric, direction, and periodic query
+counts, so a large context does not remain silent until completion. Use
+`--progress always` to force the bar in a non-interactive job or
+`--progress off` to suppress console progress; the log is written in every
+mode.
+
+W4 population statistics must exist before scoring. For the repository-default
+data layout, prepare both scopes with:
+
+```bash
+uv run python scripts/precompute_population_zscore.py \
+  --all-configured \
+  --scope both \
+  --workers 2
+```
+
+For custom `--data-root` inputs, a missing-cache error prints the exact
+`--dataset-dir` command required for that run.
+
+For the smallest reviewer-defensible run, score only the dataset-wide W4 scale
+for Tables 4 and 6 and use the strict-logFC reviewer workload for Table 9:
+
+```bash
+uv run python scripts/precompute_population_zscore.py \
+  --all-configured \
+  --scope dataset \
+  --workers 2
+uv run python scripts/run_overlap_group_rep_deg_metrics.py \
+  --w4-scales dataset
+uv run python scripts/run_overlap_group_rep_signature_similarity.py \
+  --w4-scales dataset
+uv run python scripts/run_overlap_group_rep_retrieval_metrics.py \
+  --workload reviewer-minimal \
+  --max-baseline-peers 0
+```
+
+The retrieval workload above computes only cosine and Spearman for raw logFC
+and dataset-wide per-gene W4 logFC. It reports unadjusted observed retrieval,
+source/target individual baselines, source/target centroids, and the exact
+random-rank expectation. It does not compute the legacy representations,
+dose-aware variants, negative-L2 parity, or within-dataset controls.
+
+After all three scorers finish, build the compound-clustered BCa tables and
+independently rematched exact/2x/3x/10x dose analysis:
+
+```bash
+uv run python scripts/summarize_reviewer_minimal_metrics.py \
+  --deg-metrics results/parallel_cross_source/deg/production/deg_scored_metrics.tsv \
+  --signature-metrics results/parallel_cross_source/signature/production/signature_scored_metrics.tsv \
+  --retrieval-metrics results/parallel_cross_source/retrieval/production/retrieval_scored_metrics.tsv \
+  --overlap-dir results/overlap_filtered_h5ads \
+  --output-dir results/parallel_cross_source/reviewer_minimal_summary
+```
+
+The retrieval command above scores every eligible individual peer. The default
+cap remains 512 for bounded exploratory runs; eligible and scored peer counts
+are recorded separately. The second dataset-by-cell-type W4 scale remains
+available through `--w4-scales all`.
+
 ## What Is Implemented
 
 - Dataset loading for `sciplex`, `tahoe`, `l1000_phase1`, `l1000_phase2` using paths from `notebooks/load_data.ipynb`.

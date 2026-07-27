@@ -168,9 +168,17 @@ CPB_FORCE_RECOMPUTE=all jupyter lab                       # ignore every cache
 
 Dataset selection, matched-row identities, source-file size/mtime, metric settings, peer
 cap, sampling seed, and engine versions are fingerprinted. Changing any of these
-automatically invalidates incompatible stage outputs. Peer-baseline work is additionally
-checkpointed by dataset-pair/cell/time/dose context, so an interrupted run resumes from
-completed context shards. All cache and task-result writes are published atomically.
+automatically invalidates incompatible stage outputs. Raw matched-pair scoring,
+peer-baseline scoring, retrieval, and W4 work are additionally checkpointed, so an
+interrupted run resumes from completed shards. Raw and W4 DEG/signature scoring use
+500-row shards by default; override these with `CPB_DEG_METRIC_CHECKPOINT_ROWS`,
+`CPB_SIGNATURE_METRIC_CHECKPOINT_ROWS`, `CPB_W4_DEG_CHECKPOINT_ROWS`, and
+`CPB_W4_SIGNATURE_CHECKPOINT_ROWS`. Raw peer-baseline work uses 250-row shards by
+default (`CPB_PEER_BASELINE_CHECKPOINT_ROWS`). Primary, ablation, focused, and W4
+retrieval checkpoint each complete dataset-pair/cell/time context. Retrieval's reusable
+within-source similarity matrix is capped at 4 GiB by default
+(`CPB_W4_RETRIEVAL_WITHIN_MATRIX_GB`); larger contexts retain the bounded per-query path.
+All cache and task-result writes are published atomically.
 
 The three cross-source notebooks import `scripts/cross_source_core.py`; notebook cells no
 longer retain shadow copies of the shared implementations. A single
@@ -187,7 +195,9 @@ W4 setup likewise uses one `PopulationStatsCatalog` from
 `scripts/population_zscore.py`. It owns production-versus-smoke population membership,
 precompute readiness/wait policy, dataset/cell-type and pooled-dataset statistic caches,
 gene alignment, and standardization. The notebooks retain only their metric-specific W4
-record construction and reporting.
+record construction and reporting. A shared `W4ContextArrayCache` and
+`MatchedPairShardPlan` in `scripts/cross_source_core.py` bound in-memory reuse and define
+deterministic resume shards across the three notebooks.
 
 Dataset membership is also explicit rather than being controlled by commented list
 entries. The `signature` profile includes GDPx2 and DILImap for Table 6. The `deg` and
@@ -326,6 +336,24 @@ Their appended W4 sections additionally write:
 
 Each W4 output directory also contains `w4_population_stats_qc.tsv`, including population
 row counts, valid-gene counts, finite-count ranges, fingerprints, and shared cache paths.
+
+### Reviewer-minimal script path
+
+The script runner has a bounded first-response profile:
+
+- `run_overlap_group_rep_deg_metrics.py --w4-scales dataset`
+- `run_overlap_group_rep_signature_similarity.py --w4-scales dataset`
+- `run_overlap_group_rep_retrieval_metrics.py --workload reviewer-minimal --max-baseline-peers 0`
+
+The retrieval profile is strict-condition logFC only, scores cosine and Spearman on raw
+and dataset-wide per-gene standardized values, reuses cross-source matrices across
+directions, and omits the legacy representations, retrieval variants, negative-L2 parity,
+and within-source positive control. Source and target individual-peer totals and sampled
+counts are separate; `--max-baseline-peers 0` disables sampling for the final run.
+
+`summarize_reviewer_minimal_metrics.py` consumes the three merged TSVs. It produces the
+compound-clustered BCa W1/W4 tables and independently rebuilds mutual-nearest matches at
+exact, 2x, 3x, and 10x for W3 before joining the already-scored DEG rows.
 
 ### Compute notes
 

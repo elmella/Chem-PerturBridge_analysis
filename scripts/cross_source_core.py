@@ -11,7 +11,7 @@ import itertools
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, Hashable, Mapping, Optional, Sequence
 
 import anndata as ad
 import numpy as np
@@ -824,6 +824,81 @@ class CrossSourceScope:
     line_match_summary: pd.DataFrame
 
 
+@dataclass(frozen=True)
+class MatchedPairShard:
+    """One deterministic row chunk within a scale/context scoring plan."""
+
+    key: tuple[str, ...]
+    scale_variant: str
+    context_key: tuple[str, ...]
+    row_start: int
+    row_stop: int
+
+
+@dataclass
+class MatchedPairShardPlan:
+    """Partition matched-pair contexts into deterministic resumable chunks."""
+
+    context_columns: tuple[str, ...]
+    groups: dict[tuple[str, ...], pd.DataFrame]
+    shards: list[MatchedPairShard]
+    max_rows: int
+
+    @classmethod
+    def build(
+        cls,
+        pairs: pd.DataFrame,
+        *,
+        context_columns: Sequence[str],
+        scale_variants: Sequence[str],
+        max_rows: int,
+    ) -> "MatchedPairShardPlan":
+        columns = tuple(str(column) for column in context_columns)
+        missing = sorted(set(columns) - set(pairs.columns))
+        if missing:
+            raise KeyError(f"Matched-pair shard plan is missing columns: {missing}")
+        max_rows = int(max_rows)
+        if max_rows < 1:
+            raise ValueError("Matched-pair shard max_rows must be positive")
+
+        groups = {
+            tuple(str(value) for value in context_key): group.copy()
+            for context_key, group in pairs.groupby(list(columns), sort=False)
+        }
+        shards: list[MatchedPairShard] = []
+        for scale_variant in scale_variants:
+            normalized_scale = str(scale_variant)
+            for context_key, group in groups.items():
+                for row_start in range(0, len(group), max_rows):
+                    row_stop = min(row_start + max_rows, len(group))
+                    shards.append(
+                        MatchedPairShard(
+                            key=(
+                                normalized_scale,
+                                *context_key,
+                                f"rows={row_start}:{row_stop}",
+                            ),
+                            scale_variant=normalized_scale,
+                            context_key=context_key,
+                            row_start=row_start,
+                            row_stop=row_stop,
+                        )
+                    )
+        return cls(
+            context_columns=columns,
+            groups=groups,
+            shards=shards,
+            max_rows=max_rows,
+        )
+
+    def frame(self, shard: MatchedPairShard) -> pd.DataFrame:
+        group = self.groups[shard.context_key]
+        return group.iloc[shard.row_start : shard.row_stop]
+
+    def context_size(self, shard: MatchedPairShard) -> int:
+        return int(len(self.groups[shard.context_key]))
+
+
 def prepare_cross_source_scope(
     *,
     dataset_order: Sequence[str],
@@ -1193,6 +1268,84 @@ class LineSourcePeerSelection:
     @property
     def selected_count(self) -> int:
         return int(self.row_indices.size)
+
+
+@dataclass
+class ContextArrayCache:
+    """Cache deterministic arrays only within one active scoring context.
+
+    Standardizing a complete source/dose/time stratum once and selecting rows
+    afterwards is exactly equivalent to standardizing those selected rows
+    independently. Peer score vectors are likewise reusable for a fixed scale,
+    query mask, and selected peer population. The context activation seam keeps
+    memory bounded while allowing chunked checkpoint workers to share prepared
+    arrays across adjacent chunks.
+    """
+
+    _active_context: Optional[Hashable] = field(default=None, init=False, repr=False)
+    _standardized_strata: dict[Hashable, np.ndarray] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _peer_scores: dict[Hashable, np.ndarray] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    stratum_hits: int = field(default=0, init=False)
+    stratum_misses: int = field(default=0, init=False)
+    score_hits: int = field(default=0, init=False)
+    score_misses: int = field(default=0, init=False)
+
+    def activate(self, context_key: Hashable) -> bool:
+        """Activate ``context_key`` and clear prepared arrays on a change."""
+        if context_key == self._active_context:
+            return False
+        self._active_context = context_key
+        self._standardized_strata.clear()
+        self._peer_scores.clear()
+        return True
+
+    def standardized_stratum(
+        self,
+        key: Hashable,
+        build: Callable[[], np.ndarray],
+    ) -> np.ndarray:
+        if key in self._standardized_strata:
+            self.stratum_hits += 1
+            return self._standardized_strata[key]
+        value = np.asarray(build())
+        if value.ndim != 2:
+            raise ValueError("A standardized W4 stratum must be a matrix")
+        self._standardized_strata[key] = value
+        self.stratum_misses += 1
+        return value
+
+    def peer_scores(
+        self,
+        key: Hashable,
+        build: Callable[[], np.ndarray],
+    ) -> np.ndarray:
+        if key in self._peer_scores:
+            self.score_hits += 1
+            return self._peer_scores[key]
+        value = np.asarray(build(), dtype=np.float64).reshape(-1)
+        self._peer_scores[key] = value
+        self.score_misses += 1
+        return value
+
+    def status(self) -> dict[str, int]:
+        return {
+            "stratum_hits": self.stratum_hits,
+            "stratum_misses": self.stratum_misses,
+            "score_hits": self.score_hits,
+            "score_misses": self.score_misses,
+        }
+
+
+# Backward-compatible name retained for existing W4 notebook cells.
+W4ContextArrayCache = ContextArrayCache
 
 
 def select_line_source_peers(
@@ -1568,6 +1721,7 @@ __all__ = [
     "DEFAULT_MATCH_SETTINGS",
     "DISPLAY_LABELS",
     "CrossSourceScope",
+    "ContextArrayCache",
     "DatasetSpec",
     "EMPTY_OVERLAP_FRAME",
     "INVALID_STRING_VALUES",
@@ -1576,9 +1730,12 @@ __all__ = [
     "LineSourcePeerSelection",
     "MATCH_PAIR_COLUMNS",
     "MATCH_PAIR_IDENTITY_COLUMNS",
+    "MatchedPairShard",
+    "MatchedPairShardPlan",
     "MatchSettings",
     "NUMERIC_SIG_FIGS",
     "TOP_K",
+    "W4ContextArrayCache",
     "active_dataset_names",
     "analysis_output_dir",
     "build_dataset_index",
