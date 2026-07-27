@@ -205,11 +205,24 @@ def _read_metrics(
         requested = set(columns)
         header = pd.read_csv(path, sep="\t", nrows=0).columns.tolist()
         usecols = [column for column in header if column in requested]
+    else:
+        header = pd.read_csv(path, sep="\t", nrows=0).columns.tolist()
+    identity_columns = (
+        set(cross_source_core.MATCH_PAIR_IDENTITY_COLUMNS)
+        | set(W4_IDENTITY_COLUMNS)
+        | set(RETRIEVAL_IDENTITY_COLUMNS)
+    )
+    identity_dtypes = {
+        column: "string"
+        for column in header
+        if column in identity_columns
+    }
     frame = pd.read_csv(
         path,
         sep="\t",
         low_memory=False,
         usecols=usecols,
+        dtype=identity_dtypes,
     )
     if frame.empty:
         raise ValueError(f"{label} metrics are empty: {path}")

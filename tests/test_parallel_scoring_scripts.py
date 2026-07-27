@@ -39,6 +39,7 @@ from scripts.summarize_reviewer_minimal_metrics import (
     DOSE_METRICS,
     _dose_coverage,
     _dose_metric_summaries,
+    _read_metrics,
     main as summarize_reviewer_metrics,
 )
 
@@ -202,6 +203,52 @@ def _common_arguments(
 
 
 class ParallelScoringScriptTests(unittest.TestCase):
+    def test_summary_reader_preserves_match_identity_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics_path = Path(directory) / "metrics.tsv"
+            pd.DataFrame(
+                {
+                    "left_dose_key": ["1", "0.1"],
+                    "right_dose_key": ["1.5", "10"],
+                    "left_obs_id": ["001", "002"],
+                    "observed_deg_lfc_spearman_sym_p05": [0.2, 0.3],
+                }
+            ).to_csv(metrics_path, sep="\t", index=False)
+
+            metrics = _read_metrics(
+                metrics_path,
+                label="DEG",
+                columns={
+                    "left_dose_key",
+                    "right_dose_key",
+                    "left_obs_id",
+                    "observed_deg_lfc_spearman_sym_p05",
+                },
+            )
+
+        self.assertEqual(
+            metrics[
+                ["left_dose_key", "right_dose_key", "left_obs_id"]
+            ].to_dict("records"),
+            [
+                {
+                    "left_dose_key": "1",
+                    "right_dose_key": "1.5",
+                    "left_obs_id": "001",
+                },
+                {
+                    "left_dose_key": "0.1",
+                    "right_dose_key": "10",
+                    "left_obs_id": "002",
+                },
+            ],
+        )
+        self.assertTrue(
+            pd.api.types.is_numeric_dtype(
+                metrics["observed_deg_lfc_spearman_sym_p05"]
+            )
+        )
+
     def test_empty_dose_scores_keep_merge_key_schema(self):
         drug, pair, line = _dose_metric_summaries(pd.DataFrame())
         self.assertTrue(drug.empty)
