@@ -28,7 +28,12 @@ from scripts.run_overlap_group_rep_retrieval_metrics import (
 from scripts.run_overlap_group_rep_retrieval_metrics import (
     IDENTITY_COLUMNS as RETRIEVAL_IDENTITY_COLUMNS,
 )
+from scripts.run_overlap_group_rep_retrieval_metrics import (
+    PEER_ONLY_FINAL_METRICS_NAME,
+    nested_peer_indices,
+)
 from scripts.run_overlap_group_rep_retrieval_metrics import main as run_retrieval
+from scripts.cross_source_scoring import select_peer_indices
 from scripts.run_overlap_group_rep_signature_similarity import (
     FINAL_METRICS_NAME as SIGNATURE_FINAL,
 )
@@ -41,6 +46,9 @@ from scripts.summarize_reviewer_minimal_metrics import (
     _dose_metric_summaries,
     _read_metrics,
     main as summarize_reviewer_metrics,
+)
+from scripts.summarize_retrieval_peer_sensitivity import (
+    build_summary as build_peer_sensitivity_summary,
 )
 
 
@@ -203,6 +211,254 @@ def _common_arguments(
 
 
 class ParallelScoringScriptTests(unittest.TestCase):
+    def test_nested_peer_indices_retain_the_reference_sample(self):
+        selections = nested_peer_indices(
+            1000,
+            (256, 512, None),
+            reference_cap=256,
+            seed_key="fixture-query",
+            sampling_seed=20260505,
+        )
+        reference = select_peer_indices(
+            1000,
+            256,
+            "fixture-query",
+            sampling_seed=20260505,
+        )
+        np.testing.assert_array_equal(selections["256"], reference)
+        self.assertTrue(
+            set(selections["256"]).issubset(set(selections["512"]))
+        )
+        self.assertTrue(
+            set(selections["512"]).issubset(set(selections["all"]))
+        )
+        self.assertEqual(len(selections["all"]), 1000)
+
+    def test_peer_only_raw_reuses_observed_metrics_without_w4(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_root, overlap_dir, w4_root, _ = build_fixture(root)
+            retrieval_output = root / "retrieval"
+            self.assertEqual(
+                run_retrieval(
+                    [
+                        *_common_arguments(
+                            data_root=data_root,
+                            overlap_dir=overlap_dir,
+                            w4_root=w4_root,
+                            output_dir=retrieval_output,
+                            workers=1,
+                            workload="reviewer-minimal",
+                            max_baseline_peers=3,
+                        ),
+                    ]
+                ),
+                0,
+            )
+            observed_path = retrieval_output / "fixture" / RETRIEVAL_FINAL
+            peer_output = root / "peer-only"
+            missing_w4_root = root / "does-not-exist"
+            self.assertEqual(
+                run_retrieval(
+                    [
+                        *_common_arguments(
+                            data_root=data_root,
+                            overlap_dir=overlap_dir,
+                            w4_root=missing_w4_root,
+                            output_dir=peer_output,
+                            workers=1,
+                            workload="peer-only",
+                            max_baseline_peers=3,
+                        ),
+                        "--peer-only-from",
+                        str(observed_path),
+                        "--peer-caps",
+                        "3,5,all",
+                        "--peer-reference-cap",
+                        "3",
+                        "--peer-scales",
+                        "raw",
+                    ]
+                ),
+                0,
+            )
+            peer_path = (
+                peer_output / "fixture" / PEER_ONLY_FINAL_METRICS_NAME
+            )
+            observed = pd.read_csv(observed_path, sep="\t")
+            observed = observed.loc[
+                observed["scale_variant"].astype(str) == "raw"
+            ].copy()
+            peer = pd.read_csv(peer_path, sep="\t")
+
+        reference = peer.loc[peer["peer_cap_label"].astype(str) == "3"]
+        key = [
+            "dataset_a",
+            "dataset_b",
+            "direction",
+            "cell_type",
+            "time_key",
+            "query_obs_id",
+            "representation",
+            "retrieval_variant",
+            "similarity_metric",
+            "scale_variant",
+        ]
+        comparison_columns = [
+            "source_individual_mean_similarity",
+            "source_individual_sd_similarity",
+            "source_individual_corrected_percentile",
+            "target_individual_mean_similarity",
+            "target_individual_sd_similarity",
+            "target_individual_corrected_percentile",
+            "source_peer_normalized_rank",
+            "target_peer_normalized_rank",
+        ]
+        merged = observed[key + comparison_columns].merge(
+            reference[key + comparison_columns],
+            on=key,
+            suffixes=("_observed", "_peer"),
+            validate="one_to_one",
+        )
+        self.assertEqual(len(merged), len(observed))
+        for column in comparison_columns:
+            np.testing.assert_allclose(
+                merged[f"{column}_observed"],
+                merged[f"{column}_peer"],
+                equal_nan=True,
+                rtol=0.0,
+                atol=1e-12,
+            )
+        counts = (
+            peer.groupby("peer_cap_order", as_index=False)[
+                [
+                    "source_individual_scored_count",
+                    "target_individual_scored_count",
+                ]
+            ]
+            .sum()
+            .sort_values("peer_cap_order")
+        )
+        self.assertTrue(
+            (
+                np.diff(
+                    counts["source_individual_scored_count"].to_numpy()
+                )
+                >= 0
+            ).all()
+        )
+        self.assertTrue(
+            (
+                np.diff(
+                    counts["target_individual_scored_count"].to_numpy()
+                )
+                >= 0
+            ).all()
+        )
+        summary = build_peer_sensitivity_summary(
+            peer,
+            n_boot=20,
+            seed=20260505,
+            workers=1,
+            bootstrap_batch_size=8,
+            progress=False,
+        )
+        self.assertEqual(
+            set(summary["peer_cap_label"].astype(str)),
+            {"3", "5", "all"},
+        )
+
+    def test_peer_only_dataset_scale_matches_production_reference_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_root, overlap_dir, w4_root, _ = build_fixture(root)
+            retrieval_output = root / "retrieval"
+            common = {
+                "data_root": data_root,
+                "overlap_dir": overlap_dir,
+                "w4_root": w4_root,
+                "workers": 1,
+                "max_baseline_peers": 3,
+            }
+            self.assertEqual(
+                run_retrieval(
+                    _common_arguments(
+                        output_dir=retrieval_output,
+                        workload="reviewer-minimal",
+                        **common,
+                    )
+                ),
+                0,
+            )
+            observed_path = retrieval_output / "fixture" / RETRIEVAL_FINAL
+            peer_output = root / "peer-only"
+            self.assertEqual(
+                run_retrieval(
+                    [
+                        *_common_arguments(
+                            output_dir=peer_output,
+                            workload="peer-only",
+                            **common,
+                        ),
+                        "--peer-only-from",
+                        str(observed_path),
+                        "--peer-caps",
+                        "3,all",
+                        "--peer-reference-cap",
+                        "3",
+                        "--peer-scales",
+                        "dataset",
+                    ]
+                ),
+                0,
+            )
+            observed = pd.read_csv(observed_path, sep="\t")
+            peer = pd.read_csv(
+                peer_output
+                / "fixture"
+                / PEER_ONLY_FINAL_METRICS_NAME,
+                sep="\t",
+            )
+
+        observed = observed.loc[
+            observed["scale_variant"].astype(str)
+            == PER_GENE_DATASET_VARIANT
+        ]
+        reference = peer.loc[peer["peer_cap_label"].astype(str) == "3"]
+        key = [
+            "dataset_a",
+            "dataset_b",
+            "direction",
+            "cell_type",
+            "time_key",
+            "query_obs_id",
+            "representation",
+            "retrieval_variant",
+            "similarity_metric",
+            "scale_variant",
+        ]
+        columns = [
+            "source_individual_corrected_percentile",
+            "target_individual_corrected_percentile",
+            "source_peer_normalized_rank",
+            "target_peer_normalized_rank",
+        ]
+        merged = observed[key + columns].merge(
+            reference[key + columns],
+            on=key,
+            suffixes=("_observed", "_peer"),
+            validate="one_to_one",
+        )
+        self.assertEqual(len(merged), len(observed))
+        for column in columns:
+            np.testing.assert_allclose(
+                merged[f"{column}_observed"],
+                merged[f"{column}_peer"],
+                equal_nan=True,
+                rtol=0.0,
+                atol=1e-12,
+            )
+
     def test_summary_reader_preserves_match_identity_tokens(self):
         with tempfile.TemporaryDirectory() as directory:
             metrics_path = Path(directory) / "metrics.tsv"

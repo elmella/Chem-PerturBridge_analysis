@@ -84,6 +84,7 @@ CACHE_STRING_COLUMNS: tuple[str, ...] = (
     "left_dose_key",
     "right_dose_key",
     "query_dose_key",
+    "best_target_dose_key",
     "left_plate",
     "right_plate",
     "left_well",

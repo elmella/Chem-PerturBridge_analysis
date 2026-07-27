@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 for _thread_variable in (
     "OMP_NUM_THREADS",
@@ -31,6 +32,7 @@ from scripts.cross_source_parallel import (
     TaskSpec,
     add_common_arguments,
     diagnostic_frame,
+    file_record,
     make_worker_catalog,
     make_worker_w4_catalog,
     read_overlap_metadata,
@@ -77,8 +79,10 @@ MIN_UNIQUE_COMPOUNDS_PER_SIDE = 2
 RAW_SCALE_VARIANT = "raw"
 FULL_WORKLOAD = "full"
 REVIEWER_MINIMAL_WORKLOAD = "reviewer-minimal"
+PEER_ONLY_WORKLOAD = "peer-only"
 REVIEWER_MINIMAL_SIMILARITIES = ("cosine", "spearman")
 REVIEWER_MINIMAL_SCALE_VARIANTS = (PER_GENE_DATASET_VARIANT,)
+PEER_ONLY_FINAL_METRICS_NAME = "retrieval_peer_sensitivity_metrics.tsv"
 
 IDENTITY_COLUMNS = [
     "dataset_a",
@@ -96,6 +100,60 @@ IDENTITY_COLUMNS = [
     "retrieval_variant",
     "similarity_metric",
     "scale_variant",
+]
+PEER_ONLY_REQUIRED_COLUMNS = (
+    *IDENTITY_COLUMNS,
+    "best_target_dose_key",
+    "observed_best_positive_similarity",
+    "observed_normalized_best_positive_rank",
+    "observed_recall_at_1",
+    "observed_auroc",
+)
+PEER_ONLY_OUTPUT_COLUMNS = [
+    *IDENTITY_COLUMNS,
+    "peer_cap_order",
+    "peer_cap_label",
+    "peer_cap",
+    "peer_reference_cap",
+    "peer_sampling_seed",
+    "source_individual_total_count",
+    "source_individual_scored_count",
+    "target_individual_total_count",
+    "target_individual_scored_count",
+    "best_target_dose_key",
+    "observed_best_positive_similarity",
+    "observed_normalized_best_positive_rank",
+    "observed_recall_at_1",
+    "observed_auroc",
+    *[
+        f"{side}_individual_{suffix}"
+        for side in ("source", "target")
+        for suffix in (
+            "n_peers",
+            "mean_similarity",
+            "sd_similarity",
+            "n_below_observed",
+            "fraction_below_observed",
+            "corrected_percentile",
+            "n_at_least_observed",
+            "empirical_p_upper",
+        )
+    ],
+    *[
+        f"{side}_peer_{field}"
+        for side in ("source", "target")
+        for field in (
+            "best_rank",
+            "normalized_rank",
+            "recall_at_1",
+            "auroc",
+        )
+    ],
+    *[
+        f"delta_vs_{side}_peer_{field}"
+        for side in ("source", "target")
+        for field in ("normalized_rank", "recall_at_1", "auroc")
+    ],
 ]
 COUNT_COLUMNS = [
     "target_pool_size",
@@ -273,6 +331,195 @@ def _record_key(record: Mapping[str, Any]) -> tuple[str, ...]:
             "scale_variant",
         )
     )
+
+
+def parse_peer_caps(value: str) -> tuple[Optional[int], ...]:
+    caps: list[Optional[int]] = []
+    seen: set[str] = set()
+    for raw in str(value).split(","):
+        token = raw.strip().lower()
+        if not token:
+            continue
+        if token == "all":
+            cap = None
+            label = "all"
+        else:
+            try:
+                cap = int(token)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid peer cap {raw!r}; use positive integers or 'all'"
+                ) from exc
+            if cap < 1:
+                raise ValueError(
+                    f"Invalid peer cap {raw!r}; use positive integers or 'all'"
+                )
+            label = str(cap)
+        if label in seen:
+            continue
+        seen.add(label)
+        caps.append(cap)
+    if not caps:
+        raise ValueError("--peer-caps must contain at least one cap")
+    return tuple(caps)
+
+
+def parse_peer_scales(value: str) -> tuple[str, ...]:
+    mapping = {
+        "raw": RAW_SCALE_VARIANT,
+        "dataset": PER_GENE_DATASET_VARIANT,
+    }
+    scales: list[str] = []
+    for raw in str(value).split(","):
+        token = raw.strip().lower()
+        if not token:
+            continue
+        try:
+            scale = mapping[token]
+        except KeyError as exc:
+            raise ValueError(
+                "--peer-scales supports only 'raw' and 'dataset'"
+            ) from exc
+        if scale not in scales:
+            scales.append(scale)
+    if not scales:
+        raise ValueError("--peer-scales must select at least one scale")
+    return tuple(scales)
+
+
+def nested_peer_indices(
+    n_peers: int,
+    caps: Sequence[Optional[int]],
+    *,
+    reference_cap: int,
+    seed_key: str,
+    sampling_seed: int,
+) -> dict[str, np.ndarray]:
+    """Return nested selections while exactly retaining the production cap."""
+    n_peers = int(n_peers)
+    reference_cap = int(reference_cap)
+    if reference_cap < 1:
+        raise ValueError("reference_cap must be positive")
+    numeric_caps = [int(cap) for cap in caps if cap is not None]
+    if any(cap < reference_cap for cap in numeric_caps):
+        raise ValueError(
+            "Every numeric peer sensitivity cap must be at least "
+            f"--peer-reference-cap={reference_cap}"
+        )
+    anchor = select_peer_indices(
+        n_peers,
+        reference_cap,
+        seed_key,
+        sampling_seed=sampling_seed,
+    )
+    if n_peers <= len(anchor):
+        ordered = anchor
+    else:
+        remaining = np.setdiff1d(
+            np.arange(n_peers, dtype=np.int64),
+            anchor,
+            assume_unique=True,
+        )
+        digest = hashlib.blake2b(
+            (
+                f"{int(sampling_seed)}|{seed_key}|"
+                "peer-sensitivity-extension"
+            ).encode("utf-8"),
+            digest_size=8,
+        ).digest()
+        rng = np.random.default_rng(int.from_bytes(digest, "big"))
+        ordered = np.concatenate([anchor, rng.permutation(remaining)])
+    selections: dict[str, np.ndarray] = {}
+    for cap in caps:
+        label = "all" if cap is None else str(int(cap))
+        count = n_peers if cap is None else min(n_peers, int(cap))
+        selections[label] = np.sort(ordered[:count]).astype(np.int64)
+    return selections
+
+
+def _load_peer_only_task_frame(
+    scope,
+    *,
+    observed_metrics_path: Path,
+    scales: Sequence[str],
+) -> pd.DataFrame:
+    path = Path(observed_metrics_path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Peer-only retrieval input does not exist: {path}"
+        )
+    header = pd.read_csv(path, sep="\t", nrows=0).columns.tolist()
+    missing = sorted(set(PEER_ONLY_REQUIRED_COLUMNS) - set(header))
+    if missing:
+        raise KeyError(
+            f"Peer-only retrieval input is missing columns: {missing}"
+        )
+    string_columns = {
+        column: "string"
+        for column in PEER_ONLY_REQUIRED_COLUMNS
+        if column in {
+            *IDENTITY_COLUMNS,
+            "best_target_dose_key",
+        }
+    }
+    frame = pd.read_csv(
+        path,
+        sep="\t",
+        usecols=list(PEER_ONLY_REQUIRED_COLUMNS),
+        dtype=string_columns,
+        low_memory=False,
+    )
+    frame = frame.loc[
+        (frame["representation"].astype(str) == "logFC")
+        & (
+            frame["retrieval_variant"].astype(str)
+            == "strict_matched_condition"
+        )
+        & frame["similarity_metric"].astype(str).isin(
+            REVIEWER_MINIMAL_SIMILARITIES
+        )
+        & frame["scale_variant"].astype(str).isin(scales)
+    ].copy()
+    allowed_pairs = {
+        (str(row.dataset_a), str(row.dataset_b))
+        for row in scope.matched_pairs[
+            ["dataset_a", "dataset_b"]
+        ].drop_duplicates().itertuples(index=False)
+    }
+    frame = frame.loc[
+        [
+            (str(a), str(b)) in allowed_pairs
+            for a, b in frame[["dataset_a", "dataset_b"]].itertuples(
+                index=False,
+                name=None,
+            )
+        ]
+    ].copy()
+    if frame.empty:
+        raise ValueError(
+            "No strict-logFC cosine/Spearman records matched the selected "
+            "datasets and peer scales"
+        )
+    missing_scales = sorted(set(scales) - set(frame["scale_variant"].astype(str)))
+    if missing_scales:
+        raise ValueError(
+            f"Peer-only input has no records for scales: {missing_scales}"
+        )
+    key_columns = [
+        "dataset_a",
+        "dataset_b",
+        "direction",
+        "cell_type",
+        "time_key",
+        "query_obs_id",
+        "representation",
+        "retrieval_variant",
+        "similarity_metric",
+        "scale_variant",
+    ]
+    if frame.duplicated(key_columns).any():
+        raise ValueError("Peer-only retrieval input contains duplicate identities")
+    return frame.sort_values(key_columns).reset_index(drop=True)
 
 
 def _base_record(
@@ -1239,6 +1486,408 @@ def _score_reviewer_minimal_scale(
     return raw_validity
 
 
+def _peer_only_direction_records(
+    *,
+    observed_rows: pd.DataFrame,
+    direction: str,
+    query_pool: pd.DataFrame,
+    target_pool: pd.DataFrame,
+    query_matrix: np.ndarray,
+    target_matrix: np.ndarray,
+    cross_scores: np.ndarray,
+    query_self_scores: np.ndarray,
+    valid_queries: np.ndarray,
+    valid_targets: np.ndarray,
+    caps: Sequence[Optional[int]],
+    reference_cap: int,
+    sampling_seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    rows = observed_rows.loc[
+        observed_rows["direction"].astype(str) == str(direction)
+    ]
+    if rows.empty:
+        return [], []
+    query_obs = query_pool["obs_id"].astype(str).to_numpy()
+    query_compounds = query_pool["pubchem_cid"].astype(str).to_numpy()
+    query_doses = query_pool["dose_key"].astype(str).to_numpy()
+    target_compounds = target_pool["pubchem_cid"].astype(str).to_numpy()
+    target_doses = target_pool["dose_key"].astype(str).to_numpy()
+    query_lookup = {
+        str(obs_id): index for index, obs_id in enumerate(query_obs)
+    }
+    target_indices = np.flatnonzero(valid_targets)
+    filtered_target_compounds = target_compounds[target_indices]
+    filtered_target_doses = target_doses[target_indices]
+    output: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    for row in rows.itertuples(index=False):
+        row_values = row._asdict()
+        query_obs_id = str(row_values["query_obs_id"])
+        query_idx = query_lookup.get(query_obs_id)
+        if query_idx is None or not bool(valid_queries[query_idx]):
+            diagnostics.append(
+                {
+                    "analysis": ANALYSIS,
+                    "dataset_a": row_values["dataset_a"],
+                    "dataset_b": row_values["dataset_b"],
+                    "cell_type": row_values["cell_type"],
+                    "time_key": row_values["time_key"],
+                    "query_obs_id": query_obs_id,
+                    "stage": "retrieval_peer_only",
+                    "reason": "unresolved_or_invalid_query",
+                }
+            )
+            continue
+        observed_similarity = float(
+            row_values["observed_best_positive_similarity"]
+        )
+        query_scores = np.asarray(
+            cross_scores[query_idx, target_indices],
+            dtype=np.float64,
+        )
+        query_compound = str(query_compounds[query_idx])
+        query_dose = str(query_doses[query_idx])
+        best_target_dose = str(row_values["best_target_dose_key"])
+
+        source_all_rows = np.flatnonzero(
+            (query_doses == query_dose)
+            & (query_compounds != query_compound)
+            & valid_queries
+        )
+        target_all_rows = np.flatnonzero(
+            (filtered_target_doses == best_target_dose)
+            & (filtered_target_compounds != query_compound)
+        )
+        query_dataset = str(row_values["query_dataset"])
+        target_dataset = str(row_values["target_dataset"])
+        common_key = [
+            query_dataset,
+            target_dataset,
+            str(row_values["cell_type"]),
+            str(row_values["time_key"]),
+            query_obs_id,
+        ]
+        source_key = "|".join(
+            [*common_key, query_dose, query_compound, "source"]
+        )
+        target_key = "|".join(
+            [*common_key, best_target_dose, query_compound, "target"]
+        )
+        source_selections = nested_peer_indices(
+            len(source_all_rows),
+            caps,
+            reference_cap=reference_cap,
+            seed_key=source_key,
+            sampling_seed=sampling_seed,
+        )
+        target_selections = nested_peer_indices(
+            len(target_all_rows),
+            caps,
+            reference_cap=reference_cap,
+            seed_key=target_key,
+            sampling_seed=sampling_seed,
+        )
+        source_all_scores = np.asarray(
+            query_self_scores[query_idx, source_all_rows],
+            dtype=np.float64,
+        )
+        target_all_scores = np.asarray(
+            query_scores[target_all_rows],
+            dtype=np.float64,
+        )
+        for cap_order, cap in enumerate(caps):
+            label = "all" if cap is None else str(int(cap))
+            source_offsets = source_selections[label]
+            target_offsets = target_selections[label]
+            source_scores = source_all_scores[source_offsets]
+            target_scores = target_all_scores[target_offsets]
+            source_summary = retrieval_peer_summary(
+                observed_similarity,
+                source_scores,
+                "source_individual",
+            )
+            target_summary = retrieval_peer_summary(
+                observed_similarity,
+                target_scores,
+                "target_individual",
+            )
+            source_metrics = expected_single_signature_metrics(
+                query_scores,
+                source_scores,
+            )
+            target_metrics = expected_single_signature_metrics(
+                query_scores,
+                target_scores,
+            )
+            record = {
+                column: row_values[column] for column in IDENTITY_COLUMNS
+            }
+            record.update(
+                {
+                    "peer_cap_order": cap_order,
+                    "peer_cap_label": label,
+                    "peer_cap": 0 if cap is None else int(cap),
+                    "peer_reference_cap": int(reference_cap),
+                    "peer_sampling_seed": int(sampling_seed),
+                    "source_individual_total_count": int(
+                        len(source_all_rows)
+                    ),
+                    "source_individual_scored_count": int(
+                        len(source_offsets)
+                    ),
+                    "target_individual_total_count": int(
+                        len(target_all_rows)
+                    ),
+                    "target_individual_scored_count": int(
+                        len(target_offsets)
+                    ),
+                    "best_target_dose_key": best_target_dose,
+                    "observed_best_positive_similarity": (
+                        observed_similarity
+                    ),
+                    "observed_normalized_best_positive_rank": float(
+                        row_values[
+                            "observed_normalized_best_positive_rank"
+                        ]
+                    ),
+                    "observed_recall_at_1": float(
+                        row_values["observed_recall_at_1"]
+                    ),
+                    "observed_auroc": float(
+                        row_values["observed_auroc"]
+                    ),
+                    **source_summary,
+                    **target_summary,
+                }
+            )
+            for side, metrics in (
+                ("source", source_metrics),
+                ("target", target_metrics),
+            ):
+                for field in (
+                    "best_rank",
+                    "normalized_rank",
+                    "recall_at_1",
+                    "auroc",
+                ):
+                    record[f"{side}_peer_{field}"] = metrics[field]
+                for field, observed_field in (
+                    (
+                        "normalized_rank",
+                        "observed_normalized_best_positive_rank",
+                    ),
+                    ("recall_at_1", "observed_recall_at_1"),
+                    ("auroc", "observed_auroc"),
+                ):
+                    record[f"delta_vs_{side}_peer_{field}"] = (
+                        cross_source_core.difference_if_both_defined(
+                            record[observed_field],
+                            metrics[field],
+                        )
+                    )
+            output.append(record)
+    return output, diagnostics
+
+
+def _peer_only_context_records(
+    frame: pd.DataFrame,
+    *,
+    config: Mapping[str, Any],
+    catalog: cross_source_core.LineSourceCatalog,
+    w4_catalog,
+    progress: Optional[Callable[[str, str], None]] = None,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    settings = config["settings"]
+    caps = tuple(
+        None if value == "all" else int(value)
+        for value in settings["peer_caps"]
+    )
+    scales = tuple(str(value) for value in settings["peer_scales"])
+    dataset_a = str(frame.iloc[0]["dataset_a"])
+    dataset_b = str(frame.iloc[0]["dataset_b"])
+    cell_type = str(frame.iloc[0]["cell_type"])
+    time_key = str(frame.iloc[0]["time_key"])
+    left_pool_frame = pool_frame_for_context(
+        read_overlap_metadata(config, dataset_a),
+        cell_type,
+        time_key,
+    )
+    right_pool_frame = pool_frame_for_context(
+        read_overlap_metadata(config, dataset_b),
+        cell_type,
+        time_key,
+    )
+    left_source = catalog.get_line_source(dataset_a, cell_type)
+    right_source = catalog.get_line_source(dataset_b, cell_type)
+    shared_genes, left_positions, right_positions = (
+        catalog.shared_gene_positions(left_source, right_source)
+    )
+    left = build_logfc_pool_matrices(
+        left_pool_frame,
+        left_source,
+        left_positions,
+    )
+    right = build_logfc_pool_matrices(
+        right_pool_frame,
+        right_source,
+        right_positions,
+    )
+    diagnostics: list[dict[str, Any]] = []
+    for side, values in (("left", left.diagnostics), ("right", right.diagnostics)):
+        for diagnostic in values:
+            diagnostics.append(
+                {
+                    **diagnostic,
+                    "analysis": ANALYSIS,
+                    "dataset_a": dataset_a,
+                    "dataset_b": dataset_b,
+                    "cell_type": cell_type,
+                    "time_key": time_key,
+                    "stage": "retrieval_peer_only",
+                    "reason": f"{side}_pool_{diagnostic.get('reason', '')}",
+                }
+            )
+    finite = np.isfinite(left.logfc).all(axis=0) & np.isfinite(
+        right.logfc
+    ).all(axis=0)
+    if int(finite.sum()) < 2:
+        raise ValueError(
+            f"Fewer than two finite shared genes for {dataset_a} vs "
+            f"{dataset_b} / {cell_type} / {time_key}"
+        )
+    left_raw = left.logfc[:, finite]
+    right_raw = right.logfc[:, finite]
+    scale_matrices: dict[str, tuple[np.ndarray, np.ndarray]] = {
+        RAW_SCALE_VARIANT: (left_raw, right_raw)
+    }
+    if PER_GENE_DATASET_VARIANT in scales:
+        if w4_catalog is None:
+            raise AssertionError("Dataset W4 peer scoring needs a W4 catalog")
+        left_w4 = w4_catalog.standardize_aligned_matrix(
+            left_source,
+            left.logfc,
+            left_positions,
+            scale_variant=PER_GENE_DATASET_VARIANT,
+        )
+        right_w4 = w4_catalog.standardize_aligned_matrix(
+            right_source,
+            right.logfc,
+            right_positions,
+            scale_variant=PER_GENE_DATASET_VARIANT,
+        )
+        scale_matrices[PER_GENE_DATASET_VARIANT] = (
+            left_w4[:, finite],
+            right_w4[:, finite],
+        )
+
+    output: list[dict[str, Any]] = []
+    raw_geometry: dict[
+        str, tuple[np.ndarray, np.ndarray, np.ndarray]
+    ] = {}
+    for metric in REVIEWER_MINIMAL_SIMILARITIES:
+        raw_scores, valid_left, valid_right = similarity_matrix(
+            left_raw,
+            right_raw,
+            metric,
+        )
+        raw_geometry[metric] = (raw_scores, valid_left, valid_right)
+    for scale in scales:
+        left_matrix, right_matrix = scale_matrices[scale]
+        for metric in REVIEWER_MINIMAL_SIMILARITIES:
+            selected = frame.loc[
+                (frame["scale_variant"].astype(str) == scale)
+                & (frame["similarity_metric"].astype(str) == metric)
+            ]
+            if selected.empty:
+                continue
+            if progress is not None:
+                progress(
+                    "peer_similarity",
+                    f"scale={scale} metric={metric}",
+                )
+            if scale == RAW_SCALE_VARIANT:
+                (
+                    cross_scores,
+                    scale_valid_left,
+                    scale_valid_right,
+                ) = raw_geometry[metric]
+            else:
+                cross_scores, scale_valid_left, scale_valid_right = (
+                    similarity_matrix(left_matrix, right_matrix, metric)
+                )
+            left_self, _, _ = similarity_matrix(
+                left_matrix,
+                left_matrix,
+                metric,
+            )
+            right_self, _, _ = similarity_matrix(
+                right_matrix,
+                right_matrix,
+                metric,
+            )
+            _, valid_left, valid_right = raw_geometry[metric]
+            if (
+                not np.all(scale_valid_left[valid_left])
+                or not np.all(scale_valid_right[valid_right])
+            ):
+                raise AssertionError(
+                    f"{scale} created invalid raw-valid {metric} signatures"
+                )
+            records, record_diagnostics = _peer_only_direction_records(
+                observed_rows=selected,
+                direction="A_to_B",
+                query_pool=left.frame,
+                target_pool=right.frame,
+                query_matrix=left_matrix,
+                target_matrix=right_matrix,
+                cross_scores=cross_scores,
+                query_self_scores=left_self,
+                valid_queries=valid_left,
+                valid_targets=valid_right,
+                caps=caps,
+                reference_cap=int(settings["peer_reference_cap"]),
+                sampling_seed=int(settings["peer_sampling_seed"]),
+            )
+            output.extend(records)
+            diagnostics.extend(record_diagnostics)
+            records, record_diagnostics = _peer_only_direction_records(
+                observed_rows=selected,
+                direction="B_to_A",
+                query_pool=right.frame,
+                target_pool=left.frame,
+                query_matrix=right_matrix,
+                target_matrix=left_matrix,
+                cross_scores=cross_scores.T,
+                query_self_scores=right_self,
+                valid_queries=valid_right,
+                valid_targets=valid_left,
+                caps=caps,
+                reference_cap=int(settings["peer_reference_cap"]),
+                sampling_seed=int(settings["peer_sampling_seed"]),
+            )
+            output.extend(records)
+            diagnostics.extend(record_diagnostics)
+    result = pd.DataFrame(output)
+    if result.empty:
+        return pd.DataFrame(columns=PEER_ONLY_OUTPUT_COLUMNS), diagnostics
+    for column in PEER_ONLY_OUTPUT_COLUMNS:
+        if column not in result.columns:
+            result[column] = np.nan
+    result = result.loc[:, PEER_ONLY_OUTPUT_COLUMNS]
+    sort_columns = [
+        "dataset_a",
+        "dataset_b",
+        "direction",
+        "cell_type",
+        "time_key",
+        "query_obs_id",
+        "similarity_metric",
+        "scale_variant",
+        "peer_cap_order",
+    ]
+    return result.sort_values(sort_columns).reset_index(drop=True), diagnostics
+
+
 def _context_records(
     frame: pd.DataFrame,
     *,
@@ -1680,14 +2329,28 @@ def score_task(
         )
 
     try:
-        w4_catalog = make_worker_w4_catalog(config, catalog)
-        metrics, records = _context_records(
-            frame,
-            config=config,
-            catalog=catalog,
-            w4_catalog=w4_catalog,
-            progress=progress,
+        workload = str(config["settings"].get("workload", FULL_WORKLOAD))
+        w4_catalog = (
+            make_worker_w4_catalog(config, catalog)
+            if config["settings"].get("w4_scale_variants")
+            else None
         )
+        if workload == PEER_ONLY_WORKLOAD:
+            metrics, records = _peer_only_context_records(
+                frame,
+                config=config,
+                catalog=catalog,
+                w4_catalog=w4_catalog,
+                progress=progress,
+            )
+        else:
+            metrics, records = _context_records(
+                frame,
+                config=config,
+                catalog=catalog,
+                w4_catalog=w4_catalog,
+                progress=progress,
+            )
         for record in records:
             record["task_id"] = task.task_id
         progress(
@@ -1706,12 +2369,45 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_arguments(parser, analysis=ANALYSIS)
     parser.add_argument(
         "--workload",
-        choices=(REVIEWER_MINIMAL_WORKLOAD, FULL_WORKLOAD),
+        choices=(
+            REVIEWER_MINIMAL_WORKLOAD,
+            PEER_ONLY_WORKLOAD,
+            FULL_WORKLOAD,
+        ),
         default=FULL_WORKLOAD,
         help=(
             "Scoring workload. reviewer-minimal runs strict logFC cosine and "
-            "Spearman on raw and dataset-wide W4 scales; full preserves the "
-            "complete legacy bundle."
+            "Spearman on raw and dataset-wide W4 scales; peer-only recomputes "
+            "only individual-peer baselines from an existing retrieval TSV; "
+            "full preserves the complete legacy bundle."
+        ),
+    )
+    parser.add_argument(
+        "--peer-only-from",
+        type=Path,
+        default=None,
+        help="Existing reviewer-minimal retrieval TSV used by peer-only mode.",
+    )
+    parser.add_argument(
+        "--peer-caps",
+        default="256,512,1024,all",
+        help="Comma-separated nested sensitivity caps; 'all' uses every peer.",
+    )
+    parser.add_argument(
+        "--peer-scales",
+        default="raw",
+        help=(
+            "Peer-only scales: raw or raw,dataset. Raw does not validate, "
+            "load, or calculate W4."
+        ),
+    )
+    parser.add_argument(
+        "--peer-reference-cap",
+        type=int,
+        default=256,
+        help=(
+            "Production cap whose deterministic sample must be retained "
+            "exactly as the first nested selection."
         ),
     )
     return parser
@@ -1719,17 +2415,38 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    peer_only = args.workload == PEER_ONLY_WORKLOAD
+    if peer_only and args.peer_only_from is None:
+        raise ValueError("--peer-only-from is required for peer-only workload")
+    if not peer_only and args.peer_only_from is not None:
+        raise ValueError("--peer-only-from requires --workload peer-only")
+    if peer_only and not str(args.run_tag).strip():
+        args.run_tag = "peer_sensitivity"
+    peer_caps = parse_peer_caps(args.peer_caps) if peer_only else ()
+    peer_scales = parse_peer_scales(args.peer_scales) if peer_only else ()
+    if peer_only:
+        numeric_caps = [cap for cap in peer_caps if cap is not None]
+        if args.peer_reference_cap < 1:
+            raise ValueError("--peer-reference-cap must be positive")
+        if any(cap < args.peer_reference_cap for cap in numeric_caps):
+            raise ValueError(
+                "Every numeric --peer-caps value must be at least "
+                "--peer-reference-cap"
+            )
     reviewer_minimal = args.workload == REVIEWER_MINIMAL_WORKLOAD
     similarity_metrics = (
         REVIEWER_MINIMAL_SIMILARITIES
-        if reviewer_minimal
+        if reviewer_minimal or peer_only
         else RETRIEVAL_SIMILARITIES
     )
-    w4_scale_variants = (
-        REVIEWER_MINIMAL_SCALE_VARIANTS
-        if reviewer_minimal
-        else selected_w4_scale_variants(args.w4_scales)
-    )
+    if peer_only:
+        w4_scale_variants = tuple(
+            scale for scale in peer_scales if scale != RAW_SCALE_VARIANT
+        )
+    elif reviewer_minimal:
+        w4_scale_variants = REVIEWER_MINIMAL_SCALE_VARIANTS
+    else:
+        w4_scale_variants = selected_w4_scale_variants(args.w4_scales)
     settings = {
         "workload": args.workload,
         "min_target_candidates": MIN_TARGET_CANDIDATES,
@@ -1739,22 +2456,48 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
         "retrieval_variants": (
             ["strict_matched_condition"]
-            if reviewer_minimal
+            if reviewer_minimal or peer_only
             else list(RETRIEVAL_VARIANTS)
         ),
         "similarity_metrics": list(similarity_metrics),
-        "max_baseline_peers": args.max_baseline_peers,
+        "max_baseline_peers": (
+            args.peer_reference_cap
+            if peer_only
+            else args.max_baseline_peers
+        ),
         "peer_sampling_seed": args.peer_sampling_seed,
         "w4_scale_variants": list(w4_scale_variants),
         "scorer_version": "parallel-retrieval-v2",
     }
+    task_frame_factory = None
+    final_metrics_name = FINAL_METRICS_NAME
+    if peer_only:
+        observed_path = Path(args.peer_only_from).resolve()
+        settings.update(
+            {
+                "peer_caps": [
+                    "all" if cap is None else int(cap)
+                    for cap in peer_caps
+                ],
+                "peer_scales": list(peer_scales),
+                "peer_reference_cap": int(args.peer_reference_cap),
+                "observed_metrics_input": file_record(observed_path),
+                "scorer_version": "parallel-retrieval-peer-only-v1",
+            }
+        )
+        task_frame_factory = lambda scope: _load_peer_only_task_frame(
+            scope,
+            observed_metrics_path=observed_path,
+            scales=peer_scales,
+        )
+        final_metrics_name = PEER_ONLY_FINAL_METRICS_NAME
     run_analysis(
         analysis=ANALYSIS,
         scorer_module="scripts.run_overlap_group_rep_retrieval_metrics",
         args=args,
         context_columns=CONTEXT_COLUMNS,
         rows_per_shard=None,
-        final_metrics_name=FINAL_METRICS_NAME,
+        final_metrics_name=final_metrics_name,
         settings=settings,
         code_paths=[
             Path(__file__),
@@ -1763,7 +2506,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             REPO_ROOT / "scripts" / "cross_source_core.py",
             REPO_ROOT / "scripts" / "peer_baselines.py",
             REPO_ROOT / "scripts" / "population_zscore.py",
+            REPO_ROOT / "scripts" / "notebook_cache.py",
         ],
+        task_frame_factory=task_frame_factory,
     )
     return 0
 

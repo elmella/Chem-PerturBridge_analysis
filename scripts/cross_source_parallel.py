@@ -1038,7 +1038,10 @@ def _required_layers(
     *,
     workload: str = "full",
 ) -> tuple[str, ...]:
-    if profile == "retrieval" and workload == "reviewer-minimal":
+    if profile == "retrieval" and workload in {
+        "reviewer-minimal",
+        "peer-only",
+    }:
         return ("logFC",)
     if profile == "signature":
         return ("logFC", "t")
@@ -1067,7 +1070,7 @@ def validate_line_sources(
                 ]
                 if profile == "deg" or (
                     profile == "retrieval"
-                    and workload != "reviewer-minimal"
+                    and workload not in {"reviewer-minimal", "peer-only"}
                 ):
                     try:
                         cross_source_core.first_available_layer(
@@ -1095,6 +1098,7 @@ def prepare_scope(
     args: argparse.Namespace,
     *,
     profile: str,
+    require_w4: bool = True,
 ) -> PreparedScope:
     if args.workers < 1:
         raise ValueError("--workers must be positive")
@@ -1144,41 +1148,47 @@ def prepare_scope(
             source_catalog=source_catalog,
             dataset_lines=scope.global_gene_lines,
         )
-        try:
-            # Construction performs the complete read-only cache readiness check.
-            PopulationStatsCatalog(
-                source_dataset_dirs=source_dirs,
-                matched_lines=scope.matched_lines,
-                matched_dataset_names=scope.matched_active_datasets,
-                resolve_line_path=source_catalog.resolve_line_path,
-                cache_root=paths.w4_stats_root,
-                precompute_mode="stop",
-            )
-        except (FileNotFoundError, RuntimeError, TimeoutError, ValueError) as exc:
-            dataset_arguments = " ".join(
-                "--dataset-dir "
-                + shlex.quote(
-                    f"{dataset_name}={source_dirs[dataset_name]}"
+        if require_w4:
+            try:
+                # Construction performs the complete read-only cache readiness check.
+                PopulationStatsCatalog(
+                    source_dataset_dirs=source_dirs,
+                    matched_lines=scope.matched_lines,
+                    matched_dataset_names=scope.matched_active_datasets,
+                    resolve_line_path=source_catalog.resolve_line_path,
+                    cache_root=paths.w4_stats_root,
+                    precompute_mode="stop",
                 )
-                for dataset_name in scope.matched_active_datasets
-            )
-            command = " ".join(
-                [
-                    "uv run python scripts/precompute_population_zscore.py",
-                    dataset_arguments,
-                    "--scope both --row-chunk-size 1024 --workers 2",
-                    "--cache-root",
-                    shlex.quote(str(paths.w4_stats_root)),
-                    "--qc-output",
-                    shlex.quote(
-                        str(paths.w4_stats_root / "precompute_qc.tsv")
-                    ),
-                ]
-            )
-            raise RuntimeError(
-                f"Required W4 population caches are not ready: {exc}\n"
-                f"Prepare them first with:\n{command}"
-            ) from exc
+            except (
+                FileNotFoundError,
+                RuntimeError,
+                TimeoutError,
+                ValueError,
+            ) as exc:
+                dataset_arguments = " ".join(
+                    "--dataset-dir "
+                    + shlex.quote(
+                        f"{dataset_name}={source_dirs[dataset_name]}"
+                    )
+                    for dataset_name in scope.matched_active_datasets
+                )
+                command = " ".join(
+                    [
+                        "uv run python scripts/precompute_population_zscore.py",
+                        dataset_arguments,
+                        "--scope both --row-chunk-size 1024 --workers 2",
+                        "--cache-root",
+                        shlex.quote(str(paths.w4_stats_root)),
+                        "--qc-output",
+                        shlex.quote(
+                            str(paths.w4_stats_root / "precompute_qc.tsv")
+                        ),
+                    ]
+                )
+                raise RuntimeError(
+                    f"Required W4 population caches are not ready: {exc}\n"
+                    f"Prepare them first with:\n{command}"
+                ) from exc
         return PreparedScope(
             profile=profile,
             paths=paths,
@@ -1469,7 +1479,11 @@ def run_fingerprint(
         "line_inputs": [
             file_record(path) for path in sorted(set(source_paths), key=str)
         ],
-        "w4_caches": w4_cache_inventory(scope),
+        "w4_caches": (
+            w4_cache_inventory(scope)
+            if settings.get("w4_scale_variants")
+            else []
+        ),
         "code": source_code_inventory(code_paths),
     }
     return stable_json_fingerprint(payload)
@@ -1495,6 +1509,9 @@ def run_analysis(
     final_metrics_name: str,
     settings: Mapping[str, Any],
     code_paths: Sequence[Path],
+    task_frame_factory: Optional[
+        Callable[[PreparedScope], pd.DataFrame]
+    ] = None,
 ) -> tuple[Path, Path]:
     dataset_order = selected_datasets(analysis, args.datasets)
     paths = resolve_common_paths(
@@ -1573,14 +1590,23 @@ def run_analysis(
                 print(f"[{analysis}] {message}", flush=True)
             return metrics_path, diagnostics_path
 
-        scope = prepare_scope(args, profile=analysis)
+        scope = prepare_scope(
+            args,
+            profile=analysis,
+            require_w4=bool(settings.get("w4_scale_variants")),
+        )
+        task_frame = (
+            scope.matched_pairs
+            if task_frame_factory is None
+            else task_frame_factory(scope)
+        )
         tasks, task_frames = build_tasks(
-            scope.matched_pairs,
+            task_frame,
             context_columns=context_columns,
             rows_per_shard=rows_per_shard,
         )
         if not tasks:
-            raise ValueError("No scoring tasks were produced from matched pairs")
+            raise ValueError("No scoring tasks were produced")
         fingerprint = run_fingerprint(
             analysis=analysis,
             scope=scope,
