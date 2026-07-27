@@ -252,6 +252,39 @@ class CrossNotebookScopeTests(unittest.TestCase):
                     code,
                 )
 
+    def test_w4_signature_tables_report_standardized_peer_counts(self):
+        expected_tables = {
+            "deg": "w4_table4",
+            "signature": "w4_table6",
+        }
+        for path, profile in NOTEBOOK_PROFILES.items():
+            if profile not in expected_tables:
+                continue
+            with self.subTest(notebook=path.name):
+                table_name = expected_tables[profile]
+                reporting_cell = next(
+                    cell
+                    for cell in notebook_cells(path)
+                    if f"{table_name} = pd.concat(" in cell
+                )
+                self.assertIn('"mean_peers_source": float(', reporting_cell)
+                self.assertIn(
+                    'pair_row["mean_left_peer_scored_count"]',
+                    reporting_cell,
+                )
+                self.assertIn(
+                    'pair_row["mean_right_peer_scored_count"]',
+                    reporting_cell,
+                )
+                self.assertIn(
+                    f'{table_name}["scale_variant"] != "raw_logfc"',
+                    reporting_cell,
+                )
+                self.assertIn(
+                    '"mean_peers_source"',
+                    reporting_cell,
+                )
+
     def test_source_dependent_primary_metric_caches_inventory_line_files(self):
         expected_fingerprints = {
             "deg": "DEG_METRICS_FINGERPRINT",
