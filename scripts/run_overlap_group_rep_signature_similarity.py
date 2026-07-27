@@ -34,11 +34,14 @@ if str(REPO_ROOT) not in sys.path:
 from scripts import cross_source_core
 from scripts.cross_source_parallel import (
     TaskSpec,
+    add_computation_arguments,
     add_common_arguments,
     diagnostic_frame,
     make_worker_catalog,
     make_worker_w4_catalog,
+    print_computations,
     read_task_input,
+    resolve_computations,
     run_analysis,
     selected_w4_scale_variants,
 )
@@ -46,7 +49,11 @@ from scripts.cross_source_scoring import (
     score_signature_baselines,
     select_source_peers,
 )
-from scripts.population_zscore import POPULATION_SCALE_VARIANTS
+from scripts.population_zscore import (
+    PER_GENE_DATASET_CELL_TYPE_VARIANT,
+    PER_GENE_DATASET_VARIANT,
+    POPULATION_SCALE_VARIANTS,
+)
 
 
 ANALYSIS = "signature"
@@ -59,6 +66,19 @@ CONTEXT_COLUMNS = (
     "left_dose_key",
     "right_dose_key",
 )
+COMPUTATIONS = {
+    "raw": "Raw matched-signature metrics and individual-peer baselines.",
+    "w4-dataset": (
+        "Dataset-wide per-gene population-z-score signature metrics."
+    ),
+    "w4-dataset-cell-type": (
+        "Dataset-by-cell-type per-gene population-z-score signature metrics."
+    ),
+}
+COMPUTATION_TO_SCALE = {
+    "w4-dataset": PER_GENE_DATASET_VARIANT,
+    "w4-dataset-cell-type": PER_GENE_DATASET_CELL_TYPE_VARIANT,
+}
 
 
 def _lookup(row: Mapping[str, Any], side: str) -> dict[str, str]:
@@ -421,6 +441,99 @@ def _raw_signature_record(
     return record, state
 
 
+def _signature_w4_base_record(
+    row: pd.Series,
+    *,
+    catalog: cross_source_core.LineSourceCatalog,
+    max_peers: Optional[int],
+    sampling_seed: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Prepare only the shared inputs required by selected W4 kernels."""
+    dataset_a = str(row["dataset_a"])
+    dataset_b = str(row["dataset_b"])
+    cell_type = str(row["cell_type"])
+    left_source = catalog.get_line_source(dataset_a, cell_type)
+    right_source = catalog.get_line_source(dataset_b, cell_type)
+    shared_genes, left_positions, right_positions = (
+        catalog.shared_gene_positions(left_source, right_source)
+    )
+    if shared_genes.size < 2:
+        raise ValueError(
+            f"Fewer than two shared genes for {dataset_a} vs "
+            f"{dataset_b} / {cell_type}"
+        )
+    left_obs_id = str(row["left_obs_id"])
+    right_obs_id = str(row["right_obs_id"])
+    left_lookup = _lookup(row, "left")
+    right_lookup = _lookup(row, "right")
+    left_logfc_full = left_source.get_vector(
+        left_obs_id,
+        "logFC",
+        **left_lookup,
+    )
+    right_logfc_full = right_source.get_vector(
+        right_obs_id,
+        "logFC",
+        **right_lookup,
+    )
+    left_selected = select_source_peers(
+        left_source,
+        left_obs_id,
+        left_lookup,
+        max_peers=max_peers,
+        sampling_seed=sampling_seed,
+    )
+    right_selected = select_source_peers(
+        right_source,
+        right_obs_id,
+        right_lookup,
+        max_peers=max_peers,
+        sampling_seed=sampling_seed,
+    )
+    expected_left = left_source.baseline_peer_count(
+        left_obs_id,
+        **left_lookup,
+    )
+    expected_right = right_source.baseline_peer_count(
+        right_obs_id,
+        **right_lookup,
+    )
+    if left_selected.total_count != expected_left:
+        raise AssertionError(
+            f"Left peer set has {left_selected.total_count} rows; "
+            f"centroid used {expected_left}"
+        )
+    if right_selected.total_count != expected_right:
+        raise AssertionError(
+            f"Right peer set has {right_selected.total_count} rows; "
+            f"centroid used {expected_right}"
+        )
+    record = {
+        **row.to_dict(),
+        "n_common_genes": int(shared_genes.size),
+        "left_baseline_peer_count": expected_left,
+        "right_baseline_peer_count": expected_right,
+        "left_peer_total_count": left_selected.total_count,
+        "right_peer_total_count": right_selected.total_count,
+        "left_peer_scored_count": left_selected.scored_count,
+        "right_peer_scored_count": right_selected.scored_count,
+        "peer_sampling_seed": sampling_seed,
+        "max_baseline_peers": max_peers,
+    }
+    state = {
+        "pubchem_cid": str(row["pubchem_cid"]),
+        "left_source": left_source,
+        "right_source": right_source,
+        "left_positions": left_positions,
+        "right_positions": right_positions,
+        "left_logfc_full": left_logfc_full,
+        "right_logfc_full": right_logfc_full,
+        "left_selected": left_selected,
+        "right_selected": right_selected,
+    }
+    return record, state
+
+
 def _w4_signature_columns(
     *,
     state: Mapping[str, Any],
@@ -543,14 +656,23 @@ def score_signature_row(
     w4_catalog,
     max_peers: Optional[int],
     sampling_seed: int,
+    include_raw_metrics: bool = True,
     w4_scale_variants: tuple[str, ...] = POPULATION_SCALE_VARIANTS,
 ) -> dict[str, Any]:
-    record, state = _raw_signature_record(
-        row,
-        catalog=catalog,
-        max_peers=max_peers,
-        sampling_seed=sampling_seed,
-    )
+    if include_raw_metrics:
+        record, state = _raw_signature_record(
+            row,
+            catalog=catalog,
+            max_peers=max_peers,
+            sampling_seed=sampling_seed,
+        )
+    else:
+        record, state = _signature_w4_base_record(
+            row,
+            catalog=catalog,
+            max_peers=max_peers,
+            sampling_seed=sampling_seed,
+        )
     for scale_variant in w4_scale_variants:
         record.update(
             _w4_signature_columns(
@@ -572,7 +694,11 @@ def score_task(
     diagnostics: list[dict[str, Any]] = []
     records: list[dict[str, Any]] = []
     try:
-        w4_catalog = make_worker_w4_catalog(config, catalog)
+        w4_catalog = (
+            make_worker_w4_catalog(config, catalog)
+            if settings["w4_scale_variants"]
+            else None
+        )
         for _, row in frame.iterrows():
             try:
                 records.append(
@@ -582,6 +708,9 @@ def score_task(
                         w4_catalog=w4_catalog,
                         max_peers=int(settings["max_baseline_peers"]),
                         sampling_seed=int(settings["peer_sampling_seed"]),
+                        include_raw_metrics=bool(
+                            settings["include_raw_metrics"]
+                        ),
                         w4_scale_variants=tuple(
                             settings["w4_scale_variants"]
                         ),
@@ -619,18 +748,49 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     add_common_arguments(parser, analysis=ANALYSIS)
+    add_computation_arguments(parser, computations=COMPUTATIONS)
     return parser
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    w4_scale_variants = selected_w4_scale_variants(args.w4_scales)
+    if args.list_computations:
+        print_computations(COMPUTATIONS)
+        return 0
+    if args.compute:
+        selected_computations = resolve_computations(
+            args.compute,
+            computations=COMPUTATIONS,
+        )
+        args.required_layers_override = (
+            ("logFC", "t")
+            if "raw" in selected_computations
+            else ("logFC",)
+        )
+        args.require_adj_p_override = False
+        w4_scale_variants = tuple(
+            COMPUTATION_TO_SCALE[name]
+            for name in selected_computations
+            if name in COMPUTATION_TO_SCALE
+        )
+    else:
+        w4_scale_variants = selected_w4_scale_variants(args.w4_scales)
+        selected_computations = (
+            "raw",
+            *(
+                name
+                for name in COMPUTATIONS
+                if COMPUTATION_TO_SCALE.get(name) in w4_scale_variants
+            ),
+        )
     settings = {
         "top_k": cross_source_core.TOP_K,
         "max_baseline_peers": args.max_baseline_peers,
         "peer_sampling_seed": args.peer_sampling_seed,
+        "computations": list(selected_computations),
+        "include_raw_metrics": "raw" in selected_computations,
         "w4_scale_variants": list(w4_scale_variants),
-        "scorer_version": "parallel-signature-v2",
+        "scorer_version": "parallel-signature-v3",
     }
     run_analysis(
         analysis=ANALYSIS,

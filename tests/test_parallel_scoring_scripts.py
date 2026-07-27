@@ -11,17 +11,24 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 
-from scripts.cross_source_parallel import sha256_file
+from scripts.cross_source_parallel import resolve_computations, sha256_file
 from scripts.population_zscore import (
+    PER_GENE_DATASET_CELL_TYPE_VARIANT,
     PER_GENE_DATASET_VARIANT,
     POPULATION_SCALE_VARIANTS,
     load_or_fit_dataset_population_stats_from_source_stats,
     load_or_fit_population_stats,
 )
 from scripts.run_overlap_group_rep_deg_metrics import (
+    COMPUTATIONS as DEG_COMPUTATIONS,
+)
+from scripts.run_overlap_group_rep_deg_metrics import (
     FINAL_METRICS_NAME as DEG_FINAL,
 )
 from scripts.run_overlap_group_rep_deg_metrics import main as run_deg
+from scripts.run_overlap_group_rep_retrieval_metrics import (
+    COMPUTATIONS as RETRIEVAL_COMPUTATIONS,
+)
 from scripts.run_overlap_group_rep_retrieval_metrics import (
     FINAL_METRICS_NAME as RETRIEVAL_FINAL,
 )
@@ -34,6 +41,9 @@ from scripts.run_overlap_group_rep_retrieval_metrics import (
 )
 from scripts.run_overlap_group_rep_retrieval_metrics import main as run_retrieval
 from scripts.cross_source_scoring import select_peer_indices
+from scripts.run_overlap_group_rep_signature_similarity import (
+    COMPUTATIONS as SIGNATURE_COMPUTATIONS,
+)
 from scripts.run_overlap_group_rep_signature_similarity import (
     FINAL_METRICS_NAME as SIGNATURE_FINAL,
 )
@@ -211,6 +221,179 @@ def _common_arguments(
 
 
 class ParallelScoringScriptTests(unittest.TestCase):
+    def test_computation_selectors_are_repeatable_canonical_and_validated(self):
+        self.assertEqual(
+            resolve_computations(
+                ["raw-spearman,raw-l2", "w4-dataset-cosine"],
+                computations=RETRIEVAL_COMPUTATIONS,
+            ),
+            ("raw-l2", "raw-spearman", "w4-dataset-cosine"),
+        )
+        self.assertEqual(
+            resolve_computations([], computations=DEG_COMPUTATIONS),
+            tuple(DEG_COMPUTATIONS),
+        )
+        self.assertEqual(
+            resolve_computations([], computations=SIGNATURE_COMPUTATIONS),
+            tuple(SIGNATURE_COMPUTATIONS),
+        )
+        with self.assertRaisesRegex(ValueError, "Unknown --compute"):
+            resolve_computations(
+                ["not-a-computation"],
+                computations=RETRIEVAL_COMPUTATIONS,
+            )
+
+    def test_selected_components_run_only_requested_metric_kernels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_root, overlap_dir, w4_root, _ = build_fixture(root)
+
+            deg_output = root / "results" / "deg-raw"
+            self.assertEqual(
+                run_deg(
+                    [
+                        *_common_arguments(
+                            data_root=data_root,
+                            overlap_dir=overlap_dir,
+                            w4_root=root / "missing-w4",
+                            output_dir=deg_output,
+                            workers=1,
+                        ),
+                        "--compute",
+                        "raw",
+                    ]
+                ),
+                0,
+            )
+            deg = pd.read_csv(
+                deg_output / "fixture" / DEG_FINAL,
+                sep="\t",
+            )
+            self.assertIn("observed_deg_lfc_spearman_sym_p05", deg.columns)
+            self.assertFalse(
+                any(
+                    column.startswith(
+                        (
+                            f"{PER_GENE_DATASET_VARIANT}__",
+                            f"{PER_GENE_DATASET_CELL_TYPE_VARIANT}__",
+                        )
+                    )
+                    for column in deg.columns
+                )
+            )
+
+            signature_output = root / "results" / "signature-w4"
+            self.assertEqual(
+                run_signature(
+                    [
+                        *_common_arguments(
+                            data_root=data_root,
+                            overlap_dir=overlap_dir,
+                            w4_root=w4_root,
+                            output_dir=signature_output,
+                            workers=1,
+                        ),
+                        "--compute",
+                        "w4-dataset",
+                    ]
+                ),
+                0,
+            )
+            signature = pd.read_csv(
+                signature_output / "fixture" / SIGNATURE_FINAL,
+                sep="\t",
+            )
+            self.assertNotIn("observed_spearman_logfc", signature.columns)
+            self.assertIn(
+                f"{PER_GENE_DATASET_VARIANT}__"
+                "w4_observed_spearman_logfc",
+                signature.columns,
+            )
+            self.assertFalse(
+                any(
+                    column.startswith(
+                        f"{PER_GENE_DATASET_CELL_TYPE_VARIANT}__"
+                    )
+                    for column in signature.columns
+                )
+            )
+
+            retrieval_output = root / "results" / "retrieval-selected"
+            self.assertEqual(
+                run_retrieval(
+                    [
+                        *_common_arguments(
+                            data_root=data_root,
+                            overlap_dir=overlap_dir,
+                            w4_root=w4_root,
+                            output_dir=retrieval_output,
+                            workers=1,
+                            max_baseline_peers=3,
+                        ),
+                        "--compute",
+                        "raw-l2,raw-cosine",
+                        "--compute",
+                        "w4-dataset-spearman",
+                    ]
+                ),
+                0,
+            )
+            retrieval = pd.read_csv(
+                retrieval_output / "fixture" / RETRIEVAL_FINAL,
+                sep="\t",
+            )
+            self.assertEqual(
+                set(
+                    zip(
+                        retrieval["scale_variant"].astype(str),
+                        retrieval["similarity_metric"].astype(str),
+                    )
+                ),
+                {
+                    ("raw", "negative_l2"),
+                    ("raw", "cosine"),
+                    (PER_GENE_DATASET_VARIANT, "spearman"),
+                },
+            )
+            self.assertEqual(
+                set(retrieval["representation"].astype(str)),
+                {"logFC"},
+            )
+            self.assertEqual(
+                set(retrieval["retrieval_variant"].astype(str)),
+                {"strict_matched_condition"},
+            )
+            self.assertTrue(
+                retrieval["observed_recall_at_1"].notna().all()
+            )
+
+    def test_selected_l2_is_byte_stable_for_one_and_two_workers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_root, overlap_dir, w4_root, _ = build_fixture(root)
+            paths = []
+            for workers in (1, 2):
+                output_dir = root / "results" / f"retrieval-{workers}"
+                self.assertEqual(
+                    run_retrieval(
+                        [
+                            *_common_arguments(
+                                data_root=data_root,
+                                overlap_dir=overlap_dir,
+                                w4_root=root / "missing-w4",
+                                output_dir=output_dir,
+                                workers=workers,
+                                max_baseline_peers=3,
+                            ),
+                            "--compute",
+                            "raw-l2",
+                        ]
+                    ),
+                    0,
+                )
+                paths.append(output_dir / "fixture" / RETRIEVAL_FINAL)
+            self.assertEqual(paths[0].read_bytes(), paths[1].read_bytes())
+
     def test_nested_peer_indices_retain_the_reference_sample(self):
         selections = nested_peer_indices(
             1000,

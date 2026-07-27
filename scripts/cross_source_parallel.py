@@ -86,6 +86,65 @@ DIAGNOSTIC_COLUMNS = (
 PROGRESS_LOG_NAME = "progress.log"
 
 
+def add_computation_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    computations: Mapping[str, str],
+) -> None:
+    """Add the shared repeatable computation-selection interface."""
+    names = ", ".join(computations)
+    parser.add_argument(
+        "--compute",
+        action="append",
+        default=[],
+        metavar="NAME[,NAME...]",
+        help=(
+            "Run only the named computation component. Repeat this option or "
+            "supply a comma-separated list. Omit it to run the command's "
+            f"complete default set. Available: {names}."
+        ),
+    )
+    parser.add_argument(
+        "--list-computations",
+        action="store_true",
+        help="Print available computation component names and exit.",
+    )
+
+
+def resolve_computations(
+    values: Sequence[str],
+    *,
+    computations: Mapping[str, str],
+) -> tuple[str, ...]:
+    """Validate selectors and return them in stable declared order."""
+    requested = [
+        item.strip()
+        for value in values
+        for item in str(value).split(",")
+        if item.strip()
+    ]
+    if not requested:
+        return tuple(computations)
+    unknown = sorted(set(requested) - set(computations))
+    if unknown:
+        raise ValueError(
+            f"Unknown --compute value(s): {unknown}; "
+            f"available={list(computations)}"
+        )
+    return tuple(name for name in computations if name in set(requested))
+
+
+def print_computations(
+    computations: Mapping[str, str],
+    *,
+    stream=None,
+) -> None:
+    """Print a compact, script-friendly component catalog."""
+    destination = sys.stdout if stream is None else stream
+    for name, description in computations.items():
+        print(f"{name}\t{description}", file=destination)
+
+
 def append_progress_log(
     log_path: Path,
     *,
@@ -1054,6 +1113,8 @@ def validate_line_sources(
     workload: str = "full",
     source_catalog: cross_source_core.LineSourceCatalog,
     dataset_lines: Mapping[str, Sequence[str]],
+    required_layers: Optional[Sequence[str]] = None,
+    require_adj_p: Optional[bool] = None,
 ) -> None:
     errors: list[str] = []
     for dataset_name in sorted(dataset_lines):
@@ -1062,16 +1123,29 @@ def validate_line_sources(
                 source = source_catalog.get_line_source(dataset_name, cell_type)
                 missing = [
                     layer
-                    for layer in _required_layers(
-                        profile,
-                        workload=workload,
+                    for layer in (
+                        tuple(required_layers)
+                        if required_layers is not None
+                        else _required_layers(
+                            profile,
+                            workload=workload,
+                        )
                     )
                     if layer not in source.adata.layers
                 ]
-                if profile == "deg" or (
-                    profile == "retrieval"
-                    and workload not in {"reviewer-minimal", "peer-only"}
-                ):
+                adj_p_required = (
+                    bool(require_adj_p)
+                    if require_adj_p is not None
+                    else (
+                        profile == "deg"
+                        or (
+                            profile == "retrieval"
+                            and workload
+                            not in {"reviewer-minimal", "peer-only"}
+                        )
+                    )
+                )
+                if adj_p_required:
                     try:
                         cross_source_core.first_available_layer(
                             source,
@@ -1147,6 +1221,16 @@ def prepare_scope(
             workload=str(getattr(args, "workload", "full")),
             source_catalog=source_catalog,
             dataset_lines=scope.global_gene_lines,
+            required_layers=getattr(
+                args,
+                "required_layers_override",
+                None,
+            ),
+            require_adj_p=getattr(
+                args,
+                "require_adj_p_override",
+                None,
+            ),
         )
         if require_w4:
             try:
@@ -1656,6 +1740,7 @@ __all__ = [
     "TaskCompletion",
     "TaskExecutionRequest",
     "TaskSpec",
+    "add_computation_arguments",
     "add_common_arguments",
     "atomic_write_frame",
     "atomic_write_json",
@@ -1671,11 +1756,13 @@ __all__ = [
     "merge_checkpointed_results",
     "output_directory_lock",
     "prepare_scope",
+    "print_computations",
     "read_task_input",
     "read_overlap_metadata",
     "report_task_progress",
     "run_analysis",
     "run_checkpointed_tasks",
+    "resolve_computations",
     "selected_w4_scale_variants",
     "run_fingerprint",
     "sha256_file",

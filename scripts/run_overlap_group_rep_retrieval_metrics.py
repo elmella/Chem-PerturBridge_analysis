@@ -30,14 +30,17 @@ if str(REPO_ROOT) not in sys.path:
 from scripts import cross_source_core
 from scripts.cross_source_parallel import (
     TaskSpec,
+    add_computation_arguments,
     add_common_arguments,
     diagnostic_frame,
     file_record,
     make_worker_catalog,
     make_worker_w4_catalog,
+    print_computations,
     read_overlap_metadata,
     read_task_input,
     report_task_progress,
+    resolve_computations,
     run_analysis,
     selected_w4_scale_variants,
 )
@@ -66,6 +69,7 @@ from scripts.cross_source_scoring import (
     summarize_retrieval_scores,
 )
 from scripts.population_zscore import (
+    PER_GENE_DATASET_CELL_TYPE_VARIANT,
     PER_GENE_DATASET_VARIANT,
     POPULATION_SCALE_VARIANTS,
 )
@@ -80,9 +84,63 @@ RAW_SCALE_VARIANT = "raw"
 FULL_WORKLOAD = "full"
 REVIEWER_MINIMAL_WORKLOAD = "reviewer-minimal"
 PEER_ONLY_WORKLOAD = "peer-only"
+SELECTED_WORKLOAD = "selected"
 REVIEWER_MINIMAL_SIMILARITIES = ("cosine", "spearman")
 REVIEWER_MINIMAL_SCALE_VARIANTS = (PER_GENE_DATASET_VARIANT,)
 PEER_ONLY_FINAL_METRICS_NAME = "retrieval_peer_sensitivity_metrics.tsv"
+COMPUTATIONS = {
+    "legacy-l2": (
+        "Original raw L2 bundle across logFC, moderated-t, and signed-"
+        "significance representations and all retrieval variants."
+    ),
+    "raw-l2": (
+        "Raw strict-logFC L2 retrieval, Recall@1, AUROC, and baselines."
+    ),
+    "raw-cosine": (
+        "Raw strict-logFC cosine retrieval, Recall@1, AUROC, and baselines."
+    ),
+    "raw-spearman": (
+        "Raw strict-logFC Spearman retrieval, Recall@1, AUROC, and baselines."
+    ),
+    "w4-dataset-l2": (
+        "Dataset-wide W4 strict-logFC L2 retrieval and baselines."
+    ),
+    "w4-dataset-cosine": (
+        "Dataset-wide W4 strict-logFC cosine retrieval and baselines."
+    ),
+    "w4-dataset-spearman": (
+        "Dataset-wide W4 strict-logFC Spearman retrieval and baselines."
+    ),
+    "w4-dataset-cell-type-l2": (
+        "Dataset-by-cell-type W4 strict-logFC L2 retrieval and baselines."
+    ),
+    "w4-dataset-cell-type-cosine": (
+        "Dataset-by-cell-type W4 strict-logFC cosine retrieval and baselines."
+    ),
+    "w4-dataset-cell-type-spearman": (
+        "Dataset-by-cell-type W4 strict-logFC Spearman retrieval and baselines."
+    ),
+}
+COMPUTATION_SPEC = {
+    "raw-l2": (RAW_SCALE_VARIANT, "negative_l2"),
+    "raw-cosine": (RAW_SCALE_VARIANT, "cosine"),
+    "raw-spearman": (RAW_SCALE_VARIANT, "spearman"),
+    "w4-dataset-l2": (PER_GENE_DATASET_VARIANT, "negative_l2"),
+    "w4-dataset-cosine": (PER_GENE_DATASET_VARIANT, "cosine"),
+    "w4-dataset-spearman": (PER_GENE_DATASET_VARIANT, "spearman"),
+    "w4-dataset-cell-type-l2": (
+        PER_GENE_DATASET_CELL_TYPE_VARIANT,
+        "negative_l2",
+    ),
+    "w4-dataset-cell-type-cosine": (
+        PER_GENE_DATASET_CELL_TYPE_VARIANT,
+        "cosine",
+    ),
+    "w4-dataset-cell-type-spearman": (
+        PER_GENE_DATASET_CELL_TYPE_VARIANT,
+        "spearman",
+    ),
+}
 
 IDENTITY_COLUMNS = [
     "dataset_a",
@@ -1362,7 +1420,7 @@ def _strict_enriched_rows_for_direction(
             )
 
 
-def _score_reviewer_minimal_scale(
+def _score_selected_scale(
     *,
     records: dict[tuple[str, ...], dict[str, Any]],
     dataset_a: str,
@@ -1379,6 +1437,7 @@ def _score_reviewer_minimal_scale(
     max_dose_fold: float,
     max_peers: int,
     sampling_seed: int,
+    similarity_metrics: tuple[str, ...],
     population_counts: tuple[Optional[int], Optional[int]] = (None, None),
     eligibility_masks: Optional[
         Mapping[str, tuple[np.ndarray, np.ndarray]]
@@ -1386,7 +1445,7 @@ def _score_reviewer_minimal_scale(
     progress: Optional[Callable[[str, str], None]] = None,
 ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     raw_validity: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    for metric in REVIEWER_MINIMAL_SIMILARITIES:
+    for metric in similarity_metrics:
         if progress is not None:
             progress(
                 "similarity",
@@ -1901,6 +1960,19 @@ def _context_records(
     similarity_metrics = tuple(
         str(metric) for metric in settings["similarity_metrics"]
     )
+    scale_similarity_metrics = {
+        str(scale): tuple(str(metric) for metric in metrics)
+        for scale, metrics in settings.get(
+            "scale_similarity_metrics",
+            {},
+        ).items()
+    }
+    include_legacy_retrieval = bool(
+        settings.get(
+            "include_legacy_retrieval",
+            workload == FULL_WORKLOAD,
+        )
+    )
     w4_scale_variants = tuple(
         str(variant) for variant in settings["w4_scale_variants"]
     )
@@ -1958,7 +2030,10 @@ def _context_records(
             f"Fewer than two shared genes for {dataset_a} vs "
             f"{dataset_b} / {cell_type}"
         )
-    if workload == REVIEWER_MINIMAL_WORKLOAD:
+    if (
+        workload in (REVIEWER_MINIMAL_WORKLOAD, SELECTED_WORKLOAD)
+        and not include_legacy_retrieval
+    ):
         left = build_logfc_pool_matrices(
             left_pool_frame,
             left_source,
@@ -2022,7 +2097,7 @@ def _context_records(
     finite = np.isfinite(left.logfc).all(axis=0) & np.isfinite(
         right.logfc
     ).all(axis=0)
-    if workload == FULL_WORKLOAD:
+    if include_legacy_retrieval:
         finite &= (
             np.isfinite(left.t).all(axis=0)
             & np.isfinite(right.t).all(axis=0)
@@ -2041,7 +2116,7 @@ def _context_records(
     max_fold = float(cross_source_core.DEFAULT_MATCH_SETTINGS.max_dose_fold_difference)
     records: dict[tuple[str, ...], dict[str, Any]] = {}
 
-    if workload == FULL_WORKLOAD:
+    if include_legacy_retrieval:
         left_t = left.t[:, finite]
         right_t = right.t[:, finite]
         left_adj = left.adj_p[:, finite]
@@ -2121,26 +2196,43 @@ def _context_records(
             max_dose_fold=max_fold,
             n_shared_genes=n_shared,
         )
-    raw_validity = None
-    if workload == REVIEWER_MINIMAL_WORKLOAD:
-        raw_validity = _score_reviewer_minimal_scale(
-            records=records,
-            dataset_a=dataset_a,
-            dataset_b=dataset_b,
-            cell_type=cell_type,
-            time_key=time_key,
-            left_pool=left.frame,
-            right_pool=right.frame,
-            left_matrix=left_logfc,
-            right_matrix=right_logfc,
-            strict_maps=maps,
-            scale_variant=RAW_SCALE_VARIANT,
-            n_shared_genes=n_shared,
-            max_dose_fold=max_fold,
-            max_peers=int(settings["max_baseline_peers"]),
-            sampling_seed=int(settings["peer_sampling_seed"]),
-            progress=progress,
-        )
+    raw_validity: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    if workload in (REVIEWER_MINIMAL_WORKLOAD, SELECTED_WORKLOAD):
+        raw_metrics = scale_similarity_metrics.get(RAW_SCALE_VARIANT, ())
+        if raw_metrics:
+            raw_validity.update(
+                _score_selected_scale(
+                    records=records,
+                    dataset_a=dataset_a,
+                    dataset_b=dataset_b,
+                    cell_type=cell_type,
+                    time_key=time_key,
+                    left_pool=left.frame,
+                    right_pool=right.frame,
+                    left_matrix=left_logfc,
+                    right_matrix=right_logfc,
+                    strict_maps=maps,
+                    scale_variant=RAW_SCALE_VARIANT,
+                    n_shared_genes=n_shared,
+                    max_dose_fold=max_fold,
+                    max_peers=int(settings["max_baseline_peers"]),
+                    sampling_seed=int(settings["peer_sampling_seed"]),
+                    similarity_metrics=raw_metrics,
+                    progress=progress,
+                )
+            )
+        required_validity_metrics = {
+            metric
+            for scale_variant in w4_scale_variants
+            for metric in scale_similarity_metrics.get(scale_variant, ())
+        }
+        for metric in sorted(required_validity_metrics - set(raw_validity)):
+            _, valid_left, valid_right = similarity_matrix(
+                left_logfc,
+                right_logfc,
+                metric,
+            )
+            raw_validity[metric] = (valid_left, valid_right)
     else:
         for direction, query_dataset, target_dataset, query_pool, target_pool, query_matrix, target_matrix, strict_map in (
             (
@@ -2223,12 +2315,12 @@ def _context_records(
                 scale_variant=scale_variant,
             ).population_row_count,
         )
-        if workload == REVIEWER_MINIMAL_WORKLOAD:
-            if raw_validity is None:
-                raise AssertionError(
-                    "Reviewer-minimal raw validity was not prepared"
-                )
-            _score_reviewer_minimal_scale(
+        if workload in (REVIEWER_MINIMAL_WORKLOAD, SELECTED_WORKLOAD):
+            selected_metrics = scale_similarity_metrics.get(
+                scale_variant,
+                (),
+            )
+            _score_selected_scale(
                 records=records,
                 dataset_a=dataset_a,
                 dataset_b=dataset_b,
@@ -2244,6 +2336,7 @@ def _context_records(
                 max_dose_fold=max_fold,
                 max_peers=int(settings["max_baseline_peers"]),
                 sampling_seed=int(settings["peer_sampling_seed"]),
+                similarity_metrics=selected_metrics,
                 population_counts=population_counts,
                 eligibility_masks=raw_validity,
                 progress=progress,
@@ -2367,6 +2460,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Parallel, resumable cross-source retrieval scoring."
     )
     add_common_arguments(parser, analysis=ANALYSIS)
+    add_computation_arguments(parser, computations=COMPUTATIONS)
     parser.add_argument(
         "--workload",
         choices=(
@@ -2415,7 +2509,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.list_computations:
+        print_computations(COMPUTATIONS)
+        return 0
     peer_only = args.workload == PEER_ONLY_WORKLOAD
+    if args.compute and args.workload != FULL_WORKLOAD:
+        raise ValueError(
+            "--compute replaces the scoring bundle and cannot be combined "
+            "with --workload reviewer-minimal or peer-only"
+        )
     if peer_only and args.peer_only_from is None:
         raise ValueError("--peer-only-from is required for peer-only workload")
     if not peer_only and args.peer_only_from is not None:
@@ -2434,10 +2536,63 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "--peer-reference-cap"
             )
     reviewer_minimal = args.workload == REVIEWER_MINIMAL_WORKLOAD
+    selected_mode = bool(args.compute)
+    effective_workload = (
+        SELECTED_WORKLOAD if selected_mode else args.workload
+    )
+    if selected_mode:
+        selected_computations = resolve_computations(
+            args.compute,
+            computations=COMPUTATIONS,
+        )
+    elif reviewer_minimal:
+        selected_computations = (
+            "raw-cosine",
+            "raw-spearman",
+            "w4-dataset-cosine",
+            "w4-dataset-spearman",
+        )
+    elif peer_only:
+        selected_computations = ()
+    else:
+        selected_scales = selected_w4_scale_variants(args.w4_scales)
+        selected_computations = (
+            "legacy-l2",
+            "raw-l2",
+            "raw-cosine",
+            "raw-spearman",
+            *(
+                name
+                for name, (scale, _) in COMPUTATION_SPEC.items()
+                if scale in selected_scales
+            ),
+        )
+    scale_similarity_metrics: dict[str, list[str]] = {}
+    for computation in selected_computations:
+        if computation not in COMPUTATION_SPEC:
+            continue
+        scale, metric = COMPUTATION_SPEC[computation]
+        scale_similarity_metrics.setdefault(scale, []).append(metric)
+    include_legacy_retrieval = "legacy-l2" in selected_computations
+    if selected_mode:
+        args.required_layers_override = (
+            ("logFC", "t")
+            if include_legacy_retrieval
+            else ("logFC",)
+        )
+        args.require_adj_p_override = include_legacy_retrieval
     similarity_metrics = (
         REVIEWER_MINIMAL_SIMILARITIES
-        if reviewer_minimal or peer_only
-        else RETRIEVAL_SIMILARITIES
+        if peer_only
+        else tuple(
+            metric
+            for metric in RETRIEVAL_SIMILARITIES
+            if any(
+                metric in metrics
+                for metrics in scale_similarity_metrics.values()
+            )
+            or (include_legacy_retrieval and metric == "negative_l2")
+        )
     )
     if peer_only:
         w4_scale_variants = tuple(
@@ -2445,10 +2600,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
     elif reviewer_minimal:
         w4_scale_variants = REVIEWER_MINIMAL_SCALE_VARIANTS
+    elif selected_mode:
+        w4_scale_variants = tuple(
+            scale
+            for scale in POPULATION_SCALE_VARIANTS
+            if scale in scale_similarity_metrics
+        )
     else:
         w4_scale_variants = selected_w4_scale_variants(args.w4_scales)
     settings = {
-        "workload": args.workload,
+        "workload": effective_workload,
         "min_target_candidates": MIN_TARGET_CANDIDATES,
         "min_unique_compounds_per_side": MIN_UNIQUE_COMPOUNDS_PER_SIDE,
         "max_dose_fold_difference": (
@@ -2456,9 +2617,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
         "retrieval_variants": (
             ["strict_matched_condition"]
-            if reviewer_minimal or peer_only
+            if (
+                reviewer_minimal
+                or peer_only
+                or not include_legacy_retrieval
+            )
             else list(RETRIEVAL_VARIANTS)
         ),
+        "computations": list(selected_computations),
+        "include_legacy_retrieval": include_legacy_retrieval,
+        "scale_similarity_metrics": scale_similarity_metrics,
         "similarity_metrics": list(similarity_metrics),
         "max_baseline_peers": (
             args.peer_reference_cap
@@ -2467,7 +2635,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
         "peer_sampling_seed": args.peer_sampling_seed,
         "w4_scale_variants": list(w4_scale_variants),
-        "scorer_version": "parallel-retrieval-v2",
+        "scorer_version": "parallel-retrieval-v3",
     }
     task_frame_factory = None
     final_metrics_name = FINAL_METRICS_NAME

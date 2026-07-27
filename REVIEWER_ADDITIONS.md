@@ -345,6 +345,13 @@ The script runner has a bounded first-response profile:
 - `run_overlap_group_rep_signature_similarity.py --w4-scales dataset`
 - `run_overlap_group_rep_retrieval_metrics.py --workload reviewer-minimal --max-baseline-peers 0`
 
+Each scorer also accepts repeatable or comma-separated `--compute` components;
+omitting the option preserves its complete default bundle. The component
+catalog is available with `--list-computations`. In particular,
+`run_overlap_group_rep_retrieval_metrics.py --compute raw-l2` adds the
+strict-logFC L2 observed rank, Recall@1, AUROC, and individual baselines without
+rerunning W4, cosine, Spearman, or the other legacy retrieval variants.
+
 The retrieval profile is strict-condition logFC only, scores cosine and Spearman on raw
 and dataset-wide per-gene standardized values, reuses cross-source matrices across
 directions, and omits the legacy representations, retrieval variants, negative-L2 parity,

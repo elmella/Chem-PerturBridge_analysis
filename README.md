@@ -72,6 +72,30 @@ Task inputs, completion markers, checkpoints, diagnostics, and run metadata stay
 beside the primary TSV. Compatible completed shards are reused automatically;
 `--force` recomputes them.
 
+All three scorers support additive computation selection. Omit `--compute` to
+preserve the command's complete default behavior, list the available components
+with `--list-computations`, and repeat or comma-separate `--compute` to run only
+the requested kernels:
+
+```bash
+uv run python scripts/run_overlap_group_rep_deg_metrics.py \
+  --compute raw \
+  --compute w4-dataset
+uv run python scripts/run_overlap_group_rep_signature_similarity.py \
+  --compute raw,w4-dataset
+uv run python scripts/run_overlap_group_rep_retrieval_metrics.py \
+  --compute raw-l2 \
+  --run-tag raw_l2
+```
+
+The last command is the lightweight strict-logFC L2 run: it calculates observed
+normalized rank, Recall@1, AUROC, and source/target baselines without running
+W4, cosine, Spearman, legacy representations, or dose-aware variants. Selected
+components are included in the run fingerprint. Use a distinct `--run-tag`
+when experimenting so an existing production final TSV is not replaced.
+The specialized `--workload peer-only` mode remains separate because it reads
+an existing retrieval TSV instead of rescoring observations.
+
 Every scorer also appends timestamped events to `progress.log` in its run
 directory. In an interactive terminal, one coordinator-owned tqdm bar reports
 completed and cached checkpoint tasks. Retrieval workers additionally report
