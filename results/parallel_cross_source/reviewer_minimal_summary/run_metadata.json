@@ -1,0 +1,77 @@
+{
+  "analysis": "reviewer-minimal-summary",
+  "bootstrap_batch_size": 64,
+  "bootstrap_iterations": 2000,
+  "bootstrap_seed": 20260505,
+  "datasets": [
+    "l1000_phase1",
+    "l1000_phase2",
+    "tahoe",
+    "cigs_mce",
+    "cigs_tcm",
+    "sciplex"
+  ],
+  "fingerprint": "2129a31e865f5a9ce27d6f3ccb86ae824053d31a2cfcffb6c97dd1b0c746d02e",
+  "inputs": [
+    {
+      "mtime_ns": 1785179786744998482,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/parallel_cross_source/deg/production/deg_scored_metrics.tsv",
+      "size": 197082211
+    },
+    {
+      "mtime_ns": 1785178667522387071,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/parallel_cross_source/signature/production/signature_scored_metrics.tsv",
+      "size": 175983216
+    },
+    {
+      "mtime_ns": 1785171795750755654,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/parallel_cross_source/retrieval/production/retrieval_scored_metrics.tsv",
+      "size": 269110031
+    }
+  ],
+  "outputs": [
+    "dose_mismatch_distribution.tsv",
+    "dose_threshold_deg_cluster_bca_ci.tsv",
+    "dose_threshold_deg_metric_line_summary.tsv",
+    "dose_threshold_deg_metric_summary.tsv",
+    "dose_threshold_overall_matched_pair_counts.tsv",
+    "reviewer_minimal_retrieval_ci_ranges.tsv",
+    "reviewer_minimal_retrieval_cluster_bca_ci.tsv",
+    "w4_deg_cluster_bca_ci.tsv",
+    "w4_signature_cluster_bca_ci.tsv"
+  ],
+  "overlap_inputs": [
+    {
+      "mtime_ns": 1784899361785607114,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/overlap_filtered_h5ads/l1000_phase1_overlap_filtered.h5ad",
+      "size": 239122156
+    },
+    {
+      "mtime_ns": 1784899374113504194,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/overlap_filtered_h5ads/l1000_phase2_overlap_filtered.h5ad",
+      "size": 202310823
+    },
+    {
+      "mtime_ns": 1784899380722376837,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/overlap_filtered_h5ads/tahoe_overlap_filtered.h5ad",
+      "size": 217837647
+    },
+    {
+      "mtime_ns": 1784899385811508748,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/overlap_filtered_h5ads/cigs_mce_overlap_filtered.h5ad",
+      "size": 163118270
+    },
+    {
+      "mtime_ns": 1784899425164795238,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/overlap_filtered_h5ads/cigs_tcm_overlap_filtered.h5ad",
+      "size": 161476690
+    },
+    {
+      "mtime_ns": 1784899428154284920,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/overlap_filtered_h5ads/sciplex_overlap_filtered.h5ad",
+      "size": 161948851
+    }
+  ],
+  "w4_scale_variant": "per_gene_population_zscore_dataset",
+  "workers": 8
+}

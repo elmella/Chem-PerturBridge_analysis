@@ -1,0 +1,5 @@
+threshold_order	dose_threshold	max_fold_difference	n_matched_sample_pairs
+0	exact	1.0	50072
+1	2x	2.0	75722
+2	3x	3.0	75759
+3	10x_reference	10.0	76717
