@@ -21,9 +21,12 @@ from scripts.precompute_population_zscore import (
 from scripts.population_zscore import (
     DATASET_CELL_TYPE_SCOPE,
     DATASET_SCOPE,
+    PopulationCacheReadiness,
     align_population_stats,
+    check_dataset_population_cache_readiness,
     dataset_stats_cache_path,
     discover_dataset_population_sources,
+    ensure_population_caches_ready,
     load_or_fit_dataset_population_stats,
     load_or_fit_population_stats,
     standardize_matrix,
@@ -69,6 +72,128 @@ def write_fixture(
 
 
 class PopulationZScoreTests(unittest.TestCase):
+    def test_cache_readiness_is_metadata_only_and_tracks_both_scopes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_source = root / "CVCL_A_de.h5ad"
+            second_source = root / "CVCL_B_de.h5ad"
+            cache_root = root / "cache"
+            write_fixture(
+                first_source,
+                np.asarray([[1.0, 10.0], [2.0, 20.0]]),
+                cell_type="CVCL_A",
+            )
+            write_fixture(
+                second_source,
+                np.asarray([[3.0, 30.0], [4.0, 40.0]]),
+                cell_type="CVCL_B",
+            )
+            sources = {
+                "CVCL_A": first_source,
+                "CVCL_B": second_source,
+            }
+
+            initial = check_dataset_population_cache_readiness(
+                source_paths=sources,
+                dataset_name="source",
+                cache_root=cache_root,
+            )
+            self.assertFalse(initial.ready)
+            self.assertEqual(initial.ready_source_count, 0)
+            self.assertEqual(initial.total_source_count, 2)
+            self.assertEqual(initial.pending_sources, ("CVCL_A", "CVCL_B"))
+
+            load_or_fit_population_stats(
+                source_path=first_source,
+                dataset_name="source",
+                cell_type="CVCL_A",
+                cache_root=cache_root,
+                verbose=False,
+            )
+            partial = check_dataset_population_cache_readiness(
+                source_paths=sources,
+                dataset_name="source",
+                cache_root=cache_root,
+            )
+            self.assertFalse(partial.ready)
+            self.assertEqual(partial.ready_source_count, 1)
+            self.assertEqual(partial.pending_sources, ("CVCL_B",))
+
+            load_or_fit_dataset_population_stats(
+                source_paths=sources,
+                dataset_name="source",
+                cache_root=cache_root,
+                verbose=False,
+            )
+            with patch(
+                "scripts.population_zscore.ad.read_h5ad",
+                side_effect=AssertionError(
+                    "readiness checks must not open source H5ADs"
+                ),
+            ):
+                ready = check_dataset_population_cache_readiness(
+                    source_paths=sources,
+                    dataset_name="source",
+                    cache_root=cache_root,
+                )
+                ensured = ensure_population_caches_ready(
+                    dataset_sources={"source": sources},
+                    cache_root=cache_root,
+                    wait=False,
+                    verbose=False,
+                )
+
+            self.assertTrue(ready.ready)
+            self.assertTrue(ready.dataset_cache_ready)
+            self.assertEqual(ready.ready_source_count, 2)
+            self.assertEqual(len(ensured), 1)
+            self.assertTrue(ensured[0].ready)
+
+    def test_incomplete_cache_can_stop_or_wait_for_precompute(self):
+        pending = PopulationCacheReadiness(
+            dataset_name="source",
+            ready_source_count=1,
+            total_source_count=2,
+            dataset_cache_ready=False,
+            pending_sources=("CVCL_B",),
+        )
+        ready = PopulationCacheReadiness(
+            dataset_name="source",
+            ready_source_count=2,
+            total_source_count=2,
+            dataset_cache_ready=True,
+            pending_sources=(),
+        )
+        with patch(
+            "scripts.population_zscore.check_population_caches_ready",
+            return_value=[pending],
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "rerun this W4 setup cell",
+            ):
+                ensure_population_caches_ready(
+                    dataset_sources={"source": {"CVCL_A": Path("unused")}},
+                    cache_root=Path("unused"),
+                    wait=False,
+                    verbose=False,
+                )
+
+        with patch(
+            "scripts.population_zscore.check_population_caches_ready",
+            side_effect=[[pending], [ready]],
+        ):
+            with patch("scripts.population_zscore.time.sleep") as sleep:
+                result = ensure_population_caches_ready(
+                    dataset_sources={"source": {"CVCL_A": Path("unused")}},
+                    cache_root=Path("unused"),
+                    wait=True,
+                    poll_seconds=7.0,
+                    verbose=False,
+                )
+        sleep.assert_called_once_with(7.0)
+        self.assertEqual(result, [ready])
+
     def test_dataset_source_discovery_matches_notebook_filename_policy(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

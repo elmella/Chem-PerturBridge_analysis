@@ -153,6 +153,38 @@ class _PopulationSourceInspection:
     source_identity: tuple[int, int]
 
 
+@dataclass(frozen=True)
+class PopulationCacheReadiness:
+    dataset_name: str
+    ready_source_count: int
+    total_source_count: int
+    dataset_cache_ready: bool
+    pending_sources: tuple[str, ...]
+
+    @property
+    def ready(self) -> bool:
+        return (
+            self.ready_source_count == self.total_source_count
+            and self.dataset_cache_ready
+        )
+
+    def summary(self) -> str:
+        dataset_state = "ready" if self.dataset_cache_ready else "pending"
+        pending_preview = ", ".join(self.pending_sources[:3])
+        if len(self.pending_sources) > 3:
+            pending_preview += ", ..."
+        pending_suffix = (
+            f"; pending lines: {pending_preview}"
+            if pending_preview
+            else ""
+        )
+        return (
+            f"{self.dataset_name}: line caches "
+            f"{self.ready_source_count}/{self.total_source_count}, "
+            f"dataset cache {dataset_state}{pending_suffix}"
+        )
+
+
 def _sanitized_strings(values: pd.Series) -> pd.Series:
     normalized = values.astype("string").fillna("").astype(str).str.strip()
     normalized.loc[normalized.str.lower().isin(INVALID_STRING_VALUES)] = ""
@@ -351,6 +383,27 @@ def _dataset_fingerprint(
     dataset_name: str,
     source_stats: Sequence[PopulationGeneStats],
 ) -> str:
+    return _dataset_fingerprint_from_source_records(
+        dataset_name=dataset_name,
+        source_records=[
+            (stats.cell_type, stats.fingerprint)
+            for stats in source_stats
+        ],
+    )
+
+
+def _dataset_fingerprint_from_source_records(
+    *,
+    dataset_name: str,
+    source_records: Sequence[tuple[str, str]],
+) -> str:
+    source_records = sorted(
+        (
+            (str(cell_type), str(fingerprint))
+            for cell_type, fingerprint in source_records
+        ),
+        key=lambda item: (item[0], item[1]),
+    )
     payload = {
         "engine_version": ENGINE_VERSION,
         "scope": DATASET_SCOPE,
@@ -359,10 +412,10 @@ def _dataset_fingerprint(
         "minimum_finite_observations": MIN_FINITE_OBSERVATIONS,
         "sources": [
             {
-                "cell_type": stats.cell_type,
-                "fingerprint": stats.fingerprint,
+                "cell_type": cell_type,
+                "fingerprint": fingerprint,
             }
-            for stats in source_stats
+            for cell_type, fingerprint in source_records
         ],
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -765,15 +818,15 @@ def _load_cache(
     return stats
 
 
-def _load_unchanged_source_cache(
+def _unchanged_source_cache_metadata(
     *,
     cache_path: Path,
     source_path: Path,
     dataset_name: str,
     cell_type: str,
     layer_name: str,
-) -> Optional[PopulationGeneStats]:
-    """Fast-path a line cache using immutable source inventory metadata."""
+) -> Optional[dict[str, object]]:
+    """Return compatible source-cache metadata without opening the H5AD."""
     try:
         metadata = json.loads(_metadata_path(cache_path).read_text())
         source_size, source_mtime_ns = _source_file_identity(source_path)
@@ -791,12 +844,35 @@ def _load_unchanged_source_cache(
     }
     if any(metadata.get(key) != value for key, value in expected_inventory.items()):
         return None
+    if not cache_path.exists():
+        return None
     fingerprint = metadata.get("fingerprint")
     if not isinstance(fingerprint, str) or not fingerprint:
         return None
+    return metadata
+
+
+def _load_unchanged_source_cache(
+    *,
+    cache_path: Path,
+    source_path: Path,
+    dataset_name: str,
+    cell_type: str,
+    layer_name: str,
+) -> Optional[PopulationGeneStats]:
+    """Fast-path a line cache using immutable source inventory metadata."""
+    metadata = _unchanged_source_cache_metadata(
+        cache_path=cache_path,
+        source_path=source_path,
+        dataset_name=dataset_name,
+        cell_type=cell_type,
+        layer_name=layer_name,
+    )
+    if metadata is None:
+        return None
     return _load_cache(
         cache_path=cache_path,
-        expected_fingerprint=fingerprint,
+        expected_fingerprint=str(metadata["fingerprint"]),
         dataset_name=dataset_name,
         cell_type=cell_type,
     )
@@ -974,6 +1050,149 @@ def _canonical_source_paths(
     if len(set(cell_types)) != len(cell_types):
         raise ValueError("Dataset-wide source cell types must be unique")
     return normalized
+
+
+def check_dataset_population_cache_readiness(
+    *,
+    source_paths: Union[Mapping[str, Path], Sequence[tuple[str, Path]]],
+    dataset_name: str,
+    cache_root: Path,
+    layer_name: str = "logFC",
+) -> PopulationCacheReadiness:
+    """Check both W4 cache scopes using metadata and file inventory only."""
+    canonical_sources = _canonical_source_paths(source_paths)
+    source_records: list[tuple[str, str]] = []
+    pending_sources: list[str] = []
+    for cell_type, source_path in canonical_sources:
+        cache_path = stats_cache_path(cache_root, dataset_name, cell_type)
+        metadata = _unchanged_source_cache_metadata(
+            cache_path=cache_path,
+            source_path=source_path,
+            dataset_name=dataset_name,
+            cell_type=cell_type,
+            layer_name=layer_name,
+        )
+        if metadata is None:
+            pending_sources.append(cell_type)
+            continue
+        source_records.append((cell_type, str(metadata["fingerprint"])))
+
+    dataset_cache_ready = False
+    if len(source_records) == len(canonical_sources):
+        expected_fingerprint = _dataset_fingerprint_from_source_records(
+            dataset_name=dataset_name,
+            source_records=source_records,
+        )
+        dataset_cache_path = dataset_stats_cache_path(cache_root, dataset_name)
+        try:
+            dataset_metadata = json.loads(
+                _metadata_path(dataset_cache_path).read_text()
+            )
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            dataset_metadata = {}
+        dataset_cache_ready = (
+            dataset_cache_path.exists()
+            and dataset_metadata.get("engine_version") == ENGINE_VERSION
+            and dataset_metadata.get("scope") == DATASET_SCOPE
+            and dataset_metadata.get("dataset_name") == str(dataset_name)
+            and dataset_metadata.get("cell_type") == DATASET_WIDE_CELL_TYPE
+            and dataset_metadata.get("fingerprint") == expected_fingerprint
+        )
+
+    return PopulationCacheReadiness(
+        dataset_name=str(dataset_name),
+        ready_source_count=len(source_records),
+        total_source_count=len(canonical_sources),
+        dataset_cache_ready=dataset_cache_ready,
+        pending_sources=tuple(pending_sources),
+    )
+
+
+def check_population_caches_ready(
+    *,
+    dataset_sources: Mapping[
+        str,
+        Union[Mapping[str, Path], Sequence[tuple[str, Path]]],
+    ],
+    cache_root: Path,
+    layer_name: str = "logFC",
+) -> list[PopulationCacheReadiness]:
+    """Return deterministic readiness records for every requested dataset."""
+    if not dataset_sources:
+        raise ValueError("At least one dataset is required for W4 readiness")
+    return [
+        check_dataset_population_cache_readiness(
+            source_paths=dataset_sources[dataset_name],
+            dataset_name=dataset_name,
+            cache_root=cache_root,
+            layer_name=layer_name,
+        )
+        for dataset_name in sorted(dataset_sources)
+    ]
+
+
+def ensure_population_caches_ready(
+    *,
+    dataset_sources: Mapping[
+        str,
+        Union[Mapping[str, Path], Sequence[tuple[str, Path]]],
+    ],
+    cache_root: Path,
+    layer_name: str = "logFC",
+    wait: bool = False,
+    poll_seconds: float = 30.0,
+    timeout_seconds: Optional[float] = None,
+    verbose: bool = True,
+) -> list[PopulationCacheReadiness]:
+    """Require completed line and dataset caches, optionally polling until ready."""
+    if poll_seconds <= 0.0:
+        raise ValueError("poll_seconds must be positive")
+    if timeout_seconds is not None and timeout_seconds < 0.0:
+        raise ValueError("timeout_seconds cannot be negative")
+
+    started_at = time.monotonic()
+    while True:
+        readiness = check_population_caches_ready(
+            dataset_sources=dataset_sources,
+            cache_root=cache_root,
+            layer_name=layer_name,
+        )
+        pending = [record for record in readiness if not record.ready]
+        if not pending:
+            if verbose:
+                print(
+                    f"[w4_precompute] all {len(readiness):,} required dataset "
+                    "caches are ready",
+                    flush=True,
+                )
+            return readiness
+
+        details = " | ".join(record.summary() for record in pending)
+        if not wait:
+            raise RuntimeError(
+                "W4 population precompute is incomplete. "
+                f"{details}. Finish scripts/precompute_population_zscore.py, "
+                "then rerun this W4 setup cell and the cells below it."
+            )
+
+        elapsed = time.monotonic() - started_at
+        if timeout_seconds is not None and elapsed >= timeout_seconds:
+            raise TimeoutError(
+                "Timed out waiting for W4 population precompute. "
+                f"{details}"
+            )
+        if verbose:
+            print(
+                f"[w4_precompute] waiting {elapsed / 60.0:.1f}m: {details}",
+                flush=True,
+            )
+        sleep_seconds = poll_seconds
+        if timeout_seconds is not None:
+            sleep_seconds = min(
+                sleep_seconds,
+                max(timeout_seconds - elapsed, 0.0),
+            )
+        time.sleep(sleep_seconds)
 
 
 def fit_dataset_population_stats(

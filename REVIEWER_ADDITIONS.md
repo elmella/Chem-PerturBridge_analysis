@@ -215,6 +215,30 @@ python scripts/precompute_population_zscore.py \
   --qc-output results/w4_population_zscore_stats/precompute_qc.tsv
 ```
 
+The precompute and the three notebooks may be started together. By default, each
+notebook runs its raw sections immediately and, when it reaches W4, polls the shared
+cache inventory every 30 seconds. The poll reads only small cache metadata files and
+source file size/modification times; it neither opens the H5ADs nor duplicates fitting.
+When all required line-level and dataset-wide caches are atomically published, the
+notebook continues automatically.
+
+The W4 setup behavior can be changed in a temporary first notebook cell:
+
+```python
+import os
+os.environ["CPB_W4_PRECOMPUTE_MODE"] = "wait"  # wait (default), stop, or lazy
+os.environ["CPB_W4_PRECOMPUTE_POLL_SECONDS"] = "30"
+os.environ["CPB_W4_PRECOMPUTE_TIMEOUT_MINUTES"] = "720"
+```
+
+`stop` raises a clear error at the W4 boundary and preserves every raw output already
+computed; after precompute finishes, rerun the W4 setup cell and the cells below it.
+`lazy` restores the earlier behavior in which a notebook may itself fit missing W4
+caches. Do not use `lazy` while the dedicated precompute is running unless that fallback
+is intentional. The non-production comparison-population smoke mode described below
+continues to fit its isolated, tagged caches lazily and does not wait for production
+caches.
+
 `--workers` defaults to `1`; use `2` first and try `4` only if storage throughput remains
 healthy. Workers process independent line files, while dataset-wide merging remains
 canonically ordered and exactly matches the serial result. Progress output distinguishes
@@ -239,8 +263,8 @@ execution only and must not be reported as dataset-wide reviewer results. Produc
 runs must omit `CPB_W4_SMOKE_COMPARISON_POPULATION`; they continue to use every line-level
 H5AD in each configured dataset.
 
-After the W4 precompute finishes, the three cross-source notebooks below construct
-different metric families and may run concurrently:
+The three cross-source notebooks below construct different metric families and may run
+concurrently with each other and with W4 precompute:
 
 1. `notebooks/overlap_group_rep_deg_metrics_reviewer_additions.ipynb` — Tables 4 and 5,
    plus the W3 dose sensitivity. Writes to `results/overlap_group_rep_deg_metrics/`.
