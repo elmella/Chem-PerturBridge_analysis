@@ -192,7 +192,11 @@ The source path, size, modification time, layer shape, gene order, eligibility m
 statistics are scanned once; dataset-wide statistics are obtained by finite-aware Chan
 merges after aligning gene keys, without rereading or concatenating the H5AD matrices.
 Per-cache file locks prevent concurrently running notebooks from fitting the same source
-twice.
+twice. On a cache miss, metadata inspection and layer fitting share one backed-H5AD
+handle. In `--scope both`, the precompute command passes newly fitted or reloaded
+line-stat objects directly into dataset-wide pooling rather than reopening all sources.
+The line-cache metadata records the source inventory, allowing later notebooks to
+fast-reload compatible statistics without opening the H5AD.
 
 The Table 6 W4 scorer additionally keeps a bounded in-memory cache of each active
 dataset/cell/time/dose/shared-gene stratum after standardization and Spearman-rank
@@ -207,8 +211,33 @@ python scripts/precompute_population_zscore.py \
   --all-configured \
   --scope both \
   --row-chunk-size 1024 \
+  --workers 2 \
   --qc-output results/w4_population_zscore_stats/precompute_qc.tsv
 ```
+
+`--workers` defaults to `1`; use `2` first and try `4` only if storage throughput remains
+healthy. Workers process independent line files, while dataset-wide merging remains
+canonically ordered and exactly matches the serial result. Progress output distinguishes
+source inspection, cache-lock waiting, matrix fitting, line completion, and dataset
+pooling, with elapsed time and scan ETA.
+
+For a fast end-to-end subset smoke test, the notebooks support an explicitly
+non-production population:
+
+```python
+import os
+os.environ["CPB_DATASET_SUBSET"] = "tahoe,sciplex"
+os.environ["CPB_RUN_TAG"] = "tahoe_sciplex_smoke"
+os.environ["CPB_W4_SMOKE_COMPARISON_POPULATION"] = "1"
+```
+
+Run this temporary cell before the configuration cell in each fresh kernel. In this
+mode, dataset-wide fitting uses only cell lines retained by that notebook's selected
+comparisons and writes statistics below that tagged notebook output directory. It is
+therefore quick and cannot overwrite the production W4 caches. These smoke results test
+execution only and must not be reported as dataset-wide reviewer results. Production
+runs must omit `CPB_W4_SMOKE_COMPARISON_POPULATION`; they continue to use every line-level
+H5AD in each configured dataset.
 
 After the W4 precompute finishes, the three cross-source notebooks below construct
 different metric families and may run concurrently:

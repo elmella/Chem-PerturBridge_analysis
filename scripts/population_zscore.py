@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -143,6 +144,15 @@ class PopulationGeneStats:
         return int(self.valid_mask.sum())
 
 
+@dataclass(frozen=True)
+class _PopulationSourceInspection:
+    gene_keys: np.ndarray
+    gene_positions: np.ndarray
+    eligible_mask: np.ndarray
+    fingerprint: str
+    source_identity: tuple[int, int]
+
+
 def _sanitized_strings(values: pd.Series) -> pd.Series:
     normalized = values.astype("string").fillna("").astype(str).str.strip()
     normalized.loc[normalized.str.lower().isin(INVALID_STRING_VALUES)] = ""
@@ -220,7 +230,12 @@ def _metadata_path(cache_path: Path) -> Path:
 
 
 @contextmanager
-def _exclusive_cache_lock(cache_path: Path) -> Iterator[None]:
+def _exclusive_cache_lock(
+    cache_path: Path,
+    *,
+    label: Optional[str] = None,
+    verbose: bool = False,
+) -> Iterator[None]:
     """Serialize first-time fits of one source-context cache.
 
     Atomic replacement protects readers from partial files, but without a lock two
@@ -231,11 +246,29 @@ def _exclusive_cache_lock(cache_path: Path) -> Iterator[None]:
     lock_path = Path(cache_path).with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as stream:
+        started_at = time.monotonic()
+        if verbose:
+            print(
+                f"[w4_stats] waiting for cache lock: {label or cache_path}",
+                flush=True,
+            )
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        waited = time.monotonic() - started_at
+        if verbose:
+            print(
+                f"[w4_stats] acquired cache lock after {waited:.1f}s: "
+                f"{label or cache_path}",
+                flush=True,
+            )
         try:
             yield
         finally:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _source_file_identity(source_path: Path) -> tuple[int, int]:
+    stat = Path(source_path).stat()
+    return int(stat.st_size), int(stat.st_mtime_ns)
 
 
 def _source_fingerprint(
@@ -247,8 +280,13 @@ def _source_fingerprint(
     gene_keys: np.ndarray,
     eligible_mask: np.ndarray,
     layer_name: str,
+    source_identity: Optional[tuple[int, int]] = None,
 ) -> str:
-    stat = source_path.stat()
+    source_size, source_mtime_ns = (
+        _source_file_identity(source_path)
+        if source_identity is None
+        else source_identity
+    )
     gene_hash = hashlib.sha256(
         "\0".join(np.asarray(gene_keys).astype(str).tolist()).encode("utf-8")
     ).hexdigest()
@@ -260,8 +298,8 @@ def _source_fingerprint(
         "dataset_name": str(dataset_name),
         "cell_type": str(cell_type),
         "source_path": str(source_path.resolve()),
-        "source_size": int(stat.st_size),
-        "source_mtime_ns": int(stat.st_mtime_ns),
+        "source_size": source_size,
+        "source_mtime_ns": source_mtime_ns,
         "shape": [int(shape[0]), int(shape[1])],
         "layer_name": str(layer_name),
         "gene_hash": gene_hash,
@@ -274,6 +312,38 @@ def _source_fingerprint(
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _inspect_population_source(
+    *,
+    adata: ad.AnnData,
+    source_path: Path,
+    dataset_name: str,
+    cell_type: str,
+    layer_name: str,
+) -> _PopulationSourceInspection:
+    if layer_name not in adata.layers:
+        raise KeyError(f"{source_path} has no {layer_name!r} layer")
+    gene_keys, gene_positions = unique_gene_index(adata.var, adata.var_names)
+    eligible_mask = eligible_population_mask(adata.obs, cell_type)
+    source_identity = _source_file_identity(source_path)
+    fingerprint = _source_fingerprint(
+        source_path=source_path,
+        dataset_name=dataset_name,
+        cell_type=cell_type,
+        shape=adata.shape,
+        gene_keys=gene_keys,
+        eligible_mask=eligible_mask,
+        layer_name=layer_name,
+        source_identity=source_identity,
+    )
+    return _PopulationSourceInspection(
+        gene_keys=gene_keys,
+        gene_positions=gene_positions,
+        eligible_mask=eligible_mask,
+        fingerprint=fingerprint,
+        source_identity=source_identity,
+    )
 
 
 def _dataset_fingerprint(
@@ -430,6 +500,89 @@ def _stats_from_accumulators(
     )
 
 
+def _fit_population_stats_from_open_adata(
+    *,
+    adata: ad.AnnData,
+    source_path: Path,
+    dataset_name: str,
+    cell_type: str,
+    cache_path: Path,
+    inspection: _PopulationSourceInspection,
+    layer_name: str = "logFC",
+    row_chunk_size: int = DEFAULT_ROW_CHUNK_SIZE,
+    verbose: bool = False,
+    progress_interval_seconds: float = 60.0,
+) -> PopulationGeneStats:
+    if row_chunk_size < 1:
+        raise ValueError("row_chunk_size must be positive")
+
+    gene_keys = inspection.gene_keys
+    gene_positions = inspection.gene_positions
+    eligible_mask = inspection.eligible_mask
+    n_genes = len(gene_keys)
+    counts = np.zeros(n_genes, dtype=np.int64)
+    means = np.zeros(n_genes, dtype=np.float64)
+    m2 = np.zeros(n_genes, dtype=np.float64)
+    started_at = time.monotonic()
+    last_report_at = started_at
+    if verbose:
+        print(
+            f"[w4_stats] fitting {dataset_name}/{cell_type}: "
+            f"{adata.n_obs:,} source rows in chunks of {row_chunk_size:,}",
+            flush=True,
+        )
+    for start in range(0, adata.n_obs, row_chunk_size):
+        stop = min(start + row_chunk_size, adata.n_obs)
+        local_eligible = eligible_mask[start:stop]
+        if np.any(local_eligible):
+            # Preserve the layer's stored dtype during I/O, then promote only the
+            # eligible unique-gene batch used by the stable float64 accumulator.
+            raw = np.asarray(adata.layers[layer_name][start:stop, :])
+            batch = np.asarray(
+                raw[local_eligible][:, gene_positions],
+                dtype=np.float64,
+            )
+            _merge_batch_statistics(counts, means, m2, batch)
+        now = time.monotonic()
+        if verbose and (
+            stop == adata.n_obs
+            or now - last_report_at >= float(progress_interval_seconds)
+        ):
+            elapsed = max(now - started_at, 1e-12)
+            rows_per_second = stop / elapsed
+            remaining_seconds = (
+                (adata.n_obs - stop) / rows_per_second
+                if rows_per_second > 0.0
+                else float("nan")
+            )
+            eta = (
+                f"{remaining_seconds / 60.0:.1f}m"
+                if np.isfinite(remaining_seconds)
+                else "unknown"
+            )
+            print(
+                f"[w4_stats] fitting {dataset_name}/{cell_type}: "
+                f"{stop:,}/{adata.n_obs:,} rows "
+                f"({100.0 * stop / max(adata.n_obs, 1):.1f}%), "
+                f"{rows_per_second:,.1f} rows/s, ETA {eta}",
+                flush=True,
+            )
+            last_report_at = now
+
+    return _stats_from_accumulators(
+        dataset_name=str(dataset_name),
+        cell_type=str(cell_type),
+        gene_keys=gene_keys,
+        counts=counts,
+        means=means,
+        m2=m2,
+        population_row_count=int(eligible_mask.sum()),
+        fingerprint=inspection.fingerprint,
+        cache_path=cache_path,
+        scope=DATASET_CELL_TYPE_SCOPE,
+    )
+
+
 def fit_population_stats(
     *,
     source_path: Path,
@@ -441,99 +594,46 @@ def fit_population_stats(
     verbose: bool = False,
     progress_interval_seconds: float = 60.0,
 ) -> PopulationGeneStats:
+    """Fit one source with a single backed-H5AD open."""
     source_path = Path(source_path)
     cache_path = Path(cache_path)
-    if row_chunk_size < 1:
-        raise ValueError("row_chunk_size must be positive")
-
     adata = ad.read_h5ad(source_path, backed="r")
     try:
-        if layer_name not in adata.layers:
-            raise KeyError(f"{source_path} has no {layer_name!r} layer")
-        gene_keys, gene_positions = unique_gene_index(adata.var, adata.var_names)
-        eligible_mask = eligible_population_mask(adata.obs, cell_type)
-        fingerprint = _source_fingerprint(
+        inspection = _inspect_population_source(
+            adata=adata,
             source_path=source_path,
             dataset_name=dataset_name,
             cell_type=cell_type,
-            shape=adata.shape,
-            gene_keys=gene_keys,
-            eligible_mask=eligible_mask,
             layer_name=layer_name,
         )
-
-        n_genes = len(gene_keys)
-        counts = np.zeros(n_genes, dtype=np.int64)
-        means = np.zeros(n_genes, dtype=np.float64)
-        m2 = np.zeros(n_genes, dtype=np.float64)
-        started_at = time.monotonic()
-        last_report_at = started_at
-        if verbose:
-            print(
-                f"[w4_stats] fitting {dataset_name}/{cell_type}: "
-                f"{adata.n_obs:,} source rows in chunks of {row_chunk_size:,}",
-                flush=True,
-            )
-        for start in range(0, adata.n_obs, row_chunk_size):
-            stop = min(start + row_chunk_size, adata.n_obs)
-            local_eligible = eligible_mask[start:stop]
-            if np.any(local_eligible):
-                raw = np.asarray(
-                    adata.layers[layer_name][start:stop, :],
-                    dtype=np.float64,
-                )
-                batch = raw[local_eligible][:, gene_positions]
-                _merge_batch_statistics(counts, means, m2, batch)
-            now = time.monotonic()
-            if verbose and (
-                stop == adata.n_obs
-                or now - last_report_at >= float(progress_interval_seconds)
-            ):
-                elapsed = max(now - started_at, 1e-12)
-                rows_per_second = stop / elapsed
-                remaining_seconds = (
-                    (adata.n_obs - stop) / rows_per_second
-                    if rows_per_second > 0.0
-                    else float("nan")
-                )
-                eta = (
-                    f"{remaining_seconds / 60.0:.1f}m"
-                    if np.isfinite(remaining_seconds)
-                    else "unknown"
-                )
-                print(
-                    f"[w4_stats] fitting {dataset_name}/{cell_type}: "
-                    f"{stop:,}/{adata.n_obs:,} rows "
-                    f"({100.0 * stop / max(adata.n_obs, 1):.1f}%), "
-                    f"{rows_per_second:,.1f} rows/s, ETA {eta}",
-                    flush=True,
-                )
-                last_report_at = now
+        stats = _fit_population_stats_from_open_adata(
+            adata=adata,
+            source_path=source_path,
+            dataset_name=dataset_name,
+            cell_type=cell_type,
+            cache_path=cache_path,
+            inspection=inspection,
+            layer_name=layer_name,
+            row_chunk_size=row_chunk_size,
+            verbose=verbose,
+            progress_interval_seconds=progress_interval_seconds,
+        )
     finally:
         adata.file.close()
-
-    return _stats_from_accumulators(
-        dataset_name=str(dataset_name),
-        cell_type=str(cell_type),
-        gene_keys=gene_keys,
-        counts=counts,
-        means=means,
-        m2=m2,
-        population_row_count=int(eligible_mask.sum()),
-        fingerprint=fingerprint,
-        cache_path=cache_path,
-        scope=DATASET_CELL_TYPE_SCOPE,
-    )
+    if _source_file_identity(source_path) != inspection.source_identity:
+        raise AssertionError(
+            "Source changed while population statistics were being fitted"
+        )
+    return stats
 
 
-def _write_cache(stats: PopulationGeneStats) -> None:
-    cache_path = stats.cache_path
-    metadata_path = _metadata_path(cache_path)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = cache_path.with_name(f".{cache_path.name}.tmp-{os.getpid()}")
-    temporary_metadata_path = metadata_path.with_name(
-        f".{metadata_path.name}.tmp-{os.getpid()}"
-    )
+def _cache_metadata(
+    stats: PopulationGeneStats,
+    *,
+    source_path: Optional[Path] = None,
+    source_identity: Optional[tuple[int, int]] = None,
+    layer_name: Optional[str] = None,
+) -> dict[str, object]:
     metadata = {
         "engine_version": ENGINE_VERSION,
         "scope": stats.scope,
@@ -544,6 +644,68 @@ def _write_cache(stats: PopulationGeneStats) -> None:
         "n_valid_genes": stats.n_valid_genes,
         "fingerprint": stats.fingerprint,
     }
+    if source_path is not None:
+        source_path = Path(source_path)
+        source_size, source_mtime_ns = (
+            _source_file_identity(source_path)
+            if source_identity is None
+            else source_identity
+        )
+        metadata.update(
+            {
+                "source_path": str(source_path.resolve()),
+                "source_size": source_size,
+                "source_mtime_ns": source_mtime_ns,
+                "layer_name": str(layer_name or "logFC"),
+            }
+        )
+    return metadata
+
+
+def _write_cache_metadata(
+    stats: PopulationGeneStats,
+    *,
+    source_path: Optional[Path] = None,
+    source_identity: Optional[tuple[int, int]] = None,
+    layer_name: Optional[str] = None,
+) -> None:
+    metadata_path = _metadata_path(stats.cache_path)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_metadata_path = metadata_path.with_name(
+        f".{metadata_path.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+    )
+    try:
+        temporary_metadata_path.write_text(
+            json.dumps(
+                _cache_metadata(
+                    stats,
+                    source_path=source_path,
+                    source_identity=source_identity,
+                    layer_name=layer_name,
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        os.replace(temporary_metadata_path, metadata_path)
+    finally:
+        if temporary_metadata_path.exists():
+            temporary_metadata_path.unlink()
+
+
+def _write_cache(
+    stats: PopulationGeneStats,
+    *,
+    source_path: Optional[Path] = None,
+    source_identity: Optional[tuple[int, int]] = None,
+    layer_name: Optional[str] = None,
+) -> None:
+    cache_path = stats.cache_path
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = cache_path.with_name(
+        f".{cache_path.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+    )
     try:
         with temporary_path.open("wb") as stream:
             np.savez_compressed(
@@ -554,15 +716,16 @@ def _write_cache(stats: PopulationGeneStats) -> None:
                 population_sds=stats.population_sds,
                 valid_mask=stats.valid_mask,
             )
-        temporary_metadata_path.write_text(
-            json.dumps(metadata, indent=2, sort_keys=True) + "\n"
-        )
         os.replace(temporary_path, cache_path)
-        os.replace(temporary_metadata_path, metadata_path)
+        _write_cache_metadata(
+            stats,
+            source_path=source_path,
+            source_identity=source_identity,
+            layer_name=layer_name,
+        )
     finally:
-        for temporary in (temporary_path, temporary_metadata_path):
-            if temporary.exists():
-                temporary.unlink()
+        if temporary_path.exists():
+            temporary_path.unlink()
 
 
 def _load_cache(
@@ -602,6 +765,43 @@ def _load_cache(
     return stats
 
 
+def _load_unchanged_source_cache(
+    *,
+    cache_path: Path,
+    source_path: Path,
+    dataset_name: str,
+    cell_type: str,
+    layer_name: str,
+) -> Optional[PopulationGeneStats]:
+    """Fast-path a line cache using immutable source inventory metadata."""
+    try:
+        metadata = json.loads(_metadata_path(cache_path).read_text())
+        source_size, source_mtime_ns = _source_file_identity(source_path)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    expected_inventory = {
+        "engine_version": ENGINE_VERSION,
+        "scope": DATASET_CELL_TYPE_SCOPE,
+        "dataset_name": str(dataset_name),
+        "cell_type": str(cell_type),
+        "source_path": str(Path(source_path).resolve()),
+        "source_size": source_size,
+        "source_mtime_ns": source_mtime_ns,
+        "layer_name": str(layer_name),
+    }
+    if any(metadata.get(key) != value for key, value in expected_inventory.items()):
+        return None
+    fingerprint = metadata.get("fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint:
+        return None
+    return _load_cache(
+        cache_path=cache_path,
+        expected_fingerprint=fingerprint,
+        dataset_name=dataset_name,
+        cell_type=cell_type,
+    )
+
+
 def load_or_fit_population_stats(
     *,
     source_path: Path,
@@ -616,77 +816,142 @@ def load_or_fit_population_stats(
     """Load a compatible source-context cache or fit and publish it atomically."""
     source_path = Path(source_path)
     cache_path = stats_cache_path(cache_root, dataset_name, cell_type)
-
-    adata = ad.read_h5ad(source_path, backed="r")
-    try:
-        if layer_name not in adata.layers:
-            raise KeyError(f"{source_path} has no {layer_name!r} layer")
-        gene_keys, _ = unique_gene_index(adata.var, adata.var_names)
-        eligible_mask = eligible_population_mask(adata.obs, cell_type)
-        fingerprint = _source_fingerprint(
+    inspect_started_at = time.monotonic()
+    if not force:
+        cached = _load_unchanged_source_cache(
+            cache_path=cache_path,
             source_path=source_path,
             dataset_name=dataset_name,
             cell_type=cell_type,
-            shape=adata.shape,
-            gene_keys=gene_keys,
-            eligible_mask=eligible_mask,
             layer_name=layer_name,
-        )
-    finally:
-        adata.file.close()
-
-    if not force:
-        cached = _load_cache(
-            cache_path=cache_path,
-            expected_fingerprint=fingerprint,
-            dataset_name=dataset_name,
-            cell_type=cell_type,
         )
         if cached is not None:
             if verbose:
                 print(
-                    f"[w4_stats] reloaded {dataset_name}/{cell_type}: "
-                    f"{cached.n_valid_genes:,}/{cached.n_genes:,} valid genes"
+                    f"[w4_stats] fast-reloaded {dataset_name}/{cell_type}: "
+                    f"{cached.n_valid_genes:,}/{cached.n_genes:,} valid genes",
+                    flush=True,
                 )
             return cached
-
-    with _exclusive_cache_lock(cache_path):
-        # Another notebook may have completed this exact source-context while this
-        # process waited for the lock.  Recheck before scanning the layer.
+    if verbose:
+        print(
+            f"[w4_stats] inspecting {dataset_name}/{cell_type}: {source_path}",
+            flush=True,
+        )
+    adata = ad.read_h5ad(source_path, backed="r")
+    try:
+        inspection = _inspect_population_source(
+            adata=adata,
+            source_path=source_path,
+            dataset_name=dataset_name,
+            cell_type=cell_type,
+            layer_name=layer_name,
+        )
         if not force:
             cached = _load_cache(
                 cache_path=cache_path,
-                expected_fingerprint=fingerprint,
+                expected_fingerprint=inspection.fingerprint,
                 dataset_name=dataset_name,
                 cell_type=cell_type,
             )
             if cached is not None:
+                if _source_file_identity(source_path) != inspection.source_identity:
+                    raise AssertionError(
+                        "Source changed while its population cache was validated"
+                    )
                 if verbose:
                     print(
-                        f"[w4_stats] reloaded after waiting {dataset_name}/{cell_type}: "
+                        f"[w4_stats] reloaded {dataset_name}/{cell_type} after "
+                        f"{time.monotonic() - inspect_started_at:.1f}s: "
                         f"{cached.n_valid_genes:,}/{cached.n_genes:,} valid genes"
                     )
+                _write_cache_metadata(
+                    cached,
+                    source_path=source_path,
+                    source_identity=inspection.source_identity,
+                    layer_name=layer_name,
+                )
                 return cached
 
-        stats = fit_population_stats(
-            source_path=source_path,
-            dataset_name=dataset_name,
-            cell_type=cell_type,
-            cache_path=cache_path,
-            layer_name=layer_name,
-            row_chunk_size=row_chunk_size,
+        with _exclusive_cache_lock(
+            cache_path,
+            label=f"{dataset_name}/{cell_type}",
             verbose=verbose,
-        )
-        if stats.fingerprint != fingerprint:
-            raise AssertionError(
-                "Source changed while population statistics were being fitted"
+        ):
+            # Another process may have completed this source while this process
+            # waited. Recheck before scanning the already-open H5AD layer.
+            if not force:
+                cached = _load_cache(
+                    cache_path=cache_path,
+                    expected_fingerprint=inspection.fingerprint,
+                    dataset_name=dataset_name,
+                    cell_type=cell_type,
+                )
+                if cached is not None:
+                    if (
+                        _source_file_identity(source_path)
+                        != inspection.source_identity
+                    ):
+                        raise AssertionError(
+                            "Source changed while waiting for its population cache"
+                        )
+                    if verbose:
+                        print(
+                            f"[w4_stats] reloaded after waiting "
+                            f"{dataset_name}/{cell_type}: "
+                            f"{cached.n_valid_genes:,}/{cached.n_genes:,} "
+                            "valid genes",
+                            flush=True,
+                        )
+                    _write_cache_metadata(
+                        cached,
+                        source_path=source_path,
+                        source_identity=inspection.source_identity,
+                        layer_name=layer_name,
+                    )
+                    return cached
+
+            stats = _fit_population_stats_from_open_adata(
+                adata=adata,
+                source_path=source_path,
+                dataset_name=dataset_name,
+                cell_type=cell_type,
+                cache_path=cache_path,
+                inspection=inspection,
+                layer_name=layer_name,
+                row_chunk_size=row_chunk_size,
+                verbose=verbose,
             )
-        _write_cache(stats)
+            if _source_file_identity(source_path) != inspection.source_identity:
+                raise AssertionError(
+                    "Source changed while population statistics were being fitted"
+                )
+            _write_cache(
+                stats,
+                source_path=source_path,
+                source_identity=inspection.source_identity,
+                layer_name=layer_name,
+            )
+    finally:
+        adata.file.close()
+    if stats.fingerprint != inspection.fingerprint:
+        # This is defensive: both values derive from the same immutable inspection.
+        # Keeping the assertion makes accidental future divergence explicit.
+        raise AssertionError(
+            "Fitted population statistics fingerprint changed unexpectedly"
+        )
+    if _source_file_identity(source_path) != inspection.source_identity:
+        # Catch a source replacement between cache publication and file close.
+        raise AssertionError(
+            "Source changed while population statistics were being fitted"
+        )
     if verbose:
         print(
-            f"[w4_stats] computed {dataset_name}/{cell_type}: "
+            f"[w4_stats] computed {dataset_name}/{cell_type} in "
+            f"{time.monotonic() - inspect_started_at:.1f}s: "
             f"{stats.population_row_count:,} rows, "
-            f"{stats.n_valid_genes:,}/{stats.n_genes:,} valid genes"
+            f"{stats.n_valid_genes:,}/{stats.n_genes:,} valid genes",
+            flush=True,
         )
     return stats
 
@@ -719,7 +984,10 @@ def fit_dataset_population_stats(
     fingerprint: Optional[str] = None,
 ) -> PopulationGeneStats:
     """Pool line-level sufficient statistics with gene-key-aware Chan merges."""
-    source_stats = list(source_stats)
+    source_stats = sorted(
+        list(source_stats),
+        key=lambda stats: (stats.cell_type, stats.fingerprint),
+    )
     if not source_stats:
         raise ValueError("At least one line-level PopulationGeneStats is required")
     for stats in source_stats:
@@ -794,6 +1062,101 @@ def fit_dataset_population_stats(
     )
 
 
+def load_or_fit_dataset_population_stats_from_source_stats(
+    *,
+    source_stats: Sequence[PopulationGeneStats],
+    dataset_name: str,
+    cache_root: Path,
+    force: bool = False,
+    verbose: bool = True,
+) -> PopulationGeneStats:
+    """Load or pool dataset-wide statistics from already available line stats.
+
+    This is the zero-I/O aggregation path used by the precompute command's
+    ``--scope both`` mode. It prevents reopening every source solely to recover the
+    line statistics that were fitted or reloaded moments earlier.
+    """
+    source_stats = sorted(
+        list(source_stats),
+        key=lambda stats: (stats.cell_type, stats.fingerprint),
+    )
+    if not source_stats:
+        raise ValueError("At least one line-level PopulationGeneStats is required")
+    fingerprint = _dataset_fingerprint(
+        dataset_name=dataset_name,
+        source_stats=source_stats,
+    )
+    cache_path = dataset_stats_cache_path(cache_root, dataset_name)
+
+    if not force:
+        cached = _load_cache(
+            cache_path=cache_path,
+            expected_fingerprint=fingerprint,
+            dataset_name=dataset_name,
+            cell_type=DATASET_WIDE_CELL_TYPE,
+            expected_scope=DATASET_SCOPE,
+        )
+        if cached is not None:
+            if verbose:
+                print(
+                    f"[w4_stats:dataset] reloaded {dataset_name}: "
+                    f"{cached.population_row_count:,} rows across "
+                    f"{len(source_stats):,} cell types, "
+                    f"{cached.n_valid_genes:,}/{cached.n_genes:,} valid genes",
+                    flush=True,
+                )
+            return cached
+
+    with _exclusive_cache_lock(
+        cache_path,
+        label=f"dataset-wide/{dataset_name}",
+        verbose=verbose,
+    ):
+        if not force:
+            cached = _load_cache(
+                cache_path=cache_path,
+                expected_fingerprint=fingerprint,
+                dataset_name=dataset_name,
+                cell_type=DATASET_WIDE_CELL_TYPE,
+                expected_scope=DATASET_SCOPE,
+            )
+            if cached is not None:
+                if verbose:
+                    print(
+                        f"[w4_stats:dataset] reloaded after waiting "
+                        f"{dataset_name}: "
+                        f"{cached.n_valid_genes:,}/{cached.n_genes:,} valid genes",
+                        flush=True,
+                    )
+                return cached
+
+        started_at = time.monotonic()
+        if verbose:
+            print(
+                f"[w4_stats:dataset] pooling {dataset_name}: "
+                f"{len(source_stats):,} line-stat caches",
+                flush=True,
+            )
+        stats = fit_dataset_population_stats(
+            dataset_name=dataset_name,
+            source_stats=source_stats,
+            cache_path=cache_path,
+            fingerprint=fingerprint,
+        )
+        _write_cache(stats)
+
+    if verbose:
+        print(
+            f"[w4_stats:dataset] computed {dataset_name} in "
+            f"{time.monotonic() - started_at:.1f}s: "
+            f"{stats.population_row_count:,} rows across "
+            f"{len(source_stats):,} cell types, "
+            f"{stats.n_valid_genes:,}/{stats.n_genes:,} valid genes",
+            flush=True,
+        )
+    return stats
+
+
 def load_or_fit_dataset_population_stats(
     *,
     source_paths: Union[Mapping[str, Path], Sequence[tuple[str, Path]]],
@@ -825,63 +1188,13 @@ def load_or_fit_dataset_population_stats(
         )
         for cell_type, source_path in canonical_sources
     ]
-    fingerprint = _dataset_fingerprint(
-        dataset_name=dataset_name,
+    return load_or_fit_dataset_population_stats_from_source_stats(
         source_stats=source_stats,
+        dataset_name=dataset_name,
+        cache_root=cache_root,
+        force=force,
+        verbose=verbose,
     )
-    cache_path = dataset_stats_cache_path(cache_root, dataset_name)
-
-    if not force:
-        cached = _load_cache(
-            cache_path=cache_path,
-            expected_fingerprint=fingerprint,
-            dataset_name=dataset_name,
-            cell_type=DATASET_WIDE_CELL_TYPE,
-            expected_scope=DATASET_SCOPE,
-        )
-        if cached is not None:
-            if verbose:
-                print(
-                    f"[w4_stats:dataset] reloaded {dataset_name}: "
-                    f"{cached.population_row_count:,} rows across "
-                    f"{len(source_stats):,} cell types, "
-                    f"{cached.n_valid_genes:,}/{cached.n_genes:,} valid genes"
-                )
-            return cached
-
-    with _exclusive_cache_lock(cache_path):
-        if not force:
-            cached = _load_cache(
-                cache_path=cache_path,
-                expected_fingerprint=fingerprint,
-                dataset_name=dataset_name,
-                cell_type=DATASET_WIDE_CELL_TYPE,
-                expected_scope=DATASET_SCOPE,
-            )
-            if cached is not None:
-                if verbose:
-                    print(
-                        f"[w4_stats:dataset] reloaded after waiting {dataset_name}: "
-                        f"{cached.n_valid_genes:,}/{cached.n_genes:,} valid genes"
-                    )
-                return cached
-
-        stats = fit_dataset_population_stats(
-            dataset_name=dataset_name,
-            source_stats=source_stats,
-            cache_path=cache_path,
-            fingerprint=fingerprint,
-        )
-        _write_cache(stats)
-
-    if verbose:
-        print(
-            f"[w4_stats:dataset] computed {dataset_name}: "
-            f"{stats.population_row_count:,} rows across "
-            f"{len(source_stats):,} cell types, "
-            f"{stats.n_valid_genes:,}/{stats.n_genes:,} valid genes"
-        )
-    return stats
 
 
 def align_population_stats(

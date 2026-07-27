@@ -17,14 +17,22 @@ Discover all direct ``.h5ad`` children of dataset directories::
     uv run python scripts/precompute_population_zscore.py \
       --dataset-dir cigs_mce=/data/cigs_mce/group_rep/results \
       --dataset-dir cigs_tcm=/data/cigs_tcm/group_rep/results \
-      --row-chunk-size 1024
+      --row-chunk-size 1024 \
+      --workers 2
+
+``--workers`` parallelizes independent line files only. Dataset-wide statistics are
+still pooled in canonical cell-type order, so serial and parallel runs are numerically
+identical.
 """
 
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import os
 import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Sequence
 
@@ -39,7 +47,7 @@ from scripts.population_zscore import (  # noqa: E402
     DEFAULT_ROW_CHUNK_SIZE,
     discover_dataset_population_sources,
     infer_line_cell_type,
-    load_or_fit_dataset_population_stats,
+    load_or_fit_dataset_population_stats_from_source_stats,
     load_or_fit_population_stats,
     stats_qc_record,
 )
@@ -48,6 +56,30 @@ from scripts.population_zscore import (  # noqa: E402
 SCOPE_BOTH = "both"
 SCOPE_DATASET_CELL_TYPE = "dataset-cell-type"
 SCOPE_DATASET = "dataset"
+
+
+def _fit_line_task(
+    task: tuple[str, str, Path, Path, str, int, bool],
+):
+    (
+        dataset_name,
+        cell_type,
+        source_path,
+        cache_root,
+        layer_name,
+        row_chunk_size,
+        force,
+    ) = task
+    return load_or_fit_population_stats(
+        source_path=source_path,
+        dataset_name=dataset_name,
+        cell_type=cell_type,
+        cache_root=cache_root,
+        layer_name=layer_name,
+        row_chunk_size=row_chunk_size,
+        force=force,
+        verbose=True,
+    )
 
 
 def configured_dataset_dirs(repo_root: Path) -> list[tuple[str, Path]]:
@@ -226,6 +258,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ROW_CHUNK_SIZE,
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help=(
+            "Independent line files to process concurrently. The default of 1 "
+            "preserves serial behavior; try 2 or 4 on high-memory instances."
+        ),
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Recompute the requested caches even when fingerprints match.",
@@ -241,6 +282,8 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> pd.DataFrame:
     if args.row_chunk_size < 1:
         raise ValueError("--row-chunk-size must be positive")
+    if args.workers < 1:
+        raise ValueError("--workers must be positive")
     dataset_dirs = list(args.dataset_dir)
     if args.all_configured:
         dataset_dirs.extend(configured_dataset_dirs(REPO_ROOT))
@@ -252,7 +295,8 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
     n_lines = sum(len(line_sources) for line_sources in sources.values())
     print(
         f"[w4_precompute] {len(sources):,} datasets, {n_lines:,} line files; "
-        f"scope={args.scope}; cache_root={args.cache_root}",
+        f"scope={args.scope}; workers={args.workers}; "
+        f"cache_root={args.cache_root}",
         flush=True,
     )
 
@@ -266,49 +310,86 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
             f"{dataset_name} ({len(line_sources)} lines)",
             flush=True,
         )
-        if args.scope in {SCOPE_BOTH, SCOPE_DATASET_CELL_TYPE}:
-            for line_index, (cell_type, source_path) in enumerate(
-                line_sources.items(),
-                start=1,
-            ):
+        line_tasks = [
+            (
+                dataset_name,
+                cell_type,
+                source_path,
+                args.cache_root,
+                args.layer_name,
+                args.row_chunk_size,
+                args.force,
+            )
+            for cell_type, source_path in line_sources.items()
+        ]
+        line_stats_by_cell = {}
+        line_started_at = time.monotonic()
+        if args.workers == 1 or len(line_tasks) == 1:
+            for line_index, task in enumerate(line_tasks, start=1):
+                cell_type = task[1]
                 print(
                     f"[w4_precompute]   line {line_index}/{len(line_sources)}: "
                     f"{cell_type}",
                     flush=True,
                 )
-                stats = load_or_fit_population_stats(
-                    source_path=source_path,
-                    dataset_name=dataset_name,
-                    cell_type=cell_type,
-                    cache_root=args.cache_root,
-                    layer_name=args.layer_name,
-                    row_chunk_size=args.row_chunk_size,
-                    force=args.force,
-                )
-                qc_records.append(stats_qc_record(stats))
+                stats = _fit_line_task(task)
+                line_stats_by_cell[cell_type] = stats
+        else:
+            worker_count = min(args.workers, len(line_tasks))
+            print(
+                f"[w4_precompute]   processing {len(line_tasks)} lines with "
+                f"{worker_count} workers",
+                flush=True,
+            )
+            context = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=context,
+            ) as executor:
+                future_to_cell = {
+                    executor.submit(_fit_line_task, task): task[1]
+                    for task in line_tasks
+                }
+                for completed_count, future in enumerate(
+                    as_completed(future_to_cell),
+                    start=1,
+                ):
+                    cell_type = future_to_cell[future]
+                    stats = future.result()
+                    line_stats_by_cell[cell_type] = stats
+                    elapsed = time.monotonic() - line_started_at
+                    print(
+                        f"[w4_precompute]   completed "
+                        f"{completed_count}/{len(line_tasks)}: {cell_type} "
+                        f"(elapsed {elapsed / 60.0:.1f}m)",
+                        flush=True,
+                    )
+
+        ordered_line_stats = [
+            line_stats_by_cell[cell_type]
+            for cell_type in sorted(line_stats_by_cell)
+        ]
+        if args.scope in {SCOPE_BOTH, SCOPE_DATASET_CELL_TYPE}:
+            qc_records.extend(
+                stats_qc_record(stats)
+                for stats in ordered_line_stats
+            )
 
         if args.scope in {SCOPE_BOTH, SCOPE_DATASET}:
-            dataset_stats = load_or_fit_dataset_population_stats(
-                source_paths=line_sources,
+            dataset_stats = load_or_fit_dataset_population_stats_from_source_stats(
+                source_stats=ordered_line_stats,
                 dataset_name=dataset_name,
                 cache_root=args.cache_root,
-                layer_name=args.layer_name,
-                row_chunk_size=args.row_chunk_size,
                 force=args.force,
-                # In "both" mode the line caches were just handled above.  For
-                # dataset-only mode, --force also refreshes those dependencies.
-                force_source_stats=args.force and args.scope == SCOPE_DATASET,
-                verbose=args.scope == SCOPE_DATASET,
+                verbose=True,
             )
-            if args.scope == SCOPE_BOTH:
-                print(
-                    f"[w4_stats:dataset] {'computed' if args.force else 'ready'} "
-                    f"{dataset_name}: {dataset_stats.population_row_count:,} rows, "
-                    f"{dataset_stats.n_valid_genes:,}/{dataset_stats.n_genes:,} "
-                    "valid genes",
-                    flush=True,
-                )
             qc_records.append(stats_qc_record(dataset_stats))
+
+        print(
+            f"[w4_precompute] dataset {dataset_name} complete in "
+            f"{(time.monotonic() - line_started_at) / 60.0:.1f}m",
+            flush=True,
+        )
 
     qc = pd.DataFrame(qc_records)
     if args.qc_output is not None:

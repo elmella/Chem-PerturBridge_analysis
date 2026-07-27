@@ -119,10 +119,18 @@ class PopulationZScoreTests(unittest.TestCase):
                     "1",
                 ]
             )
-            with redirect_stdout(io.StringIO()):
-                qc = run_precompute(args)
+            real_read_h5ad = ad.read_h5ad
+            with patch(
+                "scripts.population_zscore.ad.read_h5ad",
+                wraps=real_read_h5ad,
+            ) as read_h5ad:
+                with redirect_stdout(io.StringIO()):
+                    qc = run_precompute(args)
 
             self.assertEqual(len(qc), 3)
+            # --scope both scans each source once and pools the returned line stats
+            # without reopening the H5ADs for dataset-wide aggregation.
+            self.assertEqual(read_h5ad.call_count, 2)
             self.assertEqual(
                 set(qc["scope"]),
                 {DATASET_CELL_TYPE_SCOPE, DATASET_SCOPE},
@@ -130,6 +138,54 @@ class PopulationZScoreTests(unittest.TestCase):
             self.assertTrue(qc_path.exists())
             self.assertTrue(
                 dataset_stats_cache_path(cache_root, "source").exists()
+            )
+
+    def test_parallel_precompute_matches_serial_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            write_fixture(
+                source_dir / "CVCL_A_de.h5ad",
+                np.asarray([[1.0, 10.0], [2.0, 20.0], [5.0, 50.0]]),
+                cell_type="CVCL_A",
+            )
+            write_fixture(
+                source_dir / "CVCL_B_de.h5ad",
+                np.asarray([[3.0, 30.0], [4.0, 40.0], [8.0, 80.0]]),
+                cell_type="CVCL_B",
+            )
+
+            def precompute(cache_name: str, workers: int) -> pd.DataFrame:
+                args = build_precompute_parser().parse_args(
+                    [
+                        "--dataset-dir",
+                        f"source={source_dir}",
+                        "--cache-root",
+                        str(root / cache_name),
+                        "--row-chunk-size",
+                        "1",
+                        "--workers",
+                        str(workers),
+                    ]
+                )
+                with redirect_stdout(io.StringIO()):
+                    return run_precompute(args)
+
+            serial = precompute("serial_cache", 1)
+            parallel = precompute("parallel_cache", 2)
+            comparison_columns = [
+                column for column in serial.columns if column != "cache_path"
+            ]
+            sort_columns = ["scope", "cell_type"]
+            pd.testing.assert_frame_equal(
+                serial[comparison_columns]
+                .sort_values(sort_columns)
+                .reset_index(drop=True),
+                parallel[comparison_columns]
+                .sort_values(sort_columns)
+                .reset_index(drop=True),
+                check_exact=True,
             )
 
     def test_dataset_population_pools_lines_with_different_gene_orders_and_sets(self):
@@ -287,7 +343,7 @@ class PopulationZScoreTests(unittest.TestCase):
             fit_count = 0
             fit_count_lock = threading.Lock()
             start = threading.Barrier(2)
-            real_fit = population_zscore_module.fit_population_stats
+            real_fit = population_zscore_module._fit_population_stats_from_open_adata
 
             def counted_fit(**kwargs):
                 nonlocal fit_count
@@ -308,7 +364,7 @@ class PopulationZScoreTests(unittest.TestCase):
                 )
 
             with patch(
-                "scripts.population_zscore.fit_population_stats",
+                "scripts.population_zscore._fit_population_stats_from_open_adata",
                 side_effect=counted_fit,
             ):
                 with ThreadPoolExecutor(max_workers=2) as executor:
@@ -316,6 +372,45 @@ class PopulationZScoreTests(unittest.TestCase):
 
             self.assertEqual(fit_count, 1)
             self.assertEqual(first.fingerprint, second.fingerprint)
+
+    def test_cache_miss_opens_source_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.h5ad"
+            write_fixture(
+                source,
+                np.asarray([[1.0, 10.0], [2.0, 20.0], [4.0, 40.0]]),
+                cell_type="CVCL_TEST",
+            )
+            real_read_h5ad = ad.read_h5ad
+            with patch(
+                "scripts.population_zscore.ad.read_h5ad",
+                wraps=real_read_h5ad,
+            ) as read_h5ad:
+                first = load_or_fit_population_stats(
+                    source_path=source,
+                    dataset_name="source",
+                    cell_type="CVCL_TEST",
+                    cache_root=root / "cache",
+                    row_chunk_size=2,
+                    verbose=False,
+                )
+            self.assertEqual(read_h5ad.call_count, 1)
+
+            with patch(
+                "scripts.population_zscore.ad.read_h5ad",
+                wraps=real_read_h5ad,
+            ) as read_h5ad:
+                cached = load_or_fit_population_stats(
+                    source_path=source,
+                    dataset_name="source",
+                    cell_type="CVCL_TEST",
+                    cache_root=root / "cache",
+                    row_chunk_size=2,
+                    verbose=False,
+                )
+            self.assertEqual(read_h5ad.call_count, 0)
+            self.assertEqual(first.fingerprint, cached.fingerprint)
 
     def test_streaming_matches_dense_population_statistics_and_cache_reload(self):
         matrix = np.asarray(
