@@ -439,6 +439,23 @@ class ParallelScoringScriptTests(unittest.TestCase):
                 0,
             )
             observed_path = retrieval_output / "fixture" / RETRIEVAL_FINAL
+            stored_observed = pd.read_csv(
+                observed_path,
+                sep="\t",
+                dtype={"best_target_dose_key": "string"},
+            )
+            canonical_ten = (
+                stored_observed["best_target_dose_key"].astype(str) == "10"
+            )
+            self.assertTrue(canonical_ten.any())
+            stored_observed.loc[
+                canonical_ten, "best_target_dose_key"
+            ] = "10.0"
+            stored_observed.to_csv(
+                observed_path,
+                sep="\t",
+                index=False,
+            )
             peer_output = root / "peer-only"
             missing_w4_root = root / "does-not-exist"
             self.assertEqual(

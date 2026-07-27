@@ -1606,7 +1606,9 @@ def _peer_only_direction_records(
         )
         query_compound = str(query_compounds[query_idx])
         query_dose = str(query_doses[query_idx])
-        best_target_dose = str(row_values["best_target_dose_key"])
+        best_target_dose = cross_source_core.format_numeric(
+            float(row_values["best_target_dose_key"])
+        )
 
         source_all_rows = np.flatnonzero(
             (query_doses == query_dose)
