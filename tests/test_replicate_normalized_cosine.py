@@ -11,6 +11,7 @@ import scripts.precompute_replicate_signature_similarity as replicate_scoring
 from scripts.population_zscore import DATASET_SCOPE, PopulationGeneStats
 from scripts.precompute_replicate_signature_similarity import (
     cosine_against_peers,
+    complete_row_norms,
     normalized_matrix_for_stats,
     overlay_condition_metric_rows,
     resolve_processed_sep_rep_h5ad,
@@ -58,6 +59,18 @@ class ReplicateNormalizedCosineTests(unittest.TestCase):
             vector_cosine_similarity(np.asarray([1.0, 1.0]), np.asarray([1.0, -1.0])),
             0.0,
         )
+
+    def test_cached_peer_norms_preserve_cosine_scores(self) -> None:
+        rng = np.random.default_rng(17)
+        query = rng.normal(size=20)
+        peers = rng.normal(size=(12, 20))
+        expected = cosine_against_peers(query, peers)
+        observed = cosine_against_peers(
+            query,
+            peers,
+            peer_norms=complete_row_norms(peers),
+        )
+        np.testing.assert_allclose(observed, expected, rtol=1e-14, atol=1e-14)
 
     def test_scope_selection_is_explicit(self) -> None:
         self.assertEqual(resolve_normalization_scopes("dataset"), ("dataset",))

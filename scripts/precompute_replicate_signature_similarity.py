@@ -242,6 +242,7 @@ class BaselineContextVectors:
     prepared_local_logfc: dict[bytes, PreparedSpearmanRows]
     normalized_local_logfc: dict[str, np.ndarray]
     normalized_finite_totals: dict[str, tuple[np.ndarray, np.ndarray]]
+    cosine_row_norms: dict[str, Optional[np.ndarray]]
 
 
 class ReplicatePopulationStatsCache:
@@ -800,7 +801,12 @@ def vector_cosine_similarity(left_values: np.ndarray, right_values: np.ndarray) 
     return float(np.dot(left, right) / denominator)
 
 
-def cosine_against_peers(query: np.ndarray, peers: np.ndarray) -> np.ndarray:
+def cosine_against_peers(
+    query: np.ndarray,
+    peers: np.ndarray,
+    *,
+    peer_norms: Optional[np.ndarray] = None,
+) -> np.ndarray:
     query = np.asarray(query, dtype=np.float64).reshape(-1)
     peers = np.asarray(peers, dtype=np.float64)
     if peers.ndim != 2:
@@ -808,6 +814,17 @@ def cosine_against_peers(query: np.ndarray, peers: np.ndarray) -> np.ndarray:
     if peers.shape[1] != query.size:
         raise ValueError("query and peer gene dimensions differ")
     query_finite = np.isfinite(query)
+    if peer_norms is not None and query_finite.all():
+        peer_norms = np.asarray(peer_norms, dtype=np.float64).reshape(-1)
+        if peer_norms.size != peers.shape[0]:
+            raise ValueError("peer_norms length does not match peer rows")
+        query_norm = float(np.linalg.norm(query))
+        denominators = peer_norms * query_norm
+        result = np.full(peers.shape[0], np.nan, dtype=np.float64)
+        valid = np.isfinite(denominators) & (denominators > 0.0)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            result[valid] = (peers[valid] @ query) / denominators[valid]
+        return result
     if int(query_finite.sum()) >= 2:
         reduced_peers = peers[:, query_finite]
         reduced_query = query[query_finite]
@@ -835,6 +852,16 @@ def cosine_against_peers(query: np.ndarray, peers: np.ndarray) -> np.ndarray:
     valid = (counts >= 2) & np.isfinite(denominators) & (denominators > 0.0)
     result[valid] = numerators[valid] / denominators[valid]
     return result
+
+
+def complete_row_norms(matrix: np.ndarray) -> Optional[np.ndarray]:
+    """Cacheable cosine row norms, or None when pairwise-NaN scoring is needed."""
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.ndim != 2:
+        raise ValueError("matrix must be two-dimensional")
+    if not np.isfinite(matrix).all():
+        return None
+    return np.linalg.norm(matrix, axis=1)
 
 
 def normalized_matrix_for_stats(
@@ -1106,6 +1133,9 @@ def get_baseline_context_vectors(
         prepared_local_logfc={},
         normalized_local_logfc={},
         normalized_finite_totals={},
+        cosine_row_norms={
+            "raw": complete_row_norms(matrices["local_logfc"]),
+        },
     )
     cache[cache_key] = loaded
     return loaded
@@ -2930,6 +2960,9 @@ def compute_condition_metric_record_from_rows(
                         normalized_totals = normalized_context.finite_totals[
                             "local_logfc"
                         ]
+                        context_row_norms = (
+                            normalized_context.cosine_row_norms["raw"]
+                        )
                     else:
                         population_stats = population_stats_cache.get(
                             dataset_name=dataset_name,
@@ -2956,8 +2989,14 @@ def compute_condition_metric_record_from_rows(
                             normalized_context.normalized_finite_totals[scope] = (
                                 finite_column_totals(normalized_context_matrix)
                             )
+                            normalized_context.cosine_row_norms[scope] = (
+                                complete_row_norms(normalized_context_matrix)
+                            )
                         normalized_totals = (
                             normalized_context.normalized_finite_totals[scope]
+                        )
+                        context_row_norms = (
+                            normalized_context.cosine_row_norms[scope]
                         )
                     record[f"n_cosine_genes_{suffix}"] = int(
                         normalized_replicates.shape[1]
@@ -3018,6 +3057,11 @@ def compute_condition_metric_record_from_rows(
                     )
                     scored_positions = peer_context_positions[selected]
                     peer_matrix = normalized_context_matrix[scored_positions]
+                    selected_peer_norms = (
+                        context_row_norms[scored_positions]
+                        if context_row_norms is not None
+                        else None
+                    )
                     if not compute_baseline_metrics:
                         record["n_peer_rows_total"] = int(peer_row_mask.sum())
                         record["n_peer_rows_available"] = int(
@@ -3031,10 +3075,14 @@ def compute_condition_metric_record_from_rows(
                     ):
                         pair_summary = replicate_pair_peer_summary(
                             cosine_against_peers(
-                                normalized_replicates[left_idx], peer_matrix
+                                normalized_replicates[left_idx],
+                                peer_matrix,
+                                peer_norms=selected_peer_norms,
                             ),
                             cosine_against_peers(
-                                normalized_replicates[right_idx], peer_matrix
+                                normalized_replicates[right_idx],
+                                peer_matrix,
+                                peer_norms=selected_peer_norms,
                             ),
                             float(observed_values[pair_position]),
                             "peer",
