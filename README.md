@@ -171,7 +171,9 @@ complete nine-pair dose summary/CI tables under
 ### Reviewer Tables 7, 8, and 10 without notebooks
 
 Compute the within-dataset replicate metrics once. The same condition shards
-feed all three tables, so running separate expensive jobs is unnecessary:
+feed all three tables, so running separate expensive jobs is unnecessary.
+The normalized cosine sensitivity reuses the existing per-gene population
+statistics; it does not refit them:
 
 ```bash
 uv run python scripts/precompute_replicate_signature_similarity.py run-all \
@@ -179,6 +181,24 @@ uv run python scripts/precompute_replicate_signature_similarity.py run-all \
   --output-dir results/replicate_signature_similarity_sep_rep_peer_full \
   --compute-baseline-metrics \
   --compute-deg-metrics \
+  --compute-normalized-cosine \
+  --normalization-scales all \
+  --population-stats-root results/w4_population_zscore_stats \
+  --max-baseline-peers 0 \
+  --workers 8 \
+  --progress always
+```
+
+If the raw replicate run is already complete, calculate only the added cosine
+fields in a new output directory and reuse every other condition-level field:
+
+```bash
+uv run python scripts/precompute_replicate_signature_similarity.py run-all \
+  --datasets all \
+  --output-dir results/replicate_signature_similarity_sep_rep_normalized_cosine \
+  --existing-results-dir results/replicate_signature_similarity_sep_rep_peer_full \
+  --compute-normalized-cosine \
+  --normalization-scales all \
   --max-baseline-peers 0 \
   --workers 8 \
   --progress always
@@ -205,8 +225,10 @@ The table-specific entry points
 `summarize_replicate_table_10.py` accept the same summary options. Outputs
 retain observed and original centroid results and add individual-peer means,
 standard deviations, corrected percentiles, observed-minus-peer deltas, and
-PubChem-clustered confidence intervals. Compatible completed summaries are
-validated and reused automatically.
+PubChem-clustered confidence intervals. Table 10 additionally reports cosine
+agreement after dataset-wide and dataset-by-cell-type per-gene population
+normalization. Compatible completed summaries are validated and reused
+automatically.
 
 The retrieval command above scores every eligible individual peer. The default
 cap remains 512 for bounded exploratory runs; eligible and scored peer counts

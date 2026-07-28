@@ -129,6 +129,78 @@ TABLE_METRICS: dict[int, dict[str, str]] = {
         "delta_vs_individual_peer_spearman_logfc": (
             "mean_replicate_minus_peer_baseline_spearman_logfc"
         ),
+        "raw_observed_replicate_cosine": (
+            "mean_replicate_cosine_logfc_raw"
+        ),
+        "raw_centroid_baseline_cosine": (
+            "mean_replicate_baseline_cosine_logfc_raw"
+        ),
+        "raw_delta_vs_centroid_cosine": (
+            "mean_replicate_minus_baseline_cosine_logfc_raw"
+        ),
+        "raw_individual_peer_mean_cosine": (
+            "mean_peer_baseline_cosine_logfc_raw"
+        ),
+        "raw_individual_peer_sd_cosine": (
+            "mean_peer_baseline_sd_cosine_logfc_raw"
+        ),
+        "raw_individual_peer_fraction_below_observed_cosine": (
+            "mean_peer_baseline_fraction_below_observed_cosine_logfc_raw"
+        ),
+        "raw_individual_peer_corrected_percentile_cosine": (
+            "mean_peer_baseline_corrected_percentile_cosine_logfc_raw"
+        ),
+        "raw_delta_vs_individual_peer_cosine": (
+            "mean_replicate_minus_peer_baseline_cosine_logfc_raw"
+        ),
+        "dataset_normalized_observed_replicate_cosine": (
+            "mean_replicate_cosine_logfc_normalized_dataset"
+        ),
+        "dataset_normalized_centroid_baseline_cosine": (
+            "mean_replicate_baseline_cosine_logfc_normalized_dataset"
+        ),
+        "dataset_normalized_delta_vs_centroid_cosine": (
+            "mean_replicate_minus_baseline_cosine_logfc_normalized_dataset"
+        ),
+        "dataset_normalized_individual_peer_mean_cosine": (
+            "mean_peer_baseline_cosine_logfc_normalized_dataset"
+        ),
+        "dataset_normalized_individual_peer_sd_cosine": (
+            "mean_peer_baseline_sd_cosine_logfc_normalized_dataset"
+        ),
+        "dataset_normalized_individual_peer_fraction_below_observed_cosine": (
+            "mean_peer_baseline_fraction_below_observed_cosine_logfc_normalized_dataset"
+        ),
+        "dataset_normalized_individual_peer_corrected_percentile_cosine": (
+            "mean_peer_baseline_corrected_percentile_cosine_logfc_normalized_dataset"
+        ),
+        "dataset_normalized_delta_vs_individual_peer_cosine": (
+            "mean_replicate_minus_peer_baseline_cosine_logfc_normalized_dataset"
+        ),
+        "dataset_cell_type_normalized_observed_replicate_cosine": (
+            "mean_replicate_cosine_logfc_normalized_dataset_cell_type"
+        ),
+        "dataset_cell_type_normalized_centroid_baseline_cosine": (
+            "mean_replicate_baseline_cosine_logfc_normalized_dataset_cell_type"
+        ),
+        "dataset_cell_type_normalized_delta_vs_centroid_cosine": (
+            "mean_replicate_minus_baseline_cosine_logfc_normalized_dataset_cell_type"
+        ),
+        "dataset_cell_type_normalized_individual_peer_mean_cosine": (
+            "mean_peer_baseline_cosine_logfc_normalized_dataset_cell_type"
+        ),
+        "dataset_cell_type_normalized_individual_peer_sd_cosine": (
+            "mean_peer_baseline_sd_cosine_logfc_normalized_dataset_cell_type"
+        ),
+        "dataset_cell_type_normalized_individual_peer_fraction_below_observed_cosine": (
+            "mean_peer_baseline_fraction_below_observed_cosine_logfc_normalized_dataset_cell_type"
+        ),
+        "dataset_cell_type_normalized_individual_peer_corrected_percentile_cosine": (
+            "mean_peer_baseline_corrected_percentile_cosine_logfc_normalized_dataset_cell_type"
+        ),
+        "dataset_cell_type_normalized_delta_vs_individual_peer_cosine": (
+            "mean_replicate_minus_peer_baseline_cosine_logfc_normalized_dataset_cell_type"
+        ),
     },
 }
 
@@ -156,6 +228,24 @@ TABLE_PRIMARY_METRICS = {
         "individual_peer_mean_spearman_logfc",
         "delta_vs_individual_peer_spearman_logfc",
         "individual_peer_corrected_percentile_spearman_logfc",
+        "raw_observed_replicate_cosine",
+        "raw_centroid_baseline_cosine",
+        "raw_delta_vs_centroid_cosine",
+        "raw_individual_peer_mean_cosine",
+        "raw_delta_vs_individual_peer_cosine",
+        "raw_individual_peer_corrected_percentile_cosine",
+        "dataset_normalized_observed_replicate_cosine",
+        "dataset_normalized_centroid_baseline_cosine",
+        "dataset_normalized_delta_vs_centroid_cosine",
+        "dataset_normalized_individual_peer_mean_cosine",
+        "dataset_normalized_delta_vs_individual_peer_cosine",
+        "dataset_normalized_individual_peer_corrected_percentile_cosine",
+        "dataset_cell_type_normalized_observed_replicate_cosine",
+        "dataset_cell_type_normalized_centroid_baseline_cosine",
+        "dataset_cell_type_normalized_delta_vs_centroid_cosine",
+        "dataset_cell_type_normalized_individual_peer_mean_cosine",
+        "dataset_cell_type_normalized_delta_vs_individual_peer_cosine",
+        "dataset_cell_type_normalized_individual_peer_corrected_percentile_cosine",
     ),
 }
 

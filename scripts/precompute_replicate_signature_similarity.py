@@ -46,6 +46,15 @@ from peer_baselines import (
     spearman_against_prepared_peers,
     summarize_peer_scores,
 )
+from population_zscore import (
+    DATASET_CELL_TYPE_SCOPE,
+    DATASET_SCOPE,
+    DATASET_WIDE_CELL_TYPE,
+    PopulationGeneStats,
+    dataset_stats_cache_path,
+    load_population_stats_cache,
+    stats_cache_path,
+)
 
 
 REPO_ROOT = SCRIPT_DIR.parent
@@ -164,6 +173,8 @@ TASK_OUTPUT_DIR_NAME = "task_outputs"
 LINE_GLOBAL_SHARED_GENE_KEYS_FILE_NAME = "line_global_shared_gene_keys.tsv"
 TASK_CONFIG_FILE_NAME = "task_config.json"
 DATASET_METADATA_CACHE_DIR_NAME = "dataset_metadata_cache"
+DEFAULT_POPULATION_STATS_ROOT = REPO_ROOT / "results" / "w4_population_zscore_stats"
+NORMALIZATION_SCOPES = (DATASET_SCOPE, DATASET_CELL_TYPE_SCOPE)
 
 
 @dataclass
@@ -199,6 +210,44 @@ class BaselineContextVectors:
     global_t: np.ndarray
     finite_totals: dict[str, tuple[np.ndarray, np.ndarray]]
     prepared_local_logfc: dict[bytes, PreparedSpearmanRows]
+    normalized_local_logfc: dict[str, np.ndarray]
+    normalized_finite_totals: dict[str, tuple[np.ndarray, np.ndarray]]
+
+
+class ReplicatePopulationStatsCache:
+    """Read and memoize existing population statistics; never fit them."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+        self._stats: dict[tuple[str, str, str], PopulationGeneStats] = {}
+
+    def get(
+        self,
+        *,
+        dataset_name: str,
+        cell_type: str,
+        scope: str,
+    ) -> PopulationGeneStats:
+        key = (str(dataset_name), str(cell_type), str(scope))
+        cached = self._stats.get(key)
+        if cached is not None:
+            return cached
+        if scope == DATASET_SCOPE:
+            path = dataset_stats_cache_path(self.root, dataset_name)
+            cache_cell_type = DATASET_WIDE_CELL_TYPE
+        elif scope == DATASET_CELL_TYPE_SCOPE:
+            path = stats_cache_path(self.root, dataset_name, cell_type)
+            cache_cell_type = cell_type
+        else:
+            raise ValueError(f"Unsupported normalization scope: {scope!r}")
+        loaded = load_population_stats_cache(
+            cache_path=path,
+            dataset_name=dataset_name,
+            cell_type=cache_cell_type,
+            expected_scope=scope,
+        )
+        self._stats[key] = loaded
+        return loaded
 
 
 GENE_INFO_CACHE: dict[str, GeneInfo] = {}
@@ -281,6 +330,30 @@ def add_common_run_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--compute-normalized-cosine",
+        action="store_true",
+        help=(
+            "Compute raw and normalized within-dataset replicate cosine agreement, "
+            "including centroid and individual-peer baselines. Existing per-gene "
+            "population statistics are reused; none are fitted by this command."
+        ),
+    )
+    parser.add_argument(
+        "--normalization-scales",
+        choices=("all", "dataset", "dataset-cell-type"),
+        default="all",
+        help=(
+            "Population normalization scopes for normalized cosine. "
+            "Default: both dataset and dataset-by-cell-type."
+        ),
+    )
+    parser.add_argument(
+        "--population-stats-root",
+        type=Path,
+        default=DEFAULT_POPULATION_STATS_ROOT,
+        help="Root containing caches from precompute_population_zscore.py.",
+    )
+    parser.add_argument(
         "--min-retrieval-compounds-per-line-time",
         type=int,
         default=DEFAULT_MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME,
@@ -339,6 +412,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "always", "off"),
         default="auto",
         help="Task progress-bar mode.",
+    )
+    run_all_parser.add_argument(
+        "--existing-results-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optionally enrich an existing merged replicate result. Newly "
+            "computed non-missing fields take precedence; other columns are reused."
+        ),
     )
 
     prepare_parser = subparsers.add_parser(
@@ -424,6 +506,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--compute-retrieval-metrics",
         action="store_true",
         help="Also compute within-dataset strict matched-condition retrieval summaries.",
+    )
+    run_task_parser.add_argument(
+        "--compute-normalized-cosine",
+        action="store_true",
+        help="Compute normalized replicate cosine and its centroid/peer baselines.",
+    )
+    run_task_parser.add_argument(
+        "--normalization-scales",
+        choices=("all", "dataset", "dataset-cell-type"),
+        default="all",
+    )
+    run_task_parser.add_argument(
+        "--population-stats-root",
+        type=Path,
+        default=DEFAULT_POPULATION_STATS_ROOT,
     )
     run_task_parser.add_argument(
         "--min-retrieval-compounds-per-line-time",
@@ -659,6 +756,107 @@ def vector_spearman_similarity(left_values: np.ndarray, right_values: np.ndarray
     return float(similarity)
 
 
+def vector_cosine_similarity(left_values: np.ndarray, right_values: np.ndarray) -> float:
+    left_values = np.asarray(left_values, dtype=np.float64)
+    right_values = np.asarray(right_values, dtype=np.float64)
+    finite_mask = np.isfinite(left_values) & np.isfinite(right_values)
+    if int(finite_mask.sum()) < 2:
+        return float("nan")
+    left = left_values[finite_mask]
+    right = right_values[finite_mask]
+    denominator = float(np.linalg.norm(left) * np.linalg.norm(right))
+    if not np.isfinite(denominator) or denominator <= 0.0:
+        return float("nan")
+    return float(np.dot(left, right) / denominator)
+
+
+def cosine_against_peers(query: np.ndarray, peers: np.ndarray) -> np.ndarray:
+    query = np.asarray(query, dtype=np.float64).reshape(-1)
+    peers = np.asarray(peers, dtype=np.float64)
+    if peers.ndim != 2:
+        raise ValueError("peers must be a two-dimensional matrix")
+    if peers.shape[1] != query.size:
+        raise ValueError("query and peer gene dimensions differ")
+    query_finite = np.isfinite(query)
+    if int(query_finite.sum()) >= 2:
+        reduced_peers = peers[:, query_finite]
+        reduced_query = query[query_finite]
+        if np.isfinite(reduced_peers).all():
+            denominators = (
+                np.linalg.norm(reduced_peers, axis=1)
+                * np.linalg.norm(reduced_query)
+            )
+            result = np.full(peers.shape[0], np.nan, dtype=np.float64)
+            valid = np.isfinite(denominators) & (denominators > 0.0)
+            result[valid] = (
+                reduced_peers[valid] @ reduced_query
+            ) / denominators[valid]
+            return result
+    finite = np.isfinite(peers) & np.isfinite(query)[None, :]
+    counts = finite.sum(axis=1)
+    query_values = np.where(finite, query[None, :], 0.0)
+    peer_values = np.where(finite, peers, 0.0)
+    numerators = np.sum(query_values * peer_values, axis=1)
+    denominators = np.sqrt(
+        np.sum(query_values * query_values, axis=1)
+        * np.sum(peer_values * peer_values, axis=1)
+    )
+    result = np.full(peers.shape[0], np.nan, dtype=np.float64)
+    valid = (counts >= 2) & np.isfinite(denominators) & (denominators > 0.0)
+    result[valid] = numerators[valid] / denominators[valid]
+    return result
+
+
+def normalized_matrix_for_stats(
+    matrix: np.ndarray,
+    *,
+    gene_keys: np.ndarray,
+    stats_record: PopulationGeneStats,
+) -> np.ndarray:
+    """Normalize columns present and valid in an existing population cache."""
+    matrix = np.asarray(matrix, dtype=np.float64)
+    requested = np.asarray(gene_keys).astype(str)
+    source_positions = {
+        str(gene_key): position
+        for position, gene_key in enumerate(stats_record.gene_keys)
+        if bool(stats_record.valid_mask[position])
+    }
+    local_positions = np.asarray(
+        [
+            position
+            for position, gene_key in enumerate(requested)
+            if str(gene_key) in source_positions
+        ],
+        dtype=np.int64,
+    )
+    if local_positions.size < 2:
+        return np.empty((matrix.shape[0], 0), dtype=np.float64)
+    stats_positions = np.asarray(
+        [source_positions[str(requested[position])] for position in local_positions],
+        dtype=np.int64,
+    )
+    selected = matrix[:, local_positions]
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        normalized = (
+            selected - stats_record.means[stats_positions][None, :]
+        ) / stats_record.population_sds[stats_positions][None, :]
+    normalized[~np.isfinite(selected) | ~np.isfinite(normalized)] = np.nan
+    return normalized
+
+
+def resolve_normalization_scopes(value: str) -> tuple[str, ...]:
+    normalized = str(value).strip().lower()
+    if normalized == "all":
+        return NORMALIZATION_SCOPES
+    if normalized == "dataset":
+        return (DATASET_SCOPE,)
+    if normalized == "dataset-cell-type":
+        return (DATASET_CELL_TYPE_SCOPE,)
+    raise ValueError(
+        "--normalization-scales must be all, dataset, or dataset-cell-type"
+    )
+
+
 def negative_l2_similarity_matrix(query_matrix: np.ndarray, candidate_matrix: np.ndarray) -> np.ndarray:
     query_matrix = np.asarray(query_matrix, dtype=np.float64)
     candidate_matrix = np.asarray(candidate_matrix, dtype=np.float64)
@@ -876,6 +1074,8 @@ def get_baseline_context_vectors(
             for matrix_name, matrix in matrices.items()
         },
         prepared_local_logfc={},
+        normalized_local_logfc={},
+        normalized_finite_totals={},
     )
     cache[cache_key] = loaded
     return loaded
@@ -2044,6 +2244,9 @@ def compute_condition_metric_record_from_rows(
     top_k: int,
     compute_deg_metrics: bool = False,
     compute_baseline_metrics: bool = False,
+    compute_normalized_cosine: bool = False,
+    normalization_scopes: tuple[str, ...] = NORMALIZATION_SCOPES,
+    population_stats_cache: Optional[ReplicatePopulationStatsCache] = None,
     baseline_source_frame: Optional[pd.DataFrame] = None,
     baseline_context_row_indexes: Optional[dict[tuple[str, str, str], np.ndarray]] = None,
     baseline_context_vector_cache: Optional[
@@ -2178,6 +2381,36 @@ def compute_condition_metric_record_from_rows(
         "n_valid_replicate_minus_baseline_t_pairs_global": 0,
         f"n_valid_replicate_minus_baseline_signed_overlap_t_top{top_k}_pairs_global": 0,
     }
+    if compute_normalized_cosine:
+        for scope in ("raw", *normalization_scopes):
+            suffix = (
+                "raw"
+                if scope == "raw"
+                else (
+                    "dataset"
+                    if scope == DATASET_SCOPE
+                    else "dataset_cell_type"
+                )
+            )
+            metric_suffix = (
+                "raw" if scope == "raw" else f"normalized_{suffix}"
+            )
+            for field_name in (
+                "mean_replicate_cosine_logfc",
+                "mean_replicate_baseline_cosine_logfc",
+                "mean_replicate_minus_baseline_cosine_logfc",
+                "mean_peer_baseline_cosine_logfc",
+                "mean_peer_baseline_sd_cosine_logfc",
+                "mean_peer_baseline_fraction_below_observed_cosine_logfc",
+                "mean_peer_baseline_corrected_percentile_cosine_logfc",
+                "mean_replicate_minus_peer_baseline_cosine_logfc",
+            ):
+                record[f"{field_name}_{metric_suffix}"] = float("nan")
+            record[f"n_cosine_genes_{suffix}"] = 0
+            record[f"n_valid_replicate_cosine_pairs_{metric_suffix}"] = 0
+            record[f"n_valid_peer_cosine_pairs_{metric_suffix}"] = 0
+
+    raw_local_logfc_matrix: Optional[np.ndarray] = None
     if compute_deg_metrics:
         for definition_key in DEG_DEFINITION_CONFIG:
             for metric_name in deg_metric_names():
@@ -2206,7 +2439,8 @@ def compute_condition_metric_record_from_rows(
             open_adatas=open_adatas,
         )
     if all(vector is not None for vector in local_logfc_vectors) and all(vector is not None for vector in local_t_vectors):
-        local_logfc_matrix = np.vstack(local_logfc_vectors).astype(np.float64)
+        raw_local_logfc_matrix = np.vstack(local_logfc_vectors).astype(np.float64)
+        local_logfc_matrix = raw_local_logfc_matrix.copy()
         local_t_matrix = np.vstack(local_t_vectors).astype(np.float64)
         finite_local_mask = np.isfinite(local_logfc_matrix).all(axis=0) & np.isfinite(local_t_matrix).all(axis=0)
         if compute_deg_metrics and local_adj_p_vectors and all(vector is not None for vector in local_adj_p_vectors):
@@ -2573,6 +2807,214 @@ def compute_condition_metric_record_from_rows(
                     record["n_valid_replicate_minus_baseline_logfc_pairs_global"] = int(np.isfinite(replicate_minus_baseline_logfc_global).sum())
                     record["n_valid_replicate_minus_baseline_t_pairs_global"] = int(np.isfinite(replicate_minus_baseline_t_global).sum())
                     record[f"n_valid_replicate_minus_baseline_signed_overlap_t_top{top_k}_pairs_global"] = int(np.isfinite(replicate_minus_baseline_overlap_global).sum())
+
+    if compute_normalized_cosine:
+        if population_stats_cache is None:
+            raise ValueError(
+                "Normalized cosine requested without a population-statistics cache"
+            )
+        if (
+            raw_local_logfc_matrix is not None
+            and baseline_source_frame is not None
+            and baseline_context_row_indexes is not None
+        ):
+            context_key = (cell_type, time_key, dose_key)
+            context_indexes = baseline_context_row_indexes.get(context_key)
+            if context_indexes is not None and len(context_indexes) > 0:
+                normalized_context = get_baseline_context_vectors(
+                    context_rows=baseline_source_frame.iloc[
+                        np.asarray(context_indexes, dtype=np.int64)
+                    ].copy(),
+                    context_key=context_key,
+                    local_gene_keys=local_gene_keys,
+                    global_gene_keys=global_gene_keys,
+                    open_adatas=open_adatas,
+                    cache=baseline_context_vector_cache,
+                )
+                peer_row_mask = (
+                    normalized_context.rows["pubchem_cid"].astype(str).to_numpy()
+                    != pubchem_cid
+                )
+                same_compound_mask = ~peer_row_mask
+                for scope in ("raw", *normalization_scopes):
+                    suffix = (
+                        "raw"
+                        if scope == "raw"
+                        else (
+                            "dataset"
+                            if scope == DATASET_SCOPE
+                            else "dataset_cell_type"
+                        )
+                    )
+                    metric_suffix = (
+                        "raw" if scope == "raw" else f"normalized_{suffix}"
+                    )
+                    if scope == "raw":
+                        normalized_replicates = raw_local_logfc_matrix
+                        normalized_context_matrix = normalized_context.local_logfc
+                        normalized_totals = normalized_context.finite_totals[
+                            "local_logfc"
+                        ]
+                    else:
+                        population_stats = population_stats_cache.get(
+                            dataset_name=dataset_name,
+                            cell_type=cell_type,
+                            scope=scope,
+                        )
+                        normalized_replicates = normalized_matrix_for_stats(
+                            raw_local_logfc_matrix,
+                            gene_keys=local_gene_keys,
+                            stats_record=population_stats,
+                        )
+                        normalized_context_matrix = (
+                            normalized_context.normalized_local_logfc.get(scope)
+                        )
+                        if normalized_context_matrix is None:
+                            normalized_context_matrix = normalized_matrix_for_stats(
+                                normalized_context.local_logfc,
+                                gene_keys=local_gene_keys,
+                                stats_record=population_stats,
+                            )
+                            normalized_context.normalized_local_logfc[scope] = (
+                                normalized_context_matrix
+                            )
+                            normalized_context.normalized_finite_totals[scope] = (
+                                finite_column_totals(normalized_context_matrix)
+                            )
+                        normalized_totals = (
+                            normalized_context.normalized_finite_totals[scope]
+                        )
+                    record[f"n_cosine_genes_{suffix}"] = int(
+                        normalized_replicates.shape[1]
+                    )
+                    if (
+                        normalized_replicates.shape[1] < 2
+                        or not peer_row_mask.any()
+                    ):
+                        continue
+                    observed_values = np.asarray(
+                        [
+                            vector_cosine_similarity(
+                                normalized_replicates[left_idx],
+                                normalized_replicates[right_idx],
+                            )
+                            for left_idx, right_idx in pair_indices
+                        ],
+                        dtype=np.float64,
+                    )
+                    centroid = exact_mean_excluding_row_mask(
+                        normalized_context_matrix,
+                        same_compound_mask,
+                        total_sums=normalized_totals[0],
+                        total_counts=normalized_totals[1],
+                    )
+                    replicate_centroid_values, _ = (
+                        pairwise_replicate_baseline_values(
+                            normalized_replicates,
+                            centroid,
+                            pair_indices=pair_indices,
+                            scorer=vector_cosine_similarity,
+                        )
+                    )
+                    record[
+                        f"mean_replicate_cosine_logfc_{metric_suffix}"
+                    ] = mean_available(observed_values)
+                    record[
+                        f"mean_replicate_baseline_cosine_logfc_{metric_suffix}"
+                    ] = mean_available(replicate_centroid_values)
+                    record[
+                        f"mean_replicate_minus_baseline_cosine_logfc_{metric_suffix}"
+                    ] = mean_available(
+                        observed_values - replicate_centroid_values
+                    )
+                    record[
+                        f"n_valid_replicate_cosine_pairs_{metric_suffix}"
+                    ] = int(np.isfinite(observed_values).sum())
+
+                    peer_context_positions = np.flatnonzero(
+                        peer_row_mask
+                        & np.isfinite(normalized_context_matrix).any(axis=1)
+                    )
+                    selected = select_peer_indices(
+                        int(peer_context_positions.size),
+                        MAX_BASELINE_PEERS,
+                        peer_seed_key,
+                        sampling_seed=PEER_SAMPLING_SEED,
+                    )
+                    scored_positions = peer_context_positions[selected]
+                    peer_matrix = normalized_context_matrix[scored_positions]
+                    if not compute_baseline_metrics:
+                        record["n_peer_rows_total"] = int(peer_row_mask.sum())
+                        record["n_peer_rows_available"] = int(
+                            peer_context_positions.size
+                        )
+                        record["n_peer_rows_scored"] = int(peer_matrix.shape[0])
+                    peer_fields: dict[str, list[float]] = defaultdict(list)
+                    peer_deltas: list[float] = []
+                    for pair_position, (left_idx, right_idx) in enumerate(
+                        pair_indices
+                    ):
+                        pair_summary = replicate_pair_peer_summary(
+                            cosine_against_peers(
+                                normalized_replicates[left_idx], peer_matrix
+                            ),
+                            cosine_against_peers(
+                                normalized_replicates[right_idx], peer_matrix
+                            ),
+                            float(observed_values[pair_position]),
+                            "peer",
+                        )
+                        for field_name, field_value in pair_summary.items():
+                            peer_fields[field_name].append(float(field_value))
+                        peer_deltas.append(
+                            difference_if_both_defined(
+                                float(observed_values[pair_position]),
+                                float(pair_summary["peer_mean_score"]),
+                            )
+                        )
+                    record[
+                        f"mean_peer_baseline_cosine_logfc_{metric_suffix}"
+                    ] = mean_available(
+                        np.asarray(peer_fields["peer_mean_score"], dtype=np.float64)
+                    )
+                    record[
+                        f"mean_peer_baseline_sd_cosine_logfc_{metric_suffix}"
+                    ] = mean_available(
+                        np.asarray(peer_fields["peer_sd_score"], dtype=np.float64)
+                    )
+                    record[
+                        "mean_peer_baseline_fraction_below_observed_cosine_logfc_"
+                        f"{metric_suffix}"
+                    ] = mean_available(
+                        np.asarray(
+                            peer_fields["peer_fraction_below_observed"],
+                            dtype=np.float64,
+                        )
+                    )
+                    record[
+                        "mean_peer_baseline_corrected_percentile_cosine_logfc_"
+                        f"{metric_suffix}"
+                    ] = mean_available(
+                        np.asarray(
+                            peer_fields["peer_corrected_percentile"],
+                            dtype=np.float64,
+                        )
+                    )
+                    record[
+                        f"mean_replicate_minus_peer_baseline_cosine_logfc_{metric_suffix}"
+                    ] = mean_available(
+                        np.asarray(peer_deltas, dtype=np.float64)
+                    )
+                    record[
+                        f"n_valid_peer_cosine_pairs_{metric_suffix}"
+                    ] = int(
+                        np.isfinite(
+                            np.asarray(
+                                peer_fields["peer_mean_score"],
+                                dtype=np.float64,
+                            )
+                        ).sum()
+                    )
 
     if (
         compute_deg_metrics
@@ -3398,6 +3840,9 @@ def prepare(
     compute_baseline_metrics: bool = False,
     compute_deg_metrics: bool = False,
     compute_retrieval_metrics: bool = False,
+    compute_normalized_cosine: bool = False,
+    normalization_scales: str = "all",
+    population_stats_root: Path = DEFAULT_POPULATION_STATS_ROOT,
     min_retrieval_compounds_per_line_time: int = DEFAULT_MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME,
     max_baseline_peers: Optional[int] = 512,
     peer_sampling_seed: int = DEFAULT_PEER_SAMPLING_SEED,
@@ -3628,6 +4073,32 @@ def prepare(
         )
         for dataset_name in active_datasets
     }
+    if compute_normalized_cosine:
+        cache_reader = ReplicatePopulationStatsCache(population_stats_root)
+        requested_scopes = resolve_normalization_scopes(normalization_scales)
+        missing_caches: list[str] = []
+        for dataset_name, cell_types in retained_lines.items():
+            for cell_type in cell_types:
+                for scope in requested_scopes:
+                    try:
+                        cache_reader.get(
+                            dataset_name=dataset_name,
+                            cell_type=cell_type,
+                            scope=scope,
+                        )
+                    except (FileNotFoundError, ValueError) as exc:
+                        missing_caches.append(
+                            f"- {dataset_name}/{cell_type}/{scope}: {exc}"
+                        )
+        if missing_caches:
+            raise FileNotFoundError(
+                "Required population-normalization caches are unavailable:\n"
+                + "\n".join(missing_caches)
+                + "\nPrecompute them before scoring:\n"
+                + "uv run python scripts/precompute_population_zscore.py "
+                + "--all-configured --scope both "
+                + f"--cache-root {Path(population_stats_root)}"
+            )
     line_global_shared_gene_keys = set_line_global_shared_gene_keys(
         retained_lines,
         active_datasets,
@@ -3652,6 +4123,9 @@ def prepare(
             "compute_baseline_metrics": bool(compute_baseline_metrics),
             "compute_deg_metrics": bool(compute_deg_metrics),
             "compute_retrieval_metrics": bool(compute_retrieval_metrics),
+            "compute_normalized_cosine": bool(compute_normalized_cosine),
+            "normalization_scales": str(normalization_scales),
+            "population_stats_root": str(Path(population_stats_root).resolve()),
             "min_retrieval_compounds_per_line_time": int(min_retrieval_compounds_per_line_time),
             "max_baseline_peers": (
                 int(max_baseline_peers) if max_baseline_peers is not None else None
@@ -3714,6 +4188,9 @@ def run_task(
     compute_baseline_metrics: bool,
     compute_deg_metrics: bool,
     compute_retrieval_metrics: bool,
+    compute_normalized_cosine: bool,
+    normalization_scales: str,
+    population_stats_root: Path,
     min_retrieval_compounds_per_line_time: int,
 ) -> None:
     saved_config = (
@@ -3765,7 +4242,11 @@ def run_task(
     full_dataset_source_frame: Optional[pd.DataFrame] = None
     baseline_source_frame: Optional[pd.DataFrame] = None
     baseline_context_row_indexes: Optional[dict[tuple[str, str, str], np.ndarray]] = None
-    if compute_baseline_metrics or compute_retrieval_metrics:
+    if (
+        compute_baseline_metrics
+        or compute_retrieval_metrics
+        or compute_normalized_cosine
+    ):
         full_dataset_source_frame = pd.read_csv(
             dataset_metadata_cache_path(output_dir, dataset_name),
             sep="\t",
@@ -3775,7 +4256,9 @@ def run_task(
         full_dataset_source_frame = full_dataset_source_frame.loc[
             full_dataset_source_frame["condition_key"].astype(str).isin(retained_condition_keys)
         ].copy()
-    if compute_baseline_metrics and full_dataset_source_frame is not None:
+    if (
+        compute_baseline_metrics or compute_normalized_cosine
+    ) and full_dataset_source_frame is not None:
         baseline_source_frame = full_dataset_source_frame.copy()
         task_contexts = conditions_frame[["cell_type", "time_key", "dose_key"]].drop_duplicates().copy()
         baseline_source_frame = baseline_source_frame.merge(
@@ -3795,6 +4278,14 @@ def run_task(
     baseline_context_vector_cache: dict[
         tuple[object, ...], BaselineContextVectors
     ] = {}
+    population_stats_cache = (
+        ReplicatePopulationStatsCache(population_stats_root)
+        if compute_normalized_cosine
+        else None
+    )
+    normalization_scope_values = resolve_normalization_scopes(
+        normalization_scales
+    )
     metric_records: list[dict[str, object]] = []
     error_records: list[dict[str, object]] = []
     retrieval_condition_summary = pd.DataFrame()
@@ -3828,6 +4319,9 @@ def run_task(
                     top_k=top_k,
                     compute_deg_metrics=compute_deg_metrics,
                     compute_baseline_metrics=compute_baseline_metrics,
+                    compute_normalized_cosine=compute_normalized_cosine,
+                    normalization_scopes=normalization_scope_values,
+                    population_stats_cache=population_stats_cache,
                     baseline_source_frame=baseline_source_frame,
                     baseline_context_row_indexes=baseline_context_row_indexes,
                     baseline_context_vector_cache=baseline_context_vector_cache,
@@ -4230,6 +4724,34 @@ def drop_duplicate_condition_rows(frame: pd.DataFrame) -> pd.DataFrame:
     return frame.reset_index(drop=True)
 
 
+def overlay_condition_metric_rows(
+    current: pd.DataFrame,
+    existing: pd.DataFrame,
+) -> pd.DataFrame:
+    """Overlay new metric columns without erasing reusable existing values."""
+    key_options = [
+        ["dataset_name", "condition_key"],
+        ["dataset_name", "cell_type", "pubchem_cid", "time_key", "dose_key"],
+    ]
+    keys = next(
+        (
+            columns
+            for columns in key_options
+            if all(column in current.columns and column in existing.columns for column in columns)
+        ),
+        None,
+    )
+    if keys is None:
+        raise KeyError(
+            "Existing and current condition metrics have no compatible identity key"
+        )
+    current_unique = current.drop_duplicates(subset=keys, keep="last").set_index(keys)
+    existing_unique = existing.drop_duplicates(subset=keys, keep="last").set_index(keys)
+    # DataFrame.combine_first keeps each newly computed non-missing value and
+    # fills only its gaps (including entirely absent columns) from the old run.
+    return current_unique.combine_first(existing_unique).reset_index()
+
+
 def drop_duplicate_retrieval_rows(frame: pd.DataFrame) -> pd.DataFrame:
     duplicate_key_options = [
         ["dataset_name", "representation", "condition_key"],
@@ -4259,6 +4781,9 @@ def merge_task_outputs(
     expect_baseline_metrics = bool(config.get("compute_baseline_metrics", False))
     expect_deg_metrics = bool(config.get("compute_deg_metrics", False))
     expect_retrieval_metrics = bool(config.get("compute_retrieval_metrics", False))
+    expect_normalized_cosine = bool(
+        config.get("compute_normalized_cosine", False)
+    )
     expected_peer_config_fingerprint = config_fingerprint(config) if config else None
     existing_results_dir = existing_results_dir.resolve() if existing_results_dir is not None else None
     current_dataset_names = read_dataset_names_from_selection_summary(output_dir)
@@ -4270,6 +4795,7 @@ def merge_task_outputs(
     all_dataset_names = combine_ordered_unique_names(existing_dataset_names, current_dataset_names) or None
 
     metric_frames: list[pd.DataFrame] = []
+    existing_condition_metric = pd.DataFrame()
     error_frames: list[pd.DataFrame] = []
     retrieval_condition_frames: list[pd.DataFrame] = []
     missing_task_outputs: list[dict[str, object]] = []
@@ -4282,9 +4808,8 @@ def merge_task_outputs(
             )
         existing_condition_metric = read_optional_tsv(existing_condition_metric_path)
         if not existing_condition_metric.empty:
-            metric_frames.append(existing_condition_metric)
             print(
-                "Loaded existing condition-level metric summary from "
+                "Loaded existing condition-level metrics for column-wise reuse from "
                 f"{existing_condition_metric_path}"
             )
 
@@ -4358,6 +4883,11 @@ def merge_task_outputs(
 
     condition_metric_summary = pd.concat(metric_frames, ignore_index=True)
     condition_metric_summary = drop_duplicate_condition_rows(condition_metric_summary)
+    if not existing_condition_metric.empty:
+        condition_metric_summary = overlay_condition_metric_rows(
+            condition_metric_summary,
+            existing_condition_metric,
+        )
     condition_metric_summary = coerce_non_identifier_columns_to_numeric(
         condition_metric_summary,
         identifier_columns={
@@ -4374,6 +4904,26 @@ def merge_task_outputs(
     condition_metric_summary = condition_metric_summary.sort_values(
         ["dataset_name", "cell_type", "pubchem_cid", "time_key", "dose_key"]
     ).reset_index(drop=True)
+    if expect_normalized_cosine:
+        expected_normalized_columns = {
+            (
+                "mean_replicate_cosine_logfc_normalized_dataset"
+                if scope == DATASET_SCOPE
+                else "mean_replicate_cosine_logfc_normalized_dataset_cell_type"
+            )
+            for scope in resolve_normalization_scopes(
+                str(config.get("normalization_scales", "all"))
+            )
+        }
+        missing_normalized_columns = sorted(
+            expected_normalized_columns - set(condition_metric_summary.columns)
+        )
+        if missing_normalized_columns:
+            raise ValueError(
+                "Normalized cosine was requested in the saved prepare config, "
+                "but merged task outputs are missing columns: "
+                f"{missing_normalized_columns}. Rerun the scoring tasks."
+            )
     condition_metric_summary_path = output_dir / "condition_metric_summary.tsv"
     condition_metric_summary.to_csv(condition_metric_summary_path, sep="\t", index=False)
     print(f"Saved condition-level metric summary to {condition_metric_summary_path}")
@@ -4587,6 +5137,9 @@ def _run_prepared_task_worker(payload: dict[str, object]) -> int:
         compute_baseline_metrics=bool(payload["compute_baseline_metrics"]),
         compute_deg_metrics=bool(payload["compute_deg_metrics"]),
         compute_retrieval_metrics=bool(payload["compute_retrieval_metrics"]),
+        compute_normalized_cosine=bool(payload["compute_normalized_cosine"]),
+        normalization_scales=str(payload["normalization_scales"]),
+        population_stats_root=Path(str(payload["population_stats_root"])),
         min_retrieval_compounds_per_line_time=int(
             payload["min_retrieval_compounds_per_line_time"]
         ),
@@ -4607,6 +5160,9 @@ def run_all(args: argparse.Namespace) -> None:
         compute_baseline_metrics=args.compute_baseline_metrics,
         compute_deg_metrics=args.compute_deg_metrics,
         compute_retrieval_metrics=args.compute_retrieval_metrics,
+        compute_normalized_cosine=args.compute_normalized_cosine,
+        normalization_scales=args.normalization_scales,
+        population_stats_root=args.population_stats_root,
         min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
         max_baseline_peers=args.max_baseline_peers,
         peer_sampling_seed=args.peer_sampling_seed,
@@ -4626,6 +5182,9 @@ def run_all(args: argparse.Namespace) -> None:
         "compute_baseline_metrics": bool(args.compute_baseline_metrics),
         "compute_deg_metrics": bool(args.compute_deg_metrics),
         "compute_retrieval_metrics": bool(args.compute_retrieval_metrics),
+        "compute_normalized_cosine": bool(args.compute_normalized_cosine),
+        "normalization_scales": str(args.normalization_scales),
+        "population_stats_root": str(Path(args.population_stats_root).resolve()),
         "min_retrieval_compounds_per_line_time": int(
             args.min_retrieval_compounds_per_line_time
         ),
@@ -4678,7 +5237,7 @@ def run_all(args: argparse.Namespace) -> None:
         task_output_dir_path=prepare_result.task_output_dir,
         top_k=args.top_k,
         strict_missing=True,
-        existing_results_dir=None,
+        existing_results_dir=args.existing_results_dir,
     )
 
 
@@ -4712,6 +5271,9 @@ def main() -> None:
             compute_baseline_metrics=args.compute_baseline_metrics,
             compute_deg_metrics=args.compute_deg_metrics,
             compute_retrieval_metrics=args.compute_retrieval_metrics,
+            compute_normalized_cosine=args.compute_normalized_cosine,
+            normalization_scales=args.normalization_scales,
+            population_stats_root=args.population_stats_root,
             min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
             max_baseline_peers=args.max_baseline_peers,
             peer_sampling_seed=args.peer_sampling_seed,
@@ -4733,6 +5295,9 @@ def main() -> None:
             compute_baseline_metrics=args.compute_baseline_metrics,
             compute_deg_metrics=args.compute_deg_metrics,
             compute_retrieval_metrics=args.compute_retrieval_metrics,
+            compute_normalized_cosine=args.compute_normalized_cosine,
+            normalization_scales=args.normalization_scales,
+            population_stats_root=args.population_stats_root,
             min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
         )
         return

@@ -826,6 +826,50 @@ def _load_cache(
     return stats
 
 
+def load_population_stats_cache(
+    *,
+    cache_path: Path,
+    dataset_name: str,
+    cell_type: str,
+    expected_scope: str,
+) -> PopulationGeneStats:
+    """Load an existing population-statistics cache without fitting anything.
+
+    This is the read-only entry point for downstream scorers that consume caches
+    produced by ``precompute_population_zscore.py``.  Compatibility is still
+    checked against the fingerprint and scope recorded beside the NPZ.
+    """
+    cache_path = Path(cache_path)
+    metadata_path = _metadata_path(cache_path)
+    try:
+        metadata = json.loads(metadata_path.read_text())
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Population-statistics metadata not found: {metadata_path}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Population-statistics metadata is invalid JSON: {metadata_path}"
+        ) from exc
+    fingerprint = metadata.get("fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint:
+        raise ValueError(
+            f"Population-statistics metadata has no fingerprint: {metadata_path}"
+        )
+    stats = _load_cache(
+        cache_path=cache_path,
+        expected_fingerprint=fingerprint,
+        dataset_name=str(dataset_name),
+        cell_type=str(cell_type),
+        expected_scope=str(expected_scope),
+    )
+    if stats is None:
+        raise ValueError(
+            f"Population-statistics cache is missing or incompatible: {cache_path}"
+        )
+    return stats
+
+
 def _unchanged_source_cache_metadata(
     *,
     cache_path: Path,
