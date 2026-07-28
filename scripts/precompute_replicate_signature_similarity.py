@@ -8,6 +8,7 @@ import json
 import multiprocessing
 import os
 import sys
+import time
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
@@ -181,6 +182,7 @@ DEG_DEFINITION_CONFIG = {
         "require_abs_logfc": True,
     },
 }
+ACTIVE_DEG_DEFINITIONS = tuple(DEG_DEFINITION_CONFIG)
 ADJ_PVALUE_LAYER_PREFERENCES = (
     "adj.P.Value.within_one_contrast",
     "adj.P.Value.across_all_contrasts",
@@ -353,6 +355,15 @@ def add_common_run_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--deg-definitions",
+        choices=("all", "p05", "p05_lfc02"),
+        default="all",
+        help=(
+            "DEG definitions to compute. Tables 7 and 8 require only p05; "
+            "use all to preserve the full legacy sensitivity bundle."
+        ),
+    )
+    parser.add_argument(
         "--compute-retrieval-metrics",
         action="store_true",
         help=(
@@ -453,6 +464,14 @@ def build_parser() -> argparse.ArgumentParser:
             "computed non-missing fields take precedence; other columns are reused."
         ),
     )
+    run_all_parser.add_argument(
+        "--prepared-only",
+        action="store_true",
+        help=(
+            "Reuse the existing task manifest and inputs in --output-dir instead "
+            "of rescanning metadata. Completed nonempty task shards are skipped."
+        ),
+    )
 
     prepare_parser = subparsers.add_parser(
         "prepare",
@@ -481,6 +500,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         required=True,
         help="Maximum number of retained conditions to score in one task shard.",
+    )
+    reshard_parser.add_argument(
+        "--deg-definitions",
+        choices=("all", "p05", "p05_lfc02"),
+        default=None,
+        help=(
+            "Optionally update the DEG workload recorded in task_config.json while "
+            "resharding. Tables 7 and 8 require only p05."
+        ),
     )
 
     run_task_parser = subparsers.add_parser(
@@ -532,6 +560,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Also compute DEG-focused replicate metrics using adjusted p-value thresholds "
             "and baseline comparisons on the same line / time / dose other-drug baseline."
         ),
+    )
+    run_task_parser.add_argument(
+        "--deg-definitions",
+        choices=("all", "p05", "p05_lfc02"),
+        default="all",
     )
     run_task_parser.add_argument(
         "--compute-retrieval-metrics",
@@ -912,6 +945,15 @@ def resolve_normalization_scopes(value: str) -> tuple[str, ...]:
     raise ValueError(
         "--normalization-scales must be all, dataset, or dataset-cell-type"
     )
+
+
+def resolve_deg_definitions(value: str) -> tuple[str, ...]:
+    normalized = str(value).strip().lower()
+    if normalized == "all":
+        return tuple(DEG_DEFINITION_CONFIG)
+    if normalized in DEG_DEFINITION_CONFIG:
+        return (normalized,)
+    raise ValueError("--deg-definitions must be all, p05, or p05_lfc02")
 
 
 def negative_l2_similarity_matrix(query_matrix: np.ndarray, candidate_matrix: np.ndarray) -> np.ndarray:
@@ -2517,7 +2559,7 @@ def compute_condition_metric_record_from_rows(
 
     raw_local_logfc_matrix: Optional[np.ndarray] = None
     if compute_deg_metrics:
-        for definition_key in DEG_DEFINITION_CONFIG:
+        for definition_key in ACTIVE_DEG_DEFINITIONS:
             for metric_name in deg_metric_names():
                 for prefix in [
                     "mean_replicate",
@@ -2801,17 +2843,19 @@ def compute_condition_metric_record_from_rows(
                         )
                         peer_summary_fields: dict[str, list[float]] = defaultdict(list)
                         peer_delta_values: list[float] = []
+                        peer_scores_by_replicate: dict[int, np.ndarray] = {}
                         for pair_position, (left_idx, right_idx) in enumerate(pair_indices):
-                            left_peer_scores = spearman_against_prepared_peers(
-                                local_logfc_matrix[left_idx],
-                                local_peer_logfc_prepared,
-                                row_indices=scored_context_positions,
-                            )
-                            right_peer_scores = spearman_against_prepared_peers(
-                                local_logfc_matrix[right_idx],
-                                local_peer_logfc_prepared,
-                                row_indices=scored_context_positions,
-                            )
+                            for replicate_idx in (left_idx, right_idx):
+                                if replicate_idx not in peer_scores_by_replicate:
+                                    peer_scores_by_replicate[replicate_idx] = (
+                                        spearman_against_prepared_peers(
+                                            local_logfc_matrix[replicate_idx],
+                                            local_peer_logfc_prepared,
+                                            row_indices=scored_context_positions,
+                                        )
+                                    )
+                            left_peer_scores = peer_scores_by_replicate[left_idx]
+                            right_peer_scores = peer_scores_by_replicate[right_idx]
                             observed_value = (
                                 float(logfc_values[pair_position])
                                 if pair_position < len(logfc_values)
@@ -3070,20 +3114,22 @@ def compute_condition_metric_record_from_rows(
                         record["n_peer_rows_scored"] = int(peer_matrix.shape[0])
                     peer_fields: dict[str, list[float]] = defaultdict(list)
                     peer_deltas: list[float] = []
+                    cosine_peer_scores_by_replicate: dict[int, np.ndarray] = {}
                     for pair_position, (left_idx, right_idx) in enumerate(
                         pair_indices
                     ):
+                        for replicate_idx in (left_idx, right_idx):
+                            if replicate_idx not in cosine_peer_scores_by_replicate:
+                                cosine_peer_scores_by_replicate[replicate_idx] = (
+                                    cosine_against_peers(
+                                        normalized_replicates[replicate_idx],
+                                        peer_matrix,
+                                        peer_norms=selected_peer_norms,
+                                    )
+                                )
                         pair_summary = replicate_pair_peer_summary(
-                            cosine_against_peers(
-                                normalized_replicates[left_idx],
-                                peer_matrix,
-                                peer_norms=selected_peer_norms,
-                            ),
-                            cosine_against_peers(
-                                normalized_replicates[right_idx],
-                                peer_matrix,
-                                peer_norms=selected_peer_norms,
-                            ),
+                            cosine_peer_scores_by_replicate[left_idx],
+                            cosine_peer_scores_by_replicate[right_idx],
                             float(observed_values[pair_position]),
                             "peer",
                         )
@@ -3146,7 +3192,7 @@ def compute_condition_metric_record_from_rows(
         and local_logfc_matrix.shape[1] >= 2
         and local_adj_p_matrix.shape[1] >= 2
     ):
-        for definition_key in DEG_DEFINITION_CONFIG:
+        for definition_key in ACTIVE_DEG_DEFINITIONS:
             observed_values_by_metric = {
                 metric_name: []
                 for metric_name in deg_metric_names()
@@ -3163,6 +3209,10 @@ def compute_condition_metric_record_from_rows(
                 metric_name: defaultdict(list)
                 for metric_name in PEER_BASELINE_DEG_METRICS
             }
+            deg_masks_by_replicate: dict[int, np.ndarray] = {}
+            deg_peer_scores_by_replicate: dict[
+                tuple[int, str], np.ndarray
+            ] = {}
 
             for left_idx, right_idx in pair_indices:
                 observed_metrics = compute_observed_deg_metrics_for_pair(
@@ -3218,39 +3268,37 @@ def compute_condition_metric_record_from_rows(
                 # replicate's own DEG mask defines the evaluation genes, exactly as the
                 # centroid baseline does in compute_sample_baseline_deg_metrics.
                 if local_peer_logfc_matrix is not None and local_peer_logfc_matrix.shape[0] > 0:
-                    left_deg_mask = deg_mask(
-                        local_logfc_matrix[left_idx],
-                        local_adj_p_matrix[left_idx],
-                        definition_key,
-                    )
-                    right_deg_mask = deg_mask(
-                        local_logfc_matrix[right_idx],
-                        local_adj_p_matrix[right_idx],
-                        definition_key,
-                    )
+                    for replicate_idx in (left_idx, right_idx):
+                        if replicate_idx not in deg_masks_by_replicate:
+                            deg_masks_by_replicate[replicate_idx] = deg_mask(
+                                local_logfc_matrix[replicate_idx],
+                                local_adj_p_matrix[replicate_idx],
+                                definition_key,
+                            )
                     for metric_name in PEER_BASELINE_DEG_METRICS:
-                        if metric_name == "deg_lfc_spearman_sym":
-                            left_peer_scores = spearman_against_peers(
-                                local_logfc_matrix[left_idx],
-                                local_peer_logfc_matrix,
-                                left_deg_mask,
-                            )
-                            right_peer_scores = spearman_against_peers(
-                                local_logfc_matrix[right_idx],
-                                local_peer_logfc_matrix,
-                                right_deg_mask,
-                            )
-                        else:
-                            left_peer_scores = direction_agreement_against_peers(
-                                local_logfc_matrix[left_idx],
-                                local_peer_logfc_matrix,
-                                left_deg_mask,
-                            )
-                            right_peer_scores = direction_agreement_against_peers(
-                                local_logfc_matrix[right_idx],
-                                local_peer_logfc_matrix,
-                                right_deg_mask,
-                            )
+                        for replicate_idx in (left_idx, right_idx):
+                            cache_key = (replicate_idx, metric_name)
+                            if cache_key in deg_peer_scores_by_replicate:
+                                continue
+                            if metric_name == "deg_lfc_spearman_sym":
+                                scores = spearman_against_peers(
+                                    local_logfc_matrix[replicate_idx],
+                                    local_peer_logfc_matrix,
+                                    deg_masks_by_replicate[replicate_idx],
+                                )
+                            else:
+                                scores = direction_agreement_against_peers(
+                                    local_logfc_matrix[replicate_idx],
+                                    local_peer_logfc_matrix,
+                                    deg_masks_by_replicate[replicate_idx],
+                                )
+                            deg_peer_scores_by_replicate[cache_key] = scores
+                        left_peer_scores = deg_peer_scores_by_replicate[
+                            (left_idx, metric_name)
+                        ]
+                        right_peer_scores = deg_peer_scores_by_replicate[
+                            (right_idx, metric_name)
+                        ]
                         observed_value = float(observed_metrics[metric_name])
                         pair_peer_summary = replicate_pair_peer_summary(
                             left_peer_scores,
@@ -3962,6 +4010,7 @@ def prepare(
     test_max_conditions_per_dataset: int = 0,
     compute_baseline_metrics: bool = False,
     compute_deg_metrics: bool = False,
+    deg_definitions: str = "all",
     compute_retrieval_metrics: bool = False,
     compute_normalized_cosine: bool = False,
     normalization_scales: str = "all",
@@ -4245,6 +4294,9 @@ def prepare(
             "test_max_conditions_per_dataset": int(test_max_conditions_per_dataset),
             "compute_baseline_metrics": bool(compute_baseline_metrics),
             "compute_deg_metrics": bool(compute_deg_metrics),
+            "deg_definitions": ",".join(
+                resolve_deg_definitions(deg_definitions)
+            ),
             "compute_retrieval_metrics": bool(compute_retrieval_metrics),
             "compute_normalized_cosine": bool(compute_normalized_cosine),
             "normalization_scales": str(normalization_scales),
@@ -4270,7 +4322,12 @@ def prepare(
     )
 
 
-def reshard(output_dir: Path, *, conditions_per_task: int) -> ReshardResult:
+def reshard(
+    output_dir: Path,
+    *,
+    conditions_per_task: int,
+    deg_definitions: Optional[str] = None,
+) -> ReshardResult:
     retained_conditions_path = output_dir / "retained_replicate_conditions.tsv"
     if not retained_conditions_path.exists():
         raise FileNotFoundError(f"Retained condition inventory not found: {retained_conditions_path}")
@@ -4292,6 +4349,10 @@ def reshard(output_dir: Path, *, conditions_per_task: int) -> ReshardResult:
     else:
         config = {}
     config["conditions_per_task"] = int(conditions_per_task)
+    if deg_definitions is not None:
+        config["deg_definitions"] = ",".join(
+            resolve_deg_definitions(deg_definitions)
+        )
     write_task_config(config_path, config)
     print(f"Updated task config at {config_path}")
     return ReshardResult(
@@ -4323,6 +4384,7 @@ def run_task(
     )
     saved_config = {
         **saved_config,
+        "deg_definitions": ",".join(ACTIVE_DEG_DEFINITIONS),
         "max_baseline_peers": (
             int(MAX_BASELINE_PEERS) if MAX_BASELINE_PEERS is not None else None
         ),
@@ -4348,10 +4410,18 @@ def run_task(
 
     global_gene_keys = load_line_global_gene_keys(line_global_gene_keys_path(output_dir))
     dataset_name = str(task_row["dataset_name"])
+    task_started_at = time.monotonic()
+    print(
+        f"[task {int(task_id):06d}] started dataset={dataset_name} "
+        f"conditions={len(conditions_frame):,} "
+        f"replicate_rows={len(replicates_frame):,}",
+        flush=True,
+    )
     replicate_groups = {
         str(condition_key): block.copy().reset_index(drop=True)
         for condition_key, block in replicates_frame.groupby("condition_key", sort=False)
     }
+    progress_interval = max(1, min(25, len(conditions_frame) // 10))
     retained_conditions_all = pd.read_csv(
         output_dir / "retained_replicate_conditions.tsv",
         sep="\t",
@@ -4419,7 +4489,10 @@ def run_task(
         for source_path in sorted(source_paths_to_open):
             open_adatas[source_path] = read_h5ad_safely(source_path, backed="r")
 
-        for _, condition_row in conditions_frame.iterrows():
+        for condition_position, (_, condition_row) in enumerate(
+            conditions_frame.iterrows(),
+            start=1,
+        ):
             condition_key = str(condition_row["condition_key"])
             condition_rows = replicate_groups.get(condition_key)
             if condition_rows is None or condition_rows.empty:
@@ -4471,6 +4544,17 @@ def run_task(
                 record["peer_sampling_seed"] = int(PEER_SAMPLING_SEED)
                 record["peer_config_fingerprint"] = peer_config_fingerprint
                 metric_records.append(record)
+            if (
+                condition_position % progress_interval == 0
+                or condition_position == len(conditions_frame)
+            ):
+                print(
+                    f"[task {int(task_id):06d}] "
+                    f"conditions={condition_position:,}/{len(conditions_frame):,} "
+                    f"scored={len(metric_records):,} errors={len(error_records):,} "
+                    f"elapsed={time.monotonic() - task_started_at:.1f}s",
+                    flush=True,
+                )
 
         if compute_retrieval_metrics and full_dataset_source_frame is not None and not full_dataset_source_frame.empty:
             retrieval_condition_summary = compute_retrieval_condition_task_summary(
@@ -4502,7 +4586,9 @@ def run_task(
 
     print(
         f"Finished task {int(task_id):,}: "
-        f"{len(metric_records):,} scored conditions, {len(error_records):,} errors"
+        f"{len(metric_records):,} scored conditions, {len(error_records):,} errors "
+        f"in {time.monotonic() - task_started_at:.1f}s",
+        flush=True,
     )
 
 
@@ -5244,12 +5330,15 @@ def merge_task_outputs(
 
 def _run_prepared_task_worker(payload: dict[str, object]) -> int:
     """Spawn-safe adapter for one atomic replicate task shard."""
-    global MAX_BASELINE_PEERS, PEER_SAMPLING_SEED
+    global ACTIVE_DEG_DEFINITIONS, MAX_BASELINE_PEERS, PEER_SAMPLING_SEED
     max_peers = payload["max_baseline_peers"]
     MAX_BASELINE_PEERS = (
         None if max_peers is None or int(max_peers) == 0 else int(max_peers)
     )
     PEER_SAMPLING_SEED = int(payload["peer_sampling_seed"])
+    ACTIVE_DEG_DEFINITIONS = resolve_deg_definitions(
+        str(payload["deg_definitions"])
+    )
     task_id = int(payload["task_id"])
     run_task(
         output_dir=Path(str(payload["output_dir"])),
@@ -5282,27 +5371,98 @@ def run_all(args: argparse.Namespace) -> None:
                 "--existing-results-dir must contain condition_metric_summary.tsv; "
                 f"not found: {existing_condition_metrics}"
             )
-    prepare_result = prepare(
-        output_dir=args.output_dir,
-        dataset_arg=args.datasets,
-        min_replicates_per_condition=args.min_replicates_per_condition,
-        conditions_per_task=args.conditions_per_task,
-        test_one_line_per_dataset=args.test_one_line_per_dataset,
-        test_max_conditions_per_dataset=args.test_max_conditions_per_dataset,
-        compute_baseline_metrics=args.compute_baseline_metrics,
-        compute_deg_metrics=args.compute_deg_metrics,
-        compute_retrieval_metrics=args.compute_retrieval_metrics,
-        compute_normalized_cosine=args.compute_normalized_cosine,
-        normalization_scales=args.normalization_scales,
-        population_stats_root=args.population_stats_root,
-        min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
-        max_baseline_peers=args.max_baseline_peers,
-        peer_sampling_seed=args.peer_sampling_seed,
-    )
+    if args.prepared_only:
+        prepare_result = PrepareResult(
+            output_dir=args.output_dir,
+            task_manifest_path=task_manifest_path(args.output_dir),
+            task_output_dir=task_output_dir(args.output_dir),
+        )
+        if not prepare_result.task_manifest_path.is_file():
+            raise FileNotFoundError(
+                "--prepared-only requires an existing task manifest: "
+                f"{prepare_result.task_manifest_path}"
+            )
+        config = load_task_config(task_config_path(args.output_dir))
+        requested_config = {
+            "compute_baseline_metrics": bool(args.compute_baseline_metrics),
+            "compute_deg_metrics": bool(args.compute_deg_metrics),
+            "deg_definitions": ",".join(
+                resolve_deg_definitions(args.deg_definitions)
+            ),
+            "compute_retrieval_metrics": bool(args.compute_retrieval_metrics),
+            "compute_normalized_cosine": bool(args.compute_normalized_cosine),
+            "normalization_scales": str(args.normalization_scales),
+            "population_stats_root": str(
+                Path(args.population_stats_root).resolve()
+            ),
+            "min_retrieval_compounds_per_line_time": int(
+                args.min_retrieval_compounds_per_line_time
+            ),
+            "max_baseline_peers": (
+                None
+                if args.max_baseline_peers is None
+                else int(args.max_baseline_peers)
+            ),
+            "peer_sampling_seed": int(args.peer_sampling_seed),
+        }
+        mismatches = {
+            key: (config.get(key), value)
+            for key, value in requested_config.items()
+            if config.get(key) != value
+        }
+        if mismatches:
+            mismatch_lines = "\n".join(
+                f"- {key}: prepared={prepared!r}, requested={requested!r}"
+                for key, (prepared, requested) in mismatches.items()
+            )
+            raise ValueError(
+                "Prepared task configuration does not match this run:\n"
+                f"{mismatch_lines}\nReshard or prepare with the requested settings."
+            )
+        print(
+            f"Reusing prepared task manifest {prepare_result.task_manifest_path}",
+            flush=True,
+        )
+    else:
+        prepare_result = prepare(
+            output_dir=args.output_dir,
+            dataset_arg=args.datasets,
+            min_replicates_per_condition=args.min_replicates_per_condition,
+            conditions_per_task=args.conditions_per_task,
+            test_one_line_per_dataset=args.test_one_line_per_dataset,
+            test_max_conditions_per_dataset=args.test_max_conditions_per_dataset,
+            compute_baseline_metrics=args.compute_baseline_metrics,
+            compute_deg_metrics=args.compute_deg_metrics,
+            deg_definitions=args.deg_definitions,
+            compute_retrieval_metrics=args.compute_retrieval_metrics,
+            compute_normalized_cosine=args.compute_normalized_cosine,
+            normalization_scales=args.normalization_scales,
+            population_stats_root=args.population_stats_root,
+            min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
+            max_baseline_peers=args.max_baseline_peers,
+            peer_sampling_seed=args.peer_sampling_seed,
+        )
     manifest = load_task_manifest(prepare_result.task_manifest_path)
     n_tasks = int(len(manifest))
     if n_tasks == 0:
         raise ValueError("No task shards were prepared.")
+    pending_task_ids = [
+        task_idx
+        for task_idx in range(1, n_tasks + 1)
+        if not (
+            task_metrics_path(prepare_result.task_output_dir, task_idx).is_file()
+            and task_metrics_path(
+                prepare_result.task_output_dir, task_idx
+            ).stat().st_size
+            > 0
+        )
+    ]
+    completed_count = n_tasks - len(pending_task_ids)
+    if completed_count:
+        print(
+            f"Reusing {completed_count:,}/{n_tasks:,} completed task shards",
+            flush=True,
+        )
     progress_enabled = args.progress == "always" or (
         args.progress == "auto" and sys.stderr.isatty()
     )
@@ -5313,6 +5473,7 @@ def run_all(args: argparse.Namespace) -> None:
         "top_k": int(args.top_k),
         "compute_baseline_metrics": bool(args.compute_baseline_metrics),
         "compute_deg_metrics": bool(args.compute_deg_metrics),
+        "deg_definitions": str(args.deg_definitions),
         "compute_retrieval_metrics": bool(args.compute_retrieval_metrics),
         "compute_normalized_cosine": bool(args.compute_normalized_cosine),
         "normalization_scales": str(args.normalization_scales),
@@ -5327,6 +5488,7 @@ def run_all(args: argparse.Namespace) -> None:
     }
     progress_bar = tqdm(
         total=n_tasks,
+        initial=completed_count,
         desc="replicate tasks",
         unit="task",
         dynamic_ncols=True,
@@ -5334,7 +5496,7 @@ def run_all(args: argparse.Namespace) -> None:
     )
     try:
         if int(args.workers) == 1:
-            for task_idx in range(1, n_tasks + 1):
+            for task_idx in pending_task_ids:
                 _run_prepared_task_worker(
                     {**common_payload, "task_id": task_idx}
                 )
@@ -5350,7 +5512,7 @@ def run_all(args: argparse.Namespace) -> None:
                         _run_prepared_task_worker,
                         {**common_payload, "task_id": task_idx},
                     ): task_idx
-                    for task_idx in range(1, n_tasks + 1)
+                    for task_idx in pending_task_ids
                 }
                 for future in as_completed(futures):
                     task_idx = futures[future]
@@ -5374,7 +5536,7 @@ def run_all(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    global MAX_BASELINE_PEERS, PEER_SAMPLING_SEED
+    global ACTIVE_DEG_DEFINITIONS, MAX_BASELINE_PEERS, PEER_SAMPLING_SEED
     args = parse_args()
     # Read at call time inside the scoring functions, so setting it here covers every command.
     requested_max_peers = getattr(args, "max_baseline_peers", None)
@@ -5392,6 +5554,9 @@ def main() -> None:
     PEER_SAMPLING_SEED = int(
         getattr(args, "peer_sampling_seed", DEFAULT_PEER_SAMPLING_SEED)
     )
+    ACTIVE_DEG_DEFINITIONS = resolve_deg_definitions(
+        getattr(args, "deg_definitions", "all")
+    )
     if args.command == "prepare":
         prepare(
             output_dir=args.output_dir,
@@ -5402,6 +5567,7 @@ def main() -> None:
             test_max_conditions_per_dataset=args.test_max_conditions_per_dataset,
             compute_baseline_metrics=args.compute_baseline_metrics,
             compute_deg_metrics=args.compute_deg_metrics,
+            deg_definitions=args.deg_definitions,
             compute_retrieval_metrics=args.compute_retrieval_metrics,
             compute_normalized_cosine=args.compute_normalized_cosine,
             normalization_scales=args.normalization_scales,
@@ -5415,6 +5581,7 @@ def main() -> None:
         reshard(
             output_dir=args.output_dir,
             conditions_per_task=args.conditions_per_task,
+            deg_definitions=args.deg_definitions,
         )
         return
     if args.command == "run-task":

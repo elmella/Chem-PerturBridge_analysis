@@ -14,6 +14,7 @@ from scripts.precompute_replicate_signature_similarity import (
     complete_row_norms,
     normalized_matrix_for_stats,
     overlay_condition_metric_rows,
+    resolve_deg_definitions,
     resolve_processed_sep_rep_h5ad,
     resolve_normalization_scopes,
     vector_cosine_similarity,
@@ -81,6 +82,14 @@ class ReplicateNormalizedCosineTests(unittest.TestCase):
         self.assertEqual(
             set(resolve_normalization_scopes("all")),
             {"dataset", "dataset_cell_type"},
+        )
+
+    def test_deg_definition_selection_can_limit_reviewer_workload(self) -> None:
+        self.assertEqual(resolve_deg_definitions("p05"), ("p05",))
+        self.assertEqual(resolve_deg_definitions("p05_lfc02"), ("p05_lfc02",))
+        self.assertEqual(
+            resolve_deg_definitions("all"),
+            tuple(replicate_scoring.DEG_DEFINITION_CONFIG),
         )
 
     def test_overlay_preserves_old_metrics_and_prefers_new_nonmissing_values(self) -> None:
