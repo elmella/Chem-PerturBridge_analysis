@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import hashlib
 import json
+import multiprocessing
 import os
 import sys
 import warnings
@@ -13,10 +15,20 @@ from itertools import combinations
 from pathlib import Path
 from typing import Optional
 
+for _thread_variable in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ[_thread_variable] = "1"
+
 import anndata as ad
 import numpy as np
 import pandas as pd
 from scipy import stats
+from tqdm.auto import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -283,7 +295,7 @@ def add_common_run_args(parser: argparse.ArgumentParser) -> None:
         default=512,
         help=(
             "Cap how many same line / time / dose other-drug peers are scored individually "
-            "for the per-peer baselines. Omit to score every peer. Capped runs record both "
+            "for the per-peer baselines; use 0 to score every peer. Capped runs record both "
             "the total and scored peer counts. The exact centroid always uses every "
             "eligible peer. Default: 512."
         ),
@@ -304,7 +316,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_all_parser = subparsers.add_parser(
         "run-all",
-        help="Run prepare, all tasks, and merge sequentially.",
+        help="Run prepare, all tasks, and merge.",
     )
     add_common_run_args(run_all_parser)
     run_all_parser.add_argument(
@@ -312,6 +324,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=250,
         help="Maximum number of retained conditions to score in one task shard.",
+    )
+    run_all_parser.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        help=(
+            "Spawned task workers. Each worker opens its own read-only H5AD "
+            "handles. Use 1 for deterministic serial debugging. Default: 2."
+        ),
+    )
+    run_all_parser.add_argument(
+        "--progress",
+        choices=("auto", "always", "off"),
+        default="auto",
+        help="Task progress-bar mode.",
     )
 
     prepare_parser = subparsers.add_parser(
@@ -410,8 +437,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=512,
         help=(
             "Cap how many same line / time / dose other-drug peers are scored individually "
-            "for the per-peer baselines. Use a value greater than the available peer "
-            "count to score every peer. The centroid is never capped."
+            "for the per-peer baselines; use 0 to score every peer. The centroid is never "
+            "capped."
         ),
     )
     run_task_parser.add_argument(
@@ -4542,7 +4569,34 @@ def merge_task_outputs(
                 print(f"Removed stale retrieval summary file {stale_path}")
 
 
+def _run_prepared_task_worker(payload: dict[str, object]) -> int:
+    """Spawn-safe adapter for one atomic replicate task shard."""
+    global MAX_BASELINE_PEERS, PEER_SAMPLING_SEED
+    max_peers = payload["max_baseline_peers"]
+    MAX_BASELINE_PEERS = (
+        None if max_peers is None or int(max_peers) == 0 else int(max_peers)
+    )
+    PEER_SAMPLING_SEED = int(payload["peer_sampling_seed"])
+    task_id = int(payload["task_id"])
+    run_task(
+        output_dir=Path(str(payload["output_dir"])),
+        task_file=Path(str(payload["task_file"])),
+        task_id=task_id,
+        task_output_dir_path=Path(str(payload["task_output_dir"])),
+        top_k=int(payload["top_k"]),
+        compute_baseline_metrics=bool(payload["compute_baseline_metrics"]),
+        compute_deg_metrics=bool(payload["compute_deg_metrics"]),
+        compute_retrieval_metrics=bool(payload["compute_retrieval_metrics"]),
+        min_retrieval_compounds_per_line_time=int(
+            payload["min_retrieval_compounds_per_line_time"]
+        ),
+    )
+    return task_id
+
+
 def run_all(args: argparse.Namespace) -> None:
+    if int(args.workers) < 1:
+        raise ValueError("--workers must be positive")
     prepare_result = prepare(
         output_dir=args.output_dir,
         dataset_arg=args.datasets,
@@ -4561,20 +4615,63 @@ def run_all(args: argparse.Namespace) -> None:
     n_tasks = int(len(manifest))
     if n_tasks == 0:
         raise ValueError("No task shards were prepared.")
-    for task_idx in range(1, n_tasks + 1):
-        if task_idx == 1 or task_idx % int(args.progress_every) == 0:
-            print(f"Running prepared task {task_idx:,} / {n_tasks:,}")
-        run_task(
-            output_dir=args.output_dir,
-            task_file=prepare_result.task_manifest_path,
-            task_id=task_idx,
-            task_output_dir_path=prepare_result.task_output_dir,
-            top_k=args.top_k,
-            compute_baseline_metrics=args.compute_baseline_metrics,
-            compute_deg_metrics=args.compute_deg_metrics,
-            compute_retrieval_metrics=args.compute_retrieval_metrics,
-            min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
-        )
+    progress_enabled = args.progress == "always" or (
+        args.progress == "auto" and sys.stderr.isatty()
+    )
+    common_payload: dict[str, object] = {
+        "output_dir": str(args.output_dir),
+        "task_file": str(prepare_result.task_manifest_path),
+        "task_output_dir": str(prepare_result.task_output_dir),
+        "top_k": int(args.top_k),
+        "compute_baseline_metrics": bool(args.compute_baseline_metrics),
+        "compute_deg_metrics": bool(args.compute_deg_metrics),
+        "compute_retrieval_metrics": bool(args.compute_retrieval_metrics),
+        "min_retrieval_compounds_per_line_time": int(
+            args.min_retrieval_compounds_per_line_time
+        ),
+        "max_baseline_peers": (
+            None if MAX_BASELINE_PEERS is None else int(MAX_BASELINE_PEERS)
+        ),
+        "peer_sampling_seed": int(PEER_SAMPLING_SEED),
+    }
+    progress_bar = tqdm(
+        total=n_tasks,
+        desc="replicate tasks",
+        unit="task",
+        dynamic_ncols=True,
+        disable=not progress_enabled,
+    )
+    try:
+        if int(args.workers) == 1:
+            for task_idx in range(1, n_tasks + 1):
+                _run_prepared_task_worker(
+                    {**common_payload, "task_id": task_idx}
+                )
+                progress_bar.update(1)
+        else:
+            context = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(
+                max_workers=min(int(args.workers), n_tasks),
+                mp_context=context,
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        _run_prepared_task_worker,
+                        {**common_payload, "task_id": task_idx},
+                    ): task_idx
+                    for task_idx in range(1, n_tasks + 1)
+                }
+                for future in as_completed(futures):
+                    task_idx = futures[future]
+                    completed_task_id = future.result()
+                    if completed_task_id != task_idx:
+                        raise RuntimeError(
+                            f"Task identity mismatch: expected {task_idx}, "
+                            f"received {completed_task_id}"
+                        )
+                    progress_bar.update(1)
+    finally:
+        progress_bar.close()
     merge_task_outputs(
         output_dir=args.output_dir,
         task_file=prepare_result.task_manifest_path,
@@ -4589,12 +4686,21 @@ def main() -> None:
     global MAX_BASELINE_PEERS, PEER_SAMPLING_SEED
     args = parse_args()
     # Read at call time inside the scoring functions, so setting it here covers every command.
-    MAX_BASELINE_PEERS = getattr(args, "max_baseline_peers", None)
+    requested_max_peers = getattr(args, "max_baseline_peers", None)
+    if requested_max_peers is not None and int(requested_max_peers) < 0:
+        raise SystemExit("--max-baseline-peers must be zero or a positive integer.")
+    MAX_BASELINE_PEERS = (
+        None
+        if requested_max_peers is None or int(requested_max_peers) == 0
+        else int(requested_max_peers)
+    )
+    if hasattr(args, "max_baseline_peers"):
+        # Persist the canonical representation so task fingerprints and merge
+        # validation agree that zero means an uncapped peer set.
+        args.max_baseline_peers = MAX_BASELINE_PEERS
     PEER_SAMPLING_SEED = int(
         getattr(args, "peer_sampling_seed", DEFAULT_PEER_SAMPLING_SEED)
     )
-    if MAX_BASELINE_PEERS is not None and int(MAX_BASELINE_PEERS) <= 0:
-        raise SystemExit("--max-baseline-peers must be a positive integer when provided.")
     if args.command == "prepare":
         prepare(
             output_dir=args.output_dir,

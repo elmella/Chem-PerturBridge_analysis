@@ -153,6 +153,61 @@ uv run python scripts/summarize_reviewer_minimal_metrics.py \
   --output-dir results/parallel_cross_source/reviewer_minimal_summary
 ```
 
+After the optional L2 and all-peer sensitivity runs have been copied locally,
+finalize the combined Table 9 and make zero-match exact-dose comparisons
+explicit without reopening any H5AD:
+
+```bash
+uv run python scripts/summarize_reviewer_final_tables.py \
+  --bootstrap-iterations 2000 \
+  --workers 4
+```
+
+This writes raw/W4 L2 BCa intervals, one combined numeric-long and wide Table 9,
+seven presentation panels, the validated all-peer sensitivity summary, and
+complete nine-pair dose summary/CI tables under
+`results/parallel_cross_source/reviewer_final_summary/`.
+
+### Reviewer Tables 7, 8, and 10 without notebooks
+
+Compute the within-dataset replicate metrics once. The same condition shards
+feed all three tables, so running separate expensive jobs is unnecessary:
+
+```bash
+uv run python scripts/precompute_replicate_signature_similarity.py run-all \
+  --datasets all \
+  --output-dir results/replicate_signature_similarity_sep_rep_peer_full \
+  --compute-baseline-metrics \
+  --compute-deg-metrics \
+  --max-baseline-peers 0 \
+  --workers 8 \
+  --progress always
+```
+
+Here, `--max-baseline-peers 0` scores every eligible same-context
+different-compound signature. Each task writes its TSV atomically, and the
+final merge occurs only after every task succeeds.
+
+Build all three compound-clustered BCa tables without executing the replicate
+notebooks:
+
+```bash
+uv run python scripts/replicate_reviewer_tables.py \
+  --input-dir results/replicate_signature_similarity_sep_rep_peer_full \
+  --output-dir results/parallel_cross_source/replicate_reviewer_tables \
+  --bootstrap-iterations 2000 \
+  --workers 8 \
+  --progress always
+```
+
+The table-specific entry points
+`summarize_replicate_table_7.py`, `summarize_replicate_table_8.py`, and
+`summarize_replicate_table_10.py` accept the same summary options. Outputs
+retain observed and original centroid results and add individual-peer means,
+standard deviations, corrected percentiles, observed-minus-peer deltas, and
+PubChem-clustered confidence intervals. Compatible completed summaries are
+validated and reused automatically.
+
 The retrieval command above scores every eligible individual peer. The default
 cap remains 512 for bounded exploratory runs; eligible and scored peer counts
 are recorded separately. The second dataset-by-cell-type W4 scale remains

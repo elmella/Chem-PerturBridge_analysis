@@ -358,6 +358,12 @@ def build_retrieval_ci(
     *,
     n_boot: int,
     seed: int,
+    similarity_metrics: Sequence[str] = ("cosine", "spearman"),
+    scale_variants: Sequence[str] = (
+        "raw",
+        PER_GENE_DATASET_VARIANT,
+    ),
+    summary_level: str = "reviewer_minimal_retrieval_dataset_pair",
     workers: int = 1,
     bootstrap_batch_size: int = 64,
     progress: bool = False,
@@ -383,15 +389,17 @@ def build_retrieval_ci(
             == "strict_matched_condition"
         )
         & retrieval["similarity_metric"].astype(str).isin(
-            ("cosine", "spearman")
+            tuple(str(value) for value in similarity_metrics)
         )
         & retrieval["scale_variant"].astype(str).isin(
-            ("raw", PER_GENE_DATASET_VARIANT)
+            tuple(str(value) for value in scale_variants)
         )
     ].copy()
     if focused.empty:
         raise ValueError(
-            "No reviewer-minimal strict-logFC cosine/Spearman rows found"
+            "No strict-logFC retrieval rows found for similarities "
+            f"{tuple(similarity_metrics)!r} and scales "
+            f"{tuple(scale_variants)!r}"
         )
     metrics = _present_metrics(
         focused,
@@ -419,7 +427,7 @@ def build_retrieval_ci(
         outer_cols=["direction"],
         n_boot=n_boot,
         seed=seed,
-        summary_level="reviewer_minimal_retrieval_dataset_pair",
+        summary_level=summary_level,
         workers=workers,
         bootstrap_batch_size=bootstrap_batch_size,
         progress=progress,
