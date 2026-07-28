@@ -7,11 +7,13 @@ import unittest
 import numpy as np
 import pandas as pd
 
+import scripts.precompute_replicate_signature_similarity as replicate_scoring
 from scripts.population_zscore import DATASET_SCOPE, PopulationGeneStats
 from scripts.precompute_replicate_signature_similarity import (
     cosine_against_peers,
     normalized_matrix_for_stats,
     overlay_condition_metric_rows,
+    resolve_processed_sep_rep_h5ad,
     resolve_normalization_scopes,
     vector_cosine_similarity,
 )
@@ -89,6 +91,60 @@ class ReplicateNormalizedCosineTests(unittest.TestCase):
         self.assertEqual(merged.loc[0, "old_metric"], 0.4)
         self.assertEqual(merged.loc[0, "recomputed_metric"], 0.8)
         self.assertEqual(merged.loc[0, "normalized_cosine"], 0.9)
+
+    def test_grouped_processed_metadata_is_a_candidate_inventory_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            grouped = (
+                root
+                / "dataset_a"
+                / "pseudobulk_processed"
+                / "group_rep"
+                / "processed.h5ad"
+            )
+            grouped.parent.mkdir(parents=True)
+            grouped.touch()
+            self.assertEqual(
+                resolve_processed_sep_rep_h5ad("dataset_a", data_root=root),
+                grouped,
+            )
+
+    def test_published_root_processed_file_is_a_candidate_inventory_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            published = root / "dataset_a" / "processed.h5ad"
+            published.parent.mkdir(parents=True)
+            published.touch()
+            self.assertEqual(
+                resolve_processed_sep_rep_h5ad("dataset_a", data_root=root),
+                published,
+            )
+
+    def test_extracted_sep_rep_archive_layout_is_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            expected = (
+                root
+                / "dataset_a"
+                / "sep_rep_extracted"
+                / "deg_data"
+                / "sep_rep"
+                / "full"
+                / "qc_false"
+                / "filter_min_cells_0"
+                / "results"
+            )
+            expected.mkdir(parents=True)
+            (expected / "line_de.h5ad").touch()
+            original_root = replicate_scoring.SOURCE_DATA_ROOT
+            try:
+                replicate_scoring.SOURCE_DATA_ROOT = root
+                self.assertEqual(
+                    replicate_scoring.sep_rep_dataset_dir("dataset_a", 0),
+                    expected,
+                )
+            finally:
+                replicate_scoring.SOURCE_DATA_ROOT = original_root
 
 
 if __name__ == "__main__":

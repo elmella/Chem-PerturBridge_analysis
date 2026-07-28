@@ -83,19 +83,49 @@ def sep_rep_dataset_dir(dataset_name: str, filter_min_cells: int) -> Path:
     fall back to the cluster shape when neither is present, which keeps the error message
     pointing at the canonical location.
     """
-    flat = SOURCE_DATA_ROOT / dataset_name / "sep_rep"
-    if flat.is_dir():
-        return flat
-    return (
-        SOURCE_DATA_ROOT
-        / dataset_name
-        / "deg_data"
+    dataset_root = SOURCE_DATA_ROOT / dataset_name
+    relative_pipeline_path = (
+        Path("deg_data")
         / "sep_rep"
         / "full"
         / "qc_false"
         / f"filter_min_cells_{int(filter_min_cells)}"
         / "results"
     )
+    candidates = (
+        dataset_root / "sep_rep",
+        dataset_root / relative_pipeline_path,
+        dataset_root / "sep_rep_extracted" / relative_pipeline_path,
+        dataset_root
+        / "sep_rep_extracted"
+        / dataset_name
+        / relative_pipeline_path,
+    )
+    for candidate in candidates:
+        if candidate.is_dir() and any(candidate.glob("*_de.h5ad")):
+            return candidate
+
+    # Downloaded archives can add an extra wrapper directory whose name is not
+    # stable. Accept it only when recursive discovery identifies one unique DGE
+    # directory, avoiding a silent choice between different filtering runs.
+    discovered = sorted(
+        {
+            path.parent
+            for path in dataset_root.rglob("*_de.h5ad")
+            if "sep_rep" in path.parts or "sep_rep_extracted" in path.parts
+        }
+    )
+    if len(discovered) == 1:
+        return discovered[0]
+    if len(discovered) > 1:
+        locations = "\n".join(f"- {path}" for path in discovered)
+        raise RuntimeError(
+            f"Multiple separate-replicate DGE directories found for "
+            f"{dataset_name}; cannot choose safely:\n{locations}"
+        )
+
+    # Preserve the canonical path in downstream missing-input messages.
+    return dataset_root / relative_pipeline_path
 DEFAULT_SOURCE_DATASET_DIRS = {
     "sciplex": sep_rep_dataset_dir("sciplex", 10),
     "tahoe": sep_rep_dataset_dir("tahoe", 50),
@@ -1666,11 +1696,56 @@ def path_matches_allowed_cell_types(path: Path, allowed_cell_types: set[str]) ->
 def resolve_processed_sep_rep_h5ad(dataset_name: str, data_root: Path = DEFAULT_PROCESSED_DATA_ROOT) -> Path:
     sep_rep_dir = data_root / dataset_name / "pseudobulk_processed" / "sep_rep"
     matches = sorted(sep_rep_dir.glob("*.h5ad"))
-    if not matches:
-        raise FileNotFoundError(f"No processed sep_rep .h5ad file found in {sep_rep_dir}")
-    if len(matches) > 1:
-        raise RuntimeError(f"Expected one processed sep_rep .h5ad file in {sep_rep_dir}, found {len(matches)}")
-    return matches[0]
+    if matches:
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"Expected one processed sep_rep .h5ad file in {sep_rep_dir}, "
+                f"found {len(matches)}"
+            )
+        return matches[0]
+
+    # This file is used only to construct the lightweight candidate
+    # line/compound/condition inventory. Replicate vectors and replicate counts
+    # are always read later from the separate-replicate DEG H5ADs. Therefore a
+    # grouped-condition processed file is an equivalent and much smaller
+    # metadata source when the optional processed sep_rep export was not staged.
+    group_rep_dir = data_root / dataset_name / "pseudobulk_processed" / "group_rep"
+    group_matches = sorted(group_rep_dir.glob("*.h5ad"))
+    if group_matches:
+        if len(group_matches) > 1:
+            raise RuntimeError(
+                f"Expected one processed group_rep .h5ad file in {group_rep_dir}, "
+                f"found {len(group_matches)}"
+            )
+        print(
+            f"[metadata] {dataset_name}: processed sep_rep metadata is absent; "
+            f"using group_rep candidate inventory {group_matches[0]}",
+            flush=True,
+        )
+        return group_matches[0]
+
+    # Public Chem-PerturBridge releases use one processed input directly under
+    # <dataset>/ and place the DGE outputs under <dataset>/group_rep and
+    # <dataset>/sep_rep. This root-level input provides the same candidate
+    # inventory as the internal pseudobulk_processed layouts above.
+    published_matches = sorted((data_root / dataset_name).glob("*.h5ad"))
+    if published_matches:
+        if len(published_matches) > 1:
+            raise RuntimeError(
+                f"Expected one published processed .h5ad directly under "
+                f"{data_root / dataset_name}, found {len(published_matches)}"
+            )
+        print(
+            f"[metadata] {dataset_name}: using published processed candidate "
+            f"inventory {published_matches[0]}",
+            flush=True,
+        )
+        return published_matches[0]
+
+    raise FileNotFoundError(
+        "No processed candidate-inventory H5AD found in either "
+        f"{sep_rep_dir}, {group_rep_dir}, or {data_root / dataset_name}"
+    )
 
 
 def load_processed_sep_rep_metadata(dataset_name: str, data_root: Path = DEFAULT_PROCESSED_DATA_ROOT) -> pd.DataFrame:
@@ -5150,6 +5225,15 @@ def _run_prepared_task_worker(payload: dict[str, object]) -> int:
 def run_all(args: argparse.Namespace) -> None:
     if int(args.workers) < 1:
         raise ValueError("--workers must be positive")
+    if args.existing_results_dir is not None:
+        existing_condition_metrics = (
+            Path(args.existing_results_dir) / "condition_metric_summary.tsv"
+        )
+        if not existing_condition_metrics.is_file():
+            raise FileNotFoundError(
+                "--existing-results-dir must contain condition_metric_summary.tsv; "
+                f"not found: {existing_condition_metrics}"
+            )
     prepare_result = prepare(
         output_dir=args.output_dir,
         dataset_arg=args.datasets,
