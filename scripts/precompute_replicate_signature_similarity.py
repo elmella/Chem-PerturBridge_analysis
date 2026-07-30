@@ -288,6 +288,10 @@ SHARED_GENE_KEY_CACHE: dict[tuple[str, ...], np.ndarray] = {}
 GENE_POSITION_CACHE: dict[tuple[str, tuple[str, ...]], np.ndarray] = {}
 DATASET_LINE_GENE_KEY_CACHE: dict[tuple[str, str], np.ndarray] = {}
 ADJ_PVALUE_LAYER_CACHE: dict[str, str] = {}
+WORKER_BASELINE_CONTEXT_VECTOR_CACHE: dict[
+    tuple[object, ...], BaselineContextVectors
+] = {}
+WORKER_BASELINE_CACHE_DATASET: Optional[str] = None
 
 
 def add_common_run_args(parser: argparse.ArgumentParser) -> None:
@@ -1024,9 +1028,9 @@ def load_vectors_for_rows(
         if t_stat.ndim == 1:
             t_stat = t_stat[np.newaxis, :]
         for idx_value, vector in zip(source_index, logfc):
-            logfc_vectors[int(idx_value)] = np.asarray(vector, dtype=np.float64)
+            logfc_vectors[int(idx_value)] = np.asarray(vector, dtype=np.float32)
         for idx_value, vector in zip(source_index, t_stat):
-            t_vectors[int(idx_value)] = np.asarray(vector, dtype=np.float64)
+            t_vectors[int(idx_value)] = np.asarray(vector, dtype=np.float32)
     return logfc_vectors, t_vectors
 
 
@@ -1098,13 +1102,14 @@ def optional_vectors_to_matrix(
     vectors: list[Optional[np.ndarray]],
     *,
     n_columns: int,
+    dtype=np.float64,
 ) -> np.ndarray:
     """Preserve metadata-row alignment while representing unavailable vectors as NaN."""
-    matrix = np.full((len(vectors), int(n_columns)), np.nan, dtype=np.float64)
+    matrix = np.full((len(vectors), int(n_columns)), np.nan, dtype=dtype)
     for row_index, vector in enumerate(vectors):
         if vector is None:
             continue
-        values = np.asarray(vector, dtype=np.float64).reshape(-1)
+        values = np.asarray(vector, dtype=dtype).reshape(-1)
         if values.size == int(n_columns):
             matrix[row_index] = values
     return matrix
@@ -1122,14 +1127,27 @@ def get_baseline_context_vectors(
     """Load a context once per local/global gene-set combination within a task."""
     cache_key = (
         *context_key,
+        tuple(sorted(rows_path for rows_path in context_rows["source_path"].astype(str).unique())),
         tuple(map(str, np.asarray(local_gene_keys, dtype=object).tolist())),
         tuple(map(str, np.asarray(global_gene_keys, dtype=object).tolist())),
     )
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
+    # Task manifests are context-sorted. Retaining the most recent contexts lets
+    # consecutive shards reuse their expensive Tahoe matrices and peer ranks
+    # without allowing a long-lived worker to accumulate every dataset context.
+    while len(cache) >= 2:
+        cache.pop(next(iter(cache)))
 
+    context_started_at = time.monotonic()
     rows = normalize_source_metadata_frame(context_rows).reset_index(drop=True)
+    print(
+        f"[peer-context] loading rows={len(rows):,} "
+        f"local_genes={len(local_gene_keys):,} "
+        f"global_genes={len(global_gene_keys):,}",
+        flush=True,
+    )
     local_logfc_vectors, local_t_vectors = load_vectors_for_rows(
         rows,
         gene_keys=local_gene_keys,
@@ -1144,24 +1162,51 @@ def get_baseline_context_vectors(
             gene_keys=global_gene_keys,
             open_adatas=open_adatas,
         )
-    matrices = {
-        "local_logfc": optional_vectors_to_matrix(
-            local_logfc_vectors,
-            n_columns=int(local_gene_keys.size),
-        ),
-        "local_t": optional_vectors_to_matrix(
-            local_t_vectors,
-            n_columns=int(local_gene_keys.size),
-        ),
-        "global_logfc": optional_vectors_to_matrix(
+    local_logfc = optional_vectors_to_matrix(
+        local_logfc_vectors,
+        n_columns=int(local_gene_keys.size),
+        dtype=np.float32,
+    )
+    local_t = optional_vectors_to_matrix(
+        local_t_vectors,
+        n_columns=int(local_gene_keys.size),
+        dtype=np.float32,
+    )
+    if np.array_equal(local_gene_keys, global_gene_keys):
+        global_logfc = local_logfc
+        global_t = local_t
+    else:
+        global_logfc = optional_vectors_to_matrix(
             global_logfc_vectors,
             n_columns=int(global_gene_keys.size),
-        ),
-        "global_t": optional_vectors_to_matrix(
+            dtype=np.float32,
+        )
+        global_t = optional_vectors_to_matrix(
             global_t_vectors,
             n_columns=int(global_gene_keys.size),
-        ),
+            dtype=np.float32,
+        )
+    matrices = {
+        "local_logfc": local_logfc,
+        "local_t": local_t,
+        "global_logfc": global_logfc,
+        "global_t": global_t,
     }
+    print(
+        f"[peer-context] vectors loaded in "
+        f"{time.monotonic() - context_started_at:.1f}s; computing centroids",
+        flush=True,
+    )
+    local_logfc_totals = finite_column_totals(local_logfc)
+    local_t_totals = finite_column_totals(local_t)
+    if global_logfc is local_logfc:
+        global_logfc_totals = local_logfc_totals
+    else:
+        global_logfc_totals = finite_column_totals(global_logfc)
+    if global_t is local_t:
+        global_t_totals = local_t_totals
+    else:
+        global_t_totals = finite_column_totals(global_t)
     loaded = BaselineContextVectors(
         rows=rows,
         local_logfc=matrices["local_logfc"],
@@ -1169,8 +1214,10 @@ def get_baseline_context_vectors(
         global_logfc=matrices["global_logfc"],
         global_t=matrices["global_t"],
         finite_totals={
-            matrix_name: finite_column_totals(matrix)
-            for matrix_name, matrix in matrices.items()
+            "local_logfc": local_logfc_totals,
+            "local_t": local_t_totals,
+            "global_logfc": global_logfc_totals,
+            "global_t": global_t_totals,
         },
         prepared_local_logfc={},
         normalized_local_logfc={},
@@ -1180,6 +1227,11 @@ def get_baseline_context_vectors(
         },
     )
     cache[cache_key] = loaded
+    print(
+        f"[peer-context] ready rows={len(rows):,} in "
+        f"{time.monotonic() - context_started_at:.1f}s",
+        flush=True,
+    )
     return loaded
 
 
@@ -1203,7 +1255,34 @@ def get_prepared_local_context_spearman(
         context_vectors.prepared_local_logfc.pop(
             next(iter(context_vectors.prepared_local_logfc))
         )
-    prepared = prepare_spearman_rows(matrix)
+    started_at = time.monotonic()
+    last_reported_percent = -1
+
+    def report_progress(completed_rows: int, total_rows: int) -> None:
+        nonlocal last_reported_percent
+        percent = int(100 * completed_rows / max(total_rows, 1))
+        report_bucket = percent // 5
+        if report_bucket == last_reported_percent and completed_rows < total_rows:
+            return
+        last_reported_percent = report_bucket
+        print(
+            "[peer-rank] "
+            f"rows={completed_rows:,}/{total_rows:,} ({percent:d}%) "
+            f"genes={matrix.shape[1]:,} "
+            f"elapsed={time.monotonic() - started_at:.1f}s",
+            flush=True,
+        )
+
+    print(
+        f"[peer-rank] preparing rows={matrix.shape[0]:,} "
+        f"genes={matrix.shape[1]:,} in bounded-memory blocks",
+        flush=True,
+    )
+    prepared = prepare_spearman_rows(
+        matrix,
+        block_rows=128,
+        progress_callback=report_progress,
+    )
     context_vectors.prepared_local_logfc[cache_key] = prepared
     return prepared
 
@@ -4377,6 +4456,7 @@ def run_task(
     population_stats_root: Path,
     min_retrieval_compounds_per_line_time: int,
 ) -> None:
+    global WORKER_BASELINE_CACHE_DATASET
     saved_config = (
         load_task_config(task_config_path(output_dir))
         if task_config_path(output_dir).exists()
@@ -4410,6 +4490,9 @@ def run_task(
 
     global_gene_keys = load_line_global_gene_keys(line_global_gene_keys_path(output_dir))
     dataset_name = str(task_row["dataset_name"])
+    if WORKER_BASELINE_CACHE_DATASET != dataset_name:
+        WORKER_BASELINE_CONTEXT_VECTOR_CACHE.clear()
+        WORKER_BASELINE_CACHE_DATASET = dataset_name
     task_started_at = time.monotonic()
     print(
         f"[task {int(task_id):06d}] started dataset={dataset_name} "
@@ -4468,9 +4551,7 @@ def run_task(
         }
 
     open_adatas: dict[str, ad.AnnData] = {}
-    baseline_context_vector_cache: dict[
-        tuple[object, ...], BaselineContextVectors
-    ] = {}
+    baseline_context_vector_cache = WORKER_BASELINE_CONTEXT_VECTOR_CACHE
     population_stats_cache = (
         ReplicatePopulationStatsCache(population_stats_root)
         if compute_normalized_cosine

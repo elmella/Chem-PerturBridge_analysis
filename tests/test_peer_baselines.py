@@ -59,6 +59,28 @@ class PeerBaselineTests(unittest.TestCase):
         expected = spearman_against_peers(query, peers[selected])
         np.testing.assert_allclose(observed, expected, atol=1e-12, equal_nan=True)
 
+    def test_blockwise_prepared_spearman_matches_reference(self):
+        rng = np.random.default_rng(19)
+        peers = np.round(rng.normal(size=(17, 91)), decimals=2).astype(np.float32)
+        peers[4] = 2.0
+        peers[13, 7] = np.nan
+        query = np.round(rng.normal(size=91), decimals=2)
+        progress = []
+
+        prepared = prepare_spearman_rows(
+            peers,
+            block_rows=3,
+            progress_callback=lambda completed, total: progress.append(
+                (completed, total)
+            ),
+        )
+        observed = spearman_against_prepared_peers(query, prepared)
+        expected = spearman_against_peers(query, peers)
+
+        np.testing.assert_allclose(observed, expected, atol=1e-12, equal_nan=True)
+        self.assertEqual(progress[-1], (17, 17))
+        self.assertEqual(prepared.values.dtype, np.float32)
+
     def test_sampling_is_deterministic_and_seeded(self):
         first = select_peer_indices(5000, 512, "dataset|line|compound|24|10", 7)
         second = select_peer_indices(5000, 512, "dataset|line|compound|24|10", 7)

@@ -224,13 +224,23 @@ def spearman_against_peers(
     return scores
 
 
-def prepare_spearman_rows(peer_matrix: np.ndarray) -> PreparedSpearmanRows:
+def prepare_spearman_rows(
+    peer_matrix: np.ndarray,
+    *,
+    block_rows: int = 256,
+    progress_callback=None,
+) -> PreparedSpearmanRows:
     """Rank and normalize finite peer rows once for repeated all-gene Spearman calls.
 
     Rows containing non-finite values remain available in ``values`` and are evaluated
     with the scalar reference path by :func:`spearman_against_prepared_peers`.
     """
-    values = np.atleast_2d(np.asarray(peer_matrix, dtype=np.float64))
+    if int(block_rows) < 1:
+        raise ValueError("block_rows must be positive")
+    # Preserve the source dtype here. The source H5AD layers are float32, and
+    # converting an entire large context to float64 creates a second full-size
+    # matrix before ranking starts. Individual ranking blocks are promoted below.
+    values = np.atleast_2d(np.asarray(peer_matrix))
     n_rows, n_columns = values.shape
     normalized_ranks = np.full((n_rows, n_columns), np.nan, dtype=np.float64)
     finite_rows = np.isfinite(values).all(axis=1)
@@ -238,18 +248,30 @@ def prepare_spearman_rows(peer_matrix: np.ndarray) -> PreparedSpearmanRows:
     if n_columns < 2 or not finite_rows.any():
         return PreparedSpearmanRows(values, normalized_ranks, finite_rows, valid_rows)
 
-    ranks = np.atleast_2d(
-        rankdata(values[finite_rows], method="average", axis=1)
-    ).astype(np.float64)
-    centered = ranks - ranks.mean(axis=1, keepdims=True)
-    norms = np.linalg.norm(centered, axis=1)
-    finite_positions = np.flatnonzero(finite_rows)
-    usable = norms > 0.0
-    if usable.any():
-        normalized_ranks[finite_positions[usable]] = (
-            centered[usable] / norms[usable, None]
-        )
-        valid_rows[finite_positions[usable]] = True
+    for block_start in range(0, n_rows, int(block_rows)):
+        block_stop = min(block_start + int(block_rows), n_rows)
+        block_finite = finite_rows[block_start:block_stop]
+        if block_finite.any():
+            block_positions = (
+                np.flatnonzero(block_finite).astype(np.int64) + block_start
+            )
+            ranks = np.atleast_2d(
+                rankdata(
+                    np.asarray(values[block_positions], dtype=np.float64),
+                    method="average",
+                    axis=1,
+                )
+            ).astype(np.float64)
+            centered = ranks - ranks.mean(axis=1, keepdims=True)
+            norms = np.linalg.norm(centered, axis=1)
+            usable = norms > 0.0
+            if usable.any():
+                normalized_ranks[block_positions[usable]] = (
+                    centered[usable] / norms[usable, None]
+                )
+                valid_rows[block_positions[usable]] = True
+        if progress_callback is not None:
+            progress_callback(block_stop, n_rows)
     return PreparedSpearmanRows(values, normalized_ranks, finite_rows, valid_rows)
 
 
@@ -331,14 +353,26 @@ def exact_mean_for_row_mask(
     return mean
 
 
-def finite_column_totals(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def finite_column_totals(
+    matrix: np.ndarray,
+    *,
+    block_rows: int = 1024,
+) -> tuple[np.ndarray, np.ndarray]:
     """Finite sums and counts for reuse across many exclusion centroids."""
-    matrix = np.atleast_2d(np.asarray(matrix, dtype=np.float64))
-    finite = np.isfinite(matrix)
-    return (
-        np.where(finite, matrix, 0.0).sum(axis=0),
-        finite.sum(axis=0, dtype=np.int64),
-    )
+    if int(block_rows) < 1:
+        raise ValueError("block_rows must be positive")
+    matrix = np.atleast_2d(np.asarray(matrix))
+    sums = np.zeros(matrix.shape[1], dtype=np.float64)
+    counts = np.zeros(matrix.shape[1], dtype=np.int64)
+    for block_start in range(0, matrix.shape[0], int(block_rows)):
+        block = np.asarray(
+            matrix[block_start : block_start + int(block_rows)],
+            dtype=np.float64,
+        )
+        finite = np.isfinite(block)
+        sums += np.where(finite, block, 0.0).sum(axis=0)
+        counts += finite.sum(axis=0, dtype=np.int64)
+    return sums, counts
 
 
 def exact_mean_excluding_row_mask(
@@ -349,7 +383,7 @@ def exact_mean_excluding_row_mask(
     total_counts: Optional[np.ndarray] = None,
 ) -> Optional[np.ndarray]:
     """Exact finite mean after excluding rows, using reusable context totals."""
-    matrix = np.atleast_2d(np.asarray(matrix, dtype=np.float64))
+    matrix = np.atleast_2d(np.asarray(matrix))
     excluded_row_mask = np.asarray(excluded_row_mask, dtype=bool).reshape(-1)
     if excluded_row_mask.size != matrix.shape[0]:
         raise ValueError("excluded_row_mask length does not match matrix rows")
