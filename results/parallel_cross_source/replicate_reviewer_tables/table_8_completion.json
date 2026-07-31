@@ -1,0 +1,23 @@
+{
+  "bootstrap_iterations": 2000,
+  "bootstrap_seed": 20260505,
+  "files": {
+    "ci": {
+      "sha256": "eab5b6e1b295cfb98f75820167e24047e290d2e41ad3967ae1e97716b6b43275",
+      "size": 17850
+    },
+    "presentation": {
+      "sha256": "384627d5bc3b9732968cbbc0a2895b8c631214c90bc554e119b95e255f4ff879",
+      "size": 900
+    },
+    "ranges": {
+      "sha256": "6ba6316435c298895ed9694b4c80f269d6c0b680863c9129dfda799b3ead012a",
+      "size": 1283
+    }
+  },
+  "fingerprint": "2a48cc8bfb2090ec6593cf57044e20d7053adee5d0c17e9ea6c7c65ad362b391",
+  "input_path": "/home/cirro/Chem-PerturBridge_analysis/results/replicate_signature_similarity_sep_rep_normalized_cosine/condition_deg_metric_summary.tsv",
+  "n_ci_rows": 48,
+  "n_condition_rows": 43142,
+  "table": 8
+}

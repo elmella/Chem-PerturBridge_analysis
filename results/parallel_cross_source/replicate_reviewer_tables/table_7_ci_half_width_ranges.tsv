@@ -1,0 +1,9 @@
+summary_level	metric	n_intervals	min_ci_half_width	median_ci_half_width	max_ci_half_width	min_n_compounds	max_n_compounds	ci_methods	ci_statuses
+table_7_dataset	centroid_baseline_deg_lfc_spearman_sym_p05	4	0.01872623408837941	0.024691376685615114	0.04314797119028563	114	271	bca	ok
+table_7_dataset	delta_vs_centroid_deg_lfc_spearman_sym_p05	4	0.024672385550459974	0.033968910850253685	0.0556838732501387	114	270	bca	ok
+table_7_dataset	delta_vs_individual_peer_deg_lfc_spearman_sym_p05	4	0.024552580696021786	0.03764045909734057	0.0585178580677637	114	270	bca	ok
+table_7_dataset	individual_peer_corrected_percentile_deg_lfc_spearman_sym_p05	4	0.021584410878384697	0.03033863646923632	0.05969320877704687	114	270	bca	ok
+table_7_dataset	individual_peer_fraction_below_observed_deg_lfc_spearman_sym_p05	4	0.022454103003772763	0.030529475774127124	0.06161626558668304	114	270	bca	ok
+table_7_dataset	individual_peer_mean_deg_lfc_spearman_sym_p05	4	0.007668724469812982	0.010558588051654215	0.04068602478167491	114	270	bca	ok
+table_7_dataset	individual_peer_sd_deg_lfc_spearman_sym_p05	4	0.00663868796557715	0.008841710311906198	0.017559423566030186	114	270	bca	ok
+table_7_dataset	observed_deg_lfc_spearman_sym_p05	6	0.01004355133767959	0.03414635245062034	0.08087094808221948	114	5007	bca	ok
