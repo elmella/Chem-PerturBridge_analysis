@@ -2386,6 +2386,42 @@ def normalize_source_metadata_frame(frame: pd.DataFrame) -> pd.DataFrame:
     for column_name in string_columns:
         if column_name in normalized.columns:
             normalized[column_name] = normalized[column_name].astype("string").fillna("").astype(str)
+    # TSV round-trips can infer the same context value differently depending on
+    # the other rows in that particular file (for example, ``10`` in a
+    # single-dose task shard versus ``10.0`` in a mixed-dose inventory).  These
+    # columns are join keys, so canonicalize them after every read rather than
+    # relying on pandas' per-file dtype inference.
+    for column_name in ("time_key", "dose_key"):
+        if column_name in normalized.columns:
+            normalized[column_name] = normalized[column_name].map(
+                lambda value: (
+                    format_numeric(numeric)
+                    if pd.notna(
+                        numeric := pd.to_numeric(value, errors="coerce")
+                    )
+                    else str(value).strip()
+                )
+            )
+    if "pubchem_cid" in normalized.columns:
+        normalized["pubchem_cid"] = normalized["pubchem_cid"].map(
+            normalize_pubchem_cid_value
+        )
+    condition_key_columns = {
+        "cell_type",
+        "pubchem_cid",
+        "time_key",
+        "dose_key",
+    }
+    if condition_key_columns.issubset(normalized.columns):
+        normalized["condition_key"] = (
+            normalized["cell_type"].astype(str).str.strip()
+            + "|"
+            + normalized["pubchem_cid"].astype(str)
+            + "|"
+            + normalized["time_key"].astype(str)
+            + "|"
+            + normalized["dose_key"].astype(str)
+        )
     if "source_row_pos" in normalized.columns:
         normalized["source_row_pos"] = pd.to_numeric(normalized["source_row_pos"], errors="coerce").astype(np.int64)
     if "pert_time_h" in normalized.columns:

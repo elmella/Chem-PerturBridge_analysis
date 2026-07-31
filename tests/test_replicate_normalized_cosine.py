@@ -85,6 +85,46 @@ class ReplicateNormalizedCosineTests(unittest.TestCase):
             {"dataset", "dataset_cell_type"},
         )
 
+    def test_context_keys_survive_mixed_numeric_tsv_inference(self) -> None:
+        task_context = replicate_scoring.normalize_source_metadata_frame(
+            pd.DataFrame(
+                {
+                    "cell_type": ["CVCL_0062"],
+                    "pubchem_cid": [123],
+                    "time_key": [24],
+                    "dose_key": [10],
+                    "condition_key": ["CVCL_0062|123|24|10"],
+                }
+            )
+        )
+        cached_rows = replicate_scoring.normalize_source_metadata_frame(
+            pd.DataFrame(
+                {
+                    "cell_type": ["CVCL_0062", "CVCL_0062"],
+                    "pubchem_cid": [123.0, 456.0],
+                    "time_key": [24.0, 24.0],
+                    "dose_key": [10.0, 20.0],
+                    "condition_key": [
+                        "CVCL_0062|123.0|24.0|10.0",
+                        "CVCL_0062|456.0|24.0|20.0",
+                    ],
+                }
+            )
+        )
+
+        self.assertEqual(task_context.loc[0, "dose_key"], "10")
+        self.assertEqual(cached_rows.loc[0, "dose_key"], "10")
+        self.assertEqual(
+            cached_rows.loc[0, "condition_key"],
+            "CVCL_0062|123|24|10",
+        )
+        merged = cached_rows.merge(
+            task_context[["cell_type", "time_key", "dose_key"]],
+            on=["cell_type", "time_key", "dose_key"],
+            how="inner",
+        )
+        self.assertEqual(len(merged), 1)
+
     def test_deg_definition_selection_can_limit_reviewer_workload(self) -> None:
         self.assertEqual(resolve_deg_definitions("p05"), ("p05",))
         self.assertEqual(resolve_deg_definitions("p05_lfc02"), ("p05_lfc02",))
