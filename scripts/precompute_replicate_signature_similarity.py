@@ -4441,6 +4441,31 @@ def reshard(
     )
 
 
+def task_source_paths_to_open(
+    *,
+    replicates_frame: pd.DataFrame,
+    baseline_source_frame: Optional[pd.DataFrame],
+    full_dataset_source_frame: Optional[pd.DataFrame],
+    compute_retrieval_metrics: bool,
+) -> set[str]:
+    """Return only the read-only H5AD sources required by one task.
+
+    Baseline and normalized-cosine scoring operate on the task's line/time/dose
+    contexts. Only retrieval needs the complete dataset candidate population.
+    Opening every dataset file for ordinary baseline tasks made Tahoe spend about
+    15 minutes in HDF5 setup before each small shard.
+    """
+    paths = set(replicates_frame["source_path"].astype(str).unique().tolist())
+    context_frame = (
+        full_dataset_source_frame
+        if compute_retrieval_metrics
+        else baseline_source_frame
+    )
+    if context_frame is not None and not context_frame.empty:
+        paths.update(context_frame["source_path"].astype(str).unique().tolist())
+    return paths
+
+
 def run_task(
     *,
     output_dir: Path,
@@ -4564,9 +4589,12 @@ def run_task(
     error_records: list[dict[str, object]] = []
     retrieval_condition_summary = pd.DataFrame()
     try:
-        source_paths_to_open = set(replicates_frame["source_path"].astype(str).unique().tolist())
-        if full_dataset_source_frame is not None and not full_dataset_source_frame.empty:
-            source_paths_to_open.update(full_dataset_source_frame["source_path"].astype(str).unique().tolist())
+        source_paths_to_open = task_source_paths_to_open(
+            replicates_frame=replicates_frame,
+            baseline_source_frame=baseline_source_frame,
+            full_dataset_source_frame=full_dataset_source_frame,
+            compute_retrieval_metrics=compute_retrieval_metrics,
+        )
         for source_path in sorted(source_paths_to_open):
             open_adatas[source_path] = read_h5ad_safely(source_path, backed="r")
 

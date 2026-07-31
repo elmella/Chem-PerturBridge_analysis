@@ -17,6 +17,7 @@ from scripts.precompute_replicate_signature_similarity import (
     resolve_deg_definitions,
     resolve_processed_sep_rep_h5ad,
     resolve_normalization_scopes,
+    task_source_paths_to_open,
     vector_cosine_similarity,
 )
 
@@ -90,6 +91,43 @@ class ReplicateNormalizedCosineTests(unittest.TestCase):
         self.assertEqual(
             resolve_deg_definitions("all"),
             tuple(replicate_scoring.DEG_DEFINITION_CONFIG),
+        )
+
+    def test_nonretrieval_task_opens_only_context_sources(self) -> None:
+        replicates = pd.DataFrame({"source_path": ["query.h5ad"]})
+        baseline_context = pd.DataFrame(
+            {"source_path": ["query.h5ad", "context_peer.h5ad"]}
+        )
+        full_dataset = pd.DataFrame(
+            {
+                "source_path": [
+                    "query.h5ad",
+                    "context_peer.h5ad",
+                    "unrelated_line.h5ad",
+                ]
+            }
+        )
+
+        baseline_paths = task_source_paths_to_open(
+            replicates_frame=replicates,
+            baseline_source_frame=baseline_context,
+            full_dataset_source_frame=full_dataset,
+            compute_retrieval_metrics=False,
+        )
+        retrieval_paths = task_source_paths_to_open(
+            replicates_frame=replicates,
+            baseline_source_frame=baseline_context,
+            full_dataset_source_frame=full_dataset,
+            compute_retrieval_metrics=True,
+        )
+
+        self.assertEqual(
+            baseline_paths,
+            {"query.h5ad", "context_peer.h5ad"},
+        )
+        self.assertEqual(
+            retrieval_paths,
+            {"query.h5ad", "context_peer.h5ad", "unrelated_line.h5ad"},
         )
 
     def test_overlay_preserves_old_metrics_and_prefers_new_nonmissing_values(self) -> None:
