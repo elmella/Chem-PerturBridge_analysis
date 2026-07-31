@@ -37,14 +37,10 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from peer_baselines import (
     DEFAULT_PEER_SAMPLING_SEED,
-    PreparedSpearmanRows,
     direction_agreement_against_peers,
-    exact_mean_excluding_row_mask,
     finite_column_totals,
-    prepare_spearman_rows,
     select_peer_indices,
     spearman_against_peers,
-    spearman_against_prepared_peers,
     summarize_peer_scores,
 )
 from population_zscore import (
@@ -231,20 +227,18 @@ class ReshardResult:
     task_output_dir: Path
 
 
-@dataclass
-class BaselineContextVectors:
-    """All reusable vectors for one dataset / line / time / dose / gene-set context."""
+@dataclass(frozen=True)
+class ContextAggregate:
+    """Persistent finite-value totals for one context and ordered gene set."""
 
-    rows: pd.DataFrame
-    local_logfc: np.ndarray
-    local_t: np.ndarray
-    global_logfc: np.ndarray
-    global_t: np.ndarray
-    finite_totals: dict[str, tuple[np.ndarray, np.ndarray]]
-    prepared_local_logfc: dict[bytes, PreparedSpearmanRows]
-    normalized_local_logfc: dict[str, np.ndarray]
-    normalized_finite_totals: dict[str, tuple[np.ndarray, np.ndarray]]
-    cosine_row_norms: dict[str, Optional[np.ndarray]]
+    fingerprint: str
+    n_rows: int
+    gene_keys: np.ndarray
+    logfc_sums: np.ndarray
+    logfc_counts: np.ndarray
+    t_sums: np.ndarray
+    t_counts: np.ndarray
+    cache_path: Path
 
 
 class ReplicatePopulationStatsCache:
@@ -288,10 +282,8 @@ SHARED_GENE_KEY_CACHE: dict[tuple[str, ...], np.ndarray] = {}
 GENE_POSITION_CACHE: dict[tuple[str, tuple[str, ...]], np.ndarray] = {}
 DATASET_LINE_GENE_KEY_CACHE: dict[tuple[str, str], np.ndarray] = {}
 ADJ_PVALUE_LAYER_CACHE: dict[str, str] = {}
-WORKER_BASELINE_CONTEXT_VECTOR_CACHE: dict[
-    tuple[object, ...], BaselineContextVectors
-] = {}
-WORKER_BASELINE_CACHE_DATASET: Optional[str] = None
+WORKER_CONTEXT_CACHE_DATASET: Optional[str] = None
+WORKER_CONTEXT_AGGREGATE_CACHE: dict[tuple[object, ...], ContextAggregate] = {}
 
 
 def add_common_run_args(parser: argparse.ArgumentParser) -> None:
@@ -1115,176 +1107,259 @@ def optional_vectors_to_matrix(
     return matrix
 
 
-def get_baseline_context_vectors(
+def context_aggregate_cache_dir(output_dir: Path) -> Path:
+    return Path(output_dir) / "context_aggregate_cache"
+
+
+def _context_aggregate_fingerprint(
     *,
     context_rows: pd.DataFrame,
+    dataset_name: str,
     context_key: tuple[str, str, str],
-    local_gene_keys: np.ndarray,
-    global_gene_keys: np.ndarray,
+    gene_keys: np.ndarray,
+) -> str:
+    """Fingerprint the exact rows, source files, context, and ordered genes."""
+    rows = normalize_source_metadata_frame(context_rows).sort_values(
+        ["source_path", "source_row_pos"], kind="mergesort"
+    )
+    digest = hashlib.sha256()
+    digest.update(b"replicate-context-aggregate-v1\0")
+    digest.update(str(dataset_name).encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(json.dumps(list(context_key), separators=(",", ":")).encode("utf-8"))
+    digest.update(b"\0")
+    for gene_key in np.asarray(gene_keys, dtype=object):
+        digest.update(str(gene_key).encode("utf-8"))
+        digest.update(b"\0")
+    for row in rows[["source_path", "source_row_pos"]].itertuples(index=False):
+        digest.update(str(row.source_path).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(int(row.source_row_pos)).encode("ascii"))
+        digest.update(b"\0")
+    for source_path in sorted(rows["source_path"].astype(str).unique()):
+        stat = Path(source_path).stat()
+        digest.update(source_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(int(stat.st_size)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(int(stat.st_mtime_ns)).encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _context_aggregate_path(
+    *,
+    output_dir: Path,
+    dataset_name: str,
+    context_key: tuple[str, str, str],
+    fingerprint: str,
+) -> Path:
+    context_label = hashlib.sha256(
+        json.dumps(list(context_key), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    return (
+        context_aggregate_cache_dir(output_dir)
+        / str(dataset_name)
+        / f"context_{context_label}_{fingerprint}.npz"
+    )
+
+
+def _load_context_aggregate(
+    path: Path,
+    *,
+    expected_fingerprint: str,
+    expected_gene_keys: np.ndarray,
+) -> Optional[ContextAggregate]:
+    if not path.is_file():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as cached:
+            fingerprint = str(cached["fingerprint"].item())
+            gene_keys = np.asarray(cached["gene_keys"], dtype=str)
+            if (
+                fingerprint != expected_fingerprint
+                or not np.array_equal(
+                    gene_keys,
+                    np.asarray(expected_gene_keys, dtype=str),
+                )
+            ):
+                return None
+            return ContextAggregate(
+                fingerprint=fingerprint,
+                n_rows=int(cached["n_rows"].item()),
+                gene_keys=gene_keys,
+                logfc_sums=np.asarray(cached["logfc_sums"], dtype=np.float64),
+                logfc_counts=np.asarray(cached["logfc_counts"], dtype=np.int64),
+                t_sums=np.asarray(cached["t_sums"], dtype=np.float64),
+                t_counts=np.asarray(cached["t_counts"], dtype=np.int64),
+                cache_path=path,
+            )
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def get_or_build_context_aggregate(
+    *,
+    output_dir: Path,
+    dataset_name: str,
+    context_rows: pd.DataFrame,
+    context_key: tuple[str, str, str],
+    gene_keys: np.ndarray,
     open_adatas: dict[str, ad.AnnData],
-    cache: dict[tuple[object, ...], BaselineContextVectors],
-) -> BaselineContextVectors:
-    """Load a context once per local/global gene-set combination within a task."""
-    cache_key = (
-        *context_key,
-        tuple(sorted(rows_path for rows_path in context_rows["source_path"].astype(str).unique())),
-        tuple(map(str, np.asarray(local_gene_keys, dtype=object).tolist())),
-        tuple(map(str, np.asarray(global_gene_keys, dtype=object).tolist())),
-    )
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-    # Task manifests are context-sorted. Retaining the most recent contexts lets
-    # consecutive shards reuse their expensive Tahoe matrices and peer ranks
-    # without allowing a long-lived worker to accumulate every dataset context.
-    while len(cache) >= 2:
-        cache.pop(next(iter(cache)))
+    rows_per_batch: int = 512,
+) -> ContextAggregate:
+    """Load or atomically build one exact context aggregate.
 
-    context_started_at = time.monotonic()
-    rows = normalize_source_metadata_frame(context_rows).reset_index(drop=True)
-    print(
-        f"[peer-context] loading rows={len(rows):,} "
-        f"local_genes={len(local_gene_keys):,} "
-        f"global_genes={len(global_gene_keys):,}",
-        flush=True,
-    )
-    local_logfc_vectors, local_t_vectors = load_vectors_for_rows(
-        rows,
-        gene_keys=local_gene_keys,
-        open_adatas=open_adatas,
-    )
-    if np.array_equal(local_gene_keys, global_gene_keys):
-        global_logfc_vectors = local_logfc_vectors
-        global_t_vectors = local_t_vectors
-    else:
-        global_logfc_vectors, global_t_vectors = load_vectors_for_rows(
-            rows,
-            gene_keys=global_gene_keys,
-            open_adatas=open_adatas,
-        )
-    local_logfc = optional_vectors_to_matrix(
-        local_logfc_vectors,
-        n_columns=int(local_gene_keys.size),
-        dtype=np.float32,
-    )
-    local_t = optional_vectors_to_matrix(
-        local_t_vectors,
-        n_columns=int(local_gene_keys.size),
-        dtype=np.float32,
-    )
-    if np.array_equal(local_gene_keys, global_gene_keys):
-        global_logfc = local_logfc
-        global_t = local_t
-    else:
-        global_logfc = optional_vectors_to_matrix(
-            global_logfc_vectors,
-            n_columns=int(global_gene_keys.size),
-            dtype=np.float32,
-        )
-        global_t = optional_vectors_to_matrix(
-            global_t_vectors,
-            n_columns=int(global_gene_keys.size),
-            dtype=np.float32,
-        )
-    matrices = {
-        "local_logfc": local_logfc,
-        "local_t": local_t,
-        "global_logfc": global_logfc,
-        "global_t": global_t,
-    }
-    print(
-        f"[peer-context] vectors loaded in "
-        f"{time.monotonic() - context_started_at:.1f}s; computing centroids",
-        flush=True,
-    )
-    local_logfc_totals = finite_column_totals(local_logfc)
-    local_t_totals = finite_column_totals(local_t)
-    if global_logfc is local_logfc:
-        global_logfc_totals = local_logfc_totals
-    else:
-        global_logfc_totals = finite_column_totals(global_logfc)
-    if global_t is local_t:
-        global_t_totals = local_t_totals
-    else:
-        global_t_totals = finite_column_totals(global_t)
-    loaded = BaselineContextVectors(
-        rows=rows,
-        local_logfc=matrices["local_logfc"],
-        local_t=matrices["local_t"],
-        global_logfc=matrices["global_logfc"],
-        global_t=matrices["global_t"],
-        finite_totals={
-            "local_logfc": local_logfc_totals,
-            "local_t": local_t_totals,
-            "global_logfc": global_logfc_totals,
-            "global_t": global_t_totals,
-        },
-        prepared_local_logfc={},
-        normalized_local_logfc={},
-        normalized_finite_totals={},
-        cosine_row_norms={
-            "raw": complete_row_norms(matrices["local_logfc"]),
-        },
-    )
-    cache[cache_key] = loaded
-    print(
-        f"[peer-context] ready rows={len(rows):,} in "
-        f"{time.monotonic() - context_started_at:.1f}s",
-        flush=True,
-    )
-    return loaded
+    A small advisory lock prevents spawned workers from rebuilding the same
+    context concurrently. Only finite sums and counts are persisted, so cache
+    size scales with genes rather than context rows.
+    """
+    import fcntl
 
+    memory_key = (
+        str(Path(output_dir).resolve()),
+        str(dataset_name),
+        *tuple(map(str, context_key)),
+        hashlib.sha256(
+            "\0".join(map(str, np.asarray(gene_keys, dtype=object))).encode(
+                "utf-8"
+            )
+        ).hexdigest(),
+    )
+    in_memory = WORKER_CONTEXT_AGGREGATE_CACHE.get(memory_key)
+    if in_memory is not None:
+        return in_memory
 
-def get_prepared_local_context_spearman(
-    context_vectors: BaselineContextVectors,
-    column_mask: Optional[np.ndarray],
-) -> PreparedSpearmanRows:
-    """Reuse context row ranks across compounds sharing the same evaluation genes."""
-    if column_mask is None:
-        cache_key = b"all"
-        matrix = context_vectors.local_logfc
-    else:
-        normalized_mask = np.asarray(column_mask, dtype=bool).reshape(-1)
-        cache_key = normalized_mask.tobytes()
-        matrix = context_vectors.local_logfc[:, normalized_mask]
-    cached = context_vectors.prepared_local_logfc.get(cache_key)
-    if cached is not None:
-        return cached
-    # Bound rank-cache memory when rare condition-specific finite masks differ.
-    if len(context_vectors.prepared_local_logfc) >= 2:
-        context_vectors.prepared_local_logfc.pop(
-            next(iter(context_vectors.prepared_local_logfc))
+    rows = normalize_source_metadata_frame(context_rows).sort_values(
+        ["source_path", "source_row_pos"], kind="mergesort"
+    ).reset_index(drop=True)
+    ordered_genes = np.asarray(gene_keys, dtype=str)
+    fingerprint = _context_aggregate_fingerprint(
+        context_rows=rows,
+        dataset_name=dataset_name,
+        context_key=context_key,
+        gene_keys=ordered_genes,
+    )
+    path = _context_aggregate_path(
+        output_dir=output_dir,
+        dataset_name=dataset_name,
+        context_key=context_key,
+        fingerprint=fingerprint,
+    )
+    loaded = _load_context_aggregate(
+        path,
+        expected_fingerprint=fingerprint,
+        expected_gene_keys=ordered_genes,
+    )
+    if loaded is not None:
+        print(f"[context-aggregate] reusing {path}", flush=True)
+        WORKER_CONTEXT_AGGREGATE_CACHE[memory_key] = loaded
+        return loaded
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+b") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        loaded = _load_context_aggregate(
+            path,
+            expected_fingerprint=fingerprint,
+            expected_gene_keys=ordered_genes,
         )
-    started_at = time.monotonic()
-    last_reported_percent = -1
+        if loaded is not None:
+            print(f"[context-aggregate] reusing {path}", flush=True)
+            WORKER_CONTEXT_AGGREGATE_CACHE[memory_key] = loaded
+            return loaded
 
-    def report_progress(completed_rows: int, total_rows: int) -> None:
-        nonlocal last_reported_percent
-        percent = int(100 * completed_rows / max(total_rows, 1))
-        report_bucket = percent // 5
-        if report_bucket == last_reported_percent and completed_rows < total_rows:
-            return
-        last_reported_percent = report_bucket
+        started_at = time.monotonic()
+        n_genes = int(ordered_genes.size)
+        logfc_sums = np.zeros(n_genes, dtype=np.float64)
+        logfc_counts = np.zeros(n_genes, dtype=np.int64)
+        t_sums = np.zeros(n_genes, dtype=np.float64)
+        t_counts = np.zeros(n_genes, dtype=np.int64)
         print(
-            "[peer-rank] "
-            f"rows={completed_rows:,}/{total_rows:,} ({percent:d}%) "
-            f"genes={matrix.shape[1]:,} "
-            f"elapsed={time.monotonic() - started_at:.1f}s",
+            f"[context-aggregate] building dataset={dataset_name} "
+            f"context={context_key} rows={len(rows):,} genes={n_genes:,}",
             flush=True,
         )
+        for start in range(0, len(rows), max(1, int(rows_per_batch))):
+            stop = min(start + max(1, int(rows_per_batch)), len(rows))
+            logfc_vectors, t_vectors = load_vectors_for_rows(
+                rows.iloc[start:stop],
+                gene_keys=ordered_genes,
+                open_adatas=open_adatas,
+            )
+            logfc = optional_vectors_to_matrix(
+                logfc_vectors,
+                n_columns=n_genes,
+                dtype=np.float32,
+            )
+            t_stat = optional_vectors_to_matrix(
+                t_vectors,
+                n_columns=n_genes,
+                dtype=np.float32,
+            )
+            block_sums, block_counts = finite_column_totals(logfc)
+            logfc_sums += block_sums
+            logfc_counts += block_counts
+            block_sums, block_counts = finite_column_totals(t_stat)
+            t_sums += block_sums
+            t_counts += block_counts
+            print(
+                f"[context-aggregate] rows={stop:,}/{len(rows):,} "
+                f"elapsed={time.monotonic() - started_at:.1f}s",
+                flush=True,
+            )
 
-    print(
-        f"[peer-rank] preparing rows={matrix.shape[0]:,} "
-        f"genes={matrix.shape[1]:,} in bounded-memory blocks",
-        flush=True,
-    )
-    prepared = prepare_spearman_rows(
-        matrix,
-        block_rows=128,
-        progress_callback=report_progress,
-    )
-    context_vectors.prepared_local_logfc[cache_key] = prepared
-    return prepared
+        temporary_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+        with temporary_path.open("wb") as handle:
+            np.savez_compressed(
+                handle,
+                fingerprint=np.asarray(fingerprint),
+                n_rows=np.asarray(len(rows), dtype=np.int64),
+                gene_keys=ordered_genes,
+                logfc_sums=logfc_sums,
+                logfc_counts=logfc_counts,
+                t_sums=t_sums,
+                t_counts=t_counts,
+            )
+        os.replace(temporary_path, path)
+        print(
+            f"[context-aggregate] published {path} in "
+            f"{time.monotonic() - started_at:.1f}s",
+            flush=True,
+        )
+        loaded = _load_context_aggregate(
+            path,
+            expected_fingerprint=fingerprint,
+            expected_gene_keys=ordered_genes,
+        )
+        if loaded is None:
+            raise RuntimeError(f"Failed to validate context aggregate: {path}")
+        WORKER_CONTEXT_AGGREGATE_CACHE[memory_key] = loaded
+        return loaded
+
+
+def aggregate_mean_excluding_rows(
+    *,
+    sums: np.ndarray,
+    counts: np.ndarray,
+    excluded_rows: np.ndarray,
+) -> Optional[np.ndarray]:
+    """Exact finite-value mean after removing the query compound's rows."""
+    matrix = np.asarray(excluded_rows, dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape[1] != np.asarray(sums).size:
+        return None
+    finite = np.isfinite(matrix)
+    remaining_sums = np.asarray(sums, dtype=np.float64) - np.where(
+        finite, matrix, 0.0
+    ).sum(axis=0)
+    remaining_counts = np.asarray(counts, dtype=np.int64) - finite.sum(axis=0)
+    result = np.full(np.asarray(sums).size, np.nan, dtype=np.float64)
+    valid = remaining_counts > 0
+    if not np.any(valid):
+        return None
+    result[valid] = remaining_sums[valid] / remaining_counts[valid]
+    return result
 
 
 def deg_metric_names() -> list[str]:
@@ -2502,6 +2577,7 @@ def compute_condition_metric_record_from_rows(
     condition_row: pd.Series,
     condition_rows: pd.DataFrame,
     *,
+    output_dir: Path,
     line_global_shared_gene_keys: dict[str, np.ndarray],
     top_k: int,
     compute_deg_metrics: bool = False,
@@ -2511,9 +2587,6 @@ def compute_condition_metric_record_from_rows(
     population_stats_cache: Optional[ReplicatePopulationStatsCache] = None,
     baseline_source_frame: Optional[pd.DataFrame] = None,
     baseline_context_row_indexes: Optional[dict[tuple[str, str, str], np.ndarray]] = None,
-    baseline_context_vector_cache: Optional[
-        dict[tuple[object, ...], BaselineContextVectors]
-    ] = None,
     open_adatas: Optional[dict[str, ad.AnnData]] = None,
 ) -> Optional[dict[str, object]]:
     condition_rows = normalize_source_metadata_frame(condition_rows)
@@ -2533,8 +2606,6 @@ def compute_condition_metric_record_from_rows(
     global_gene_keys = line_global_shared_gene_keys.get(cell_type, np.asarray([], dtype=object))
     if open_adatas is None:
         open_adatas = {}
-    if baseline_context_vector_cache is None:
-        baseline_context_vector_cache = {}
 
     indexed_rows = condition_rows.reset_index(drop=True)
     local_logfc_vectors, local_t_vectors = load_vectors_for_rows(
@@ -2673,6 +2744,7 @@ def compute_condition_metric_record_from_rows(
             record[f"n_valid_peer_cosine_pairs_{metric_suffix}"] = 0
 
     raw_local_logfc_matrix: Optional[np.ndarray] = None
+    raw_local_t_matrix: Optional[np.ndarray] = None
     if compute_deg_metrics:
         for definition_key in ACTIVE_DEG_DEFINITIONS:
             for metric_name in deg_metric_names():
@@ -2703,7 +2775,8 @@ def compute_condition_metric_record_from_rows(
     if all(vector is not None for vector in local_logfc_vectors) and all(vector is not None for vector in local_t_vectors):
         raw_local_logfc_matrix = np.vstack(local_logfc_vectors).astype(np.float64)
         local_logfc_matrix = raw_local_logfc_matrix.copy()
-        local_t_matrix = np.vstack(local_t_vectors).astype(np.float64)
+        raw_local_t_matrix = np.vstack(local_t_vectors).astype(np.float64)
+        local_t_matrix = raw_local_t_matrix.copy()
         finite_local_mask = np.isfinite(local_logfc_matrix).all(axis=0) & np.isfinite(local_t_matrix).all(axis=0)
         if compute_deg_metrics and local_adj_p_vectors and all(vector is not None for vector in local_adj_p_vectors):
             local_adj_p_matrix = np.vstack(local_adj_p_vectors).astype(np.float64)
@@ -2739,14 +2812,18 @@ def compute_condition_metric_record_from_rows(
             record["n_valid_t_pairs"] = int(np.isfinite(t_values).sum())
             record[f"n_valid_signed_overlap_t_top{top_k}_pairs"] = int(np.isfinite(overlap_values).sum())
 
+    raw_global_logfc_matrix: Optional[np.ndarray] = None
+    raw_global_t_matrix: Optional[np.ndarray] = None
     global_logfc_matrix: Optional[np.ndarray] = None
     global_t_matrix: Optional[np.ndarray] = None
     logfc_values_global = np.asarray([], dtype=np.float64)
     t_values_global = np.asarray([], dtype=np.float64)
     overlap_values_global = np.asarray([], dtype=np.float64)
     if all(vector is not None for vector in global_logfc_vectors) and all(vector is not None for vector in global_t_vectors):
-        global_logfc_matrix = np.vstack(global_logfc_vectors).astype(np.float64)
-        global_t_matrix = np.vstack(global_t_vectors).astype(np.float64)
+        raw_global_logfc_matrix = np.vstack(global_logfc_vectors).astype(np.float64)
+        raw_global_t_matrix = np.vstack(global_t_vectors).astype(np.float64)
+        global_logfc_matrix = raw_global_logfc_matrix.copy()
+        global_t_matrix = raw_global_t_matrix.copy()
         finite_global_mask = np.isfinite(global_logfc_matrix).all(axis=0) & np.isfinite(global_t_matrix).all(axis=0)
         global_logfc_matrix = global_logfc_matrix[:, finite_global_mask]
         global_t_matrix = global_t_matrix[:, finite_global_mask]
@@ -2775,63 +2852,123 @@ def compute_condition_metric_record_from_rows(
             record[f"n_valid_signed_overlap_t_top{top_k}_pairs_global"] = int(np.isfinite(overlap_values_global).sum())
 
     local_baseline_logfc: Optional[np.ndarray] = None
+    raw_local_baseline_logfc: Optional[np.ndarray] = None
     global_baseline_logfc: Optional[np.ndarray] = None
     local_peer_logfc_matrix: Optional[np.ndarray] = None
-    local_peer_logfc_prepared = None
+    raw_local_peer_logfc_matrix: Optional[np.ndarray] = None
+    selected_peer_rows = pd.DataFrame()
+    local_context_aggregate: Optional[ContextAggregate] = None
     peer_seed_key = "|".join([dataset_name, cell_type, pubchem_cid, time_key, dose_key])
 
     if compute_baseline_metrics and baseline_source_frame is not None and baseline_context_row_indexes is not None:
         context_key = (cell_type, time_key, dose_key)
         context_indexes = baseline_context_row_indexes.get(context_key)
         if context_indexes is not None and len(context_indexes) > 0:
-            raw_context_frame = baseline_source_frame.iloc[
+            raw_context_frame = normalize_source_metadata_frame(baseline_source_frame.iloc[
                 np.asarray(context_indexes, dtype=np.int64)
-            ].copy()
-            context_vectors = get_baseline_context_vectors(
-                context_rows=raw_context_frame,
-                context_key=context_key,
-                local_gene_keys=local_gene_keys,
-                global_gene_keys=global_gene_keys,
-                open_adatas=open_adatas,
-                cache=baseline_context_vector_cache,
-            )
+            ].copy())
             peer_row_mask = (
-                context_vectors.rows["pubchem_cid"].astype(str).to_numpy() != pubchem_cid
+                raw_context_frame["pubchem_cid"].astype(str).to_numpy() != pubchem_cid
             )
             if peer_row_mask.any():
-                same_compound_mask = ~peer_row_mask
-                baseline_rows = context_vectors.rows.loc[peer_row_mask].reset_index(drop=True)
+                baseline_rows = raw_context_frame.loc[peer_row_mask].reset_index(drop=True)
                 record["n_baseline_peer_rows"] = int(peer_row_mask.sum())
                 record["n_baseline_peer_compounds"] = int(
                     baseline_rows["pubchem_cid"].astype(str).nunique()
                 )
-                # The published centroid remains exact and therefore always uses every
-                # eligible peer row. The cap applies only to the single-peer distribution.
-                local_baseline_logfc = exact_mean_excluding_row_mask(
-                    context_vectors.local_logfc,
-                    same_compound_mask,
-                    total_sums=context_vectors.finite_totals["local_logfc"][0],
-                    total_counts=context_vectors.finite_totals["local_logfc"][1],
+                # Persist only finite totals/counts. Exact leave-one-compound-out
+                # centroids are reconstructed by subtracting the current compound's
+                # replicate rows; the full context matrix is never needed again.
+                local_context_aggregate = get_or_build_context_aggregate(
+                    output_dir=output_dir,
+                    dataset_name=dataset_name,
+                    context_rows=raw_context_frame,
+                    context_key=context_key,
+                    gene_keys=local_gene_keys,
+                    open_adatas=open_adatas,
                 )
-                local_baseline_t = exact_mean_excluding_row_mask(
-                    context_vectors.local_t,
-                    same_compound_mask,
-                    total_sums=context_vectors.finite_totals["local_t"][0],
-                    total_counts=context_vectors.finite_totals["local_t"][1],
+                global_context_aggregate = (
+                    local_context_aggregate
+                    if np.array_equal(local_gene_keys, global_gene_keys)
+                    else get_or_build_context_aggregate(
+                        output_dir=output_dir,
+                        dataset_name=dataset_name,
+                        context_rows=raw_context_frame,
+                        context_key=context_key,
+                        gene_keys=global_gene_keys,
+                        open_adatas=open_adatas,
+                    )
                 )
-                global_baseline_logfc = exact_mean_excluding_row_mask(
-                    context_vectors.global_logfc,
-                    same_compound_mask,
-                    total_sums=context_vectors.finite_totals["global_logfc"][0],
-                    total_counts=context_vectors.finite_totals["global_logfc"][1],
+                if raw_local_logfc_matrix is not None:
+                    raw_local_baseline_logfc = aggregate_mean_excluding_rows(
+                        sums=local_context_aggregate.logfc_sums,
+                        counts=local_context_aggregate.logfc_counts,
+                        excluded_rows=raw_local_logfc_matrix,
+                    )
+                    local_baseline_logfc = raw_local_baseline_logfc
+                if raw_local_t_matrix is not None:
+                    local_baseline_t = aggregate_mean_excluding_rows(
+                        sums=local_context_aggregate.t_sums,
+                        counts=local_context_aggregate.t_counts,
+                        excluded_rows=raw_local_t_matrix,
+                    )
+                if raw_global_logfc_matrix is not None:
+                    global_baseline_logfc = aggregate_mean_excluding_rows(
+                        sums=global_context_aggregate.logfc_sums,
+                        counts=global_context_aggregate.logfc_counts,
+                        excluded_rows=raw_global_logfc_matrix,
+                    )
+                if raw_global_t_matrix is not None:
+                    global_baseline_t = aggregate_mean_excluding_rows(
+                        sums=global_context_aggregate.t_sums,
+                        counts=global_context_aggregate.t_counts,
+                        excluded_rows=raw_global_t_matrix,
+                    )
+
+                selected_positions = select_peer_indices(
+                    int(len(baseline_rows)),
+                    MAX_BASELINE_PEERS,
+                    peer_seed_key,
+                    sampling_seed=PEER_SAMPLING_SEED,
                 )
-                global_baseline_t = exact_mean_excluding_row_mask(
-                    context_vectors.global_t,
-                    same_compound_mask,
-                    total_sums=context_vectors.finite_totals["global_t"][0],
-                    total_counts=context_vectors.finite_totals["global_t"][1],
+                selected_peer_rows = baseline_rows.iloc[selected_positions].copy()
+                selected_logfc_vectors, _ = load_vectors_for_rows(
+                    selected_peer_rows,
+                    gene_keys=local_gene_keys,
+                    open_adatas=open_adatas,
                 )
-                record["n_baseline_peer_rows_loaded"] = int(peer_row_mask.sum())
+                raw_local_peer_logfc_matrix = optional_vectors_to_matrix(
+                    selected_logfc_vectors,
+                    n_columns=int(local_gene_keys.size),
+                    dtype=np.float64,
+                )
+                available_peer_mask = np.isfinite(
+                    raw_local_peer_logfc_matrix
+                ).any(axis=1)
+                raw_local_peer_logfc_matrix = raw_local_peer_logfc_matrix[
+                    available_peer_mask
+                ]
+                selected_peer_rows = selected_peer_rows.iloc[
+                    np.flatnonzero(available_peer_mask)
+                ].reset_index(drop=True)
+                record["n_baseline_peer_rows_loaded"] = int(
+                    len(selected_peer_rows)
+                )
+                record["n_peer_rows_total"] = int(len(baseline_rows))
+                record["n_peer_rows_available"] = int(len(baseline_rows))
+                record["n_peer_rows_scored"] = int(len(selected_peer_rows))
+                record["peer_sampling_seed"] = int(PEER_SAMPLING_SEED)
+
+                if raw_local_peer_logfc_matrix.size:
+                    if local_adj_p_matrix is not None:
+                        local_peer_logfc_matrix = raw_local_peer_logfc_matrix[
+                            :, finite_local_mask
+                        ]
+                    elif (
+                        raw_local_peer_logfc_matrix.shape[1]
+                        == local_logfc_matrix.shape[1]
+                    ):
+                        local_peer_logfc_matrix = raw_local_peer_logfc_matrix
 
                 if local_baseline_logfc is not None and local_logfc_matrix is not None:
                     if local_adj_p_matrix is not None:
@@ -2918,44 +3055,11 @@ def compute_condition_metric_record_from_rows(
                 # Per-peer baseline for the all-gene logFC Spearman summary: score each
                 # same line / time / dose other-drug peer separately instead of averaging
                 # the peers into a centroid first.
-                if local_logfc_matrix is not None:
-                    peer_context_positions = np.flatnonzero(
-                        peer_row_mask
-                        & np.isfinite(context_vectors.local_logfc).any(axis=1)
-                    )
-                    selected_peer_positions = select_peer_indices(
-                        int(peer_context_positions.size),
-                        MAX_BASELINE_PEERS,
-                        peer_seed_key,
-                        sampling_seed=PEER_SAMPLING_SEED,
-                    )
-                    scored_context_positions = peer_context_positions[
-                        selected_peer_positions
-                    ]
-                    local_peer_logfc_matrix = context_vectors.local_logfc[
-                        scored_context_positions
-                    ]
-                    if local_adj_p_matrix is not None:
-                        local_peer_logfc_matrix = local_peer_logfc_matrix[
-                            :, finite_local_mask
-                        ]
-                    elif local_peer_logfc_matrix.shape[1] != local_logfc_matrix.shape[1]:
-                        local_peer_logfc_matrix = None
-                    record["n_peer_rows_total"] = int(peer_row_mask.sum())
-                    record["n_peer_rows_available"] = int(peer_context_positions.size)
-                    record["n_peer_rows_scored"] = (
-                        int(local_peer_logfc_matrix.shape[0])
-                        if local_peer_logfc_matrix is not None
-                        else 0
-                    )
-                    record["peer_sampling_seed"] = int(PEER_SAMPLING_SEED)
-                    if local_peer_logfc_matrix is not None and local_peer_logfc_matrix.shape[0] > 0:
-                        local_peer_logfc_prepared = get_prepared_local_context_spearman(
-                            context_vectors,
-                            finite_local_mask
-                            if local_adj_p_matrix is not None
-                            else None,
-                        )
+                if (
+                    local_logfc_matrix is not None
+                    and local_peer_logfc_matrix is not None
+                    and local_peer_logfc_matrix.shape[0] > 0
+                ):
                         peer_summary_fields: dict[str, list[float]] = defaultdict(list)
                         peer_delta_values: list[float] = []
                         peer_scores_by_replicate: dict[int, np.ndarray] = {}
@@ -2963,10 +3067,9 @@ def compute_condition_metric_record_from_rows(
                             for replicate_idx in (left_idx, right_idx):
                                 if replicate_idx not in peer_scores_by_replicate:
                                     peer_scores_by_replicate[replicate_idx] = (
-                                        spearman_against_prepared_peers(
+                                        spearman_against_peers(
                                             local_logfc_matrix[replicate_idx],
-                                            local_peer_logfc_prepared,
-                                            row_indices=scored_context_positions,
+                                            local_peer_logfc_matrix,
                                         )
                                     )
                             left_peer_scores = peer_scores_by_replicate[left_idx]
@@ -3077,121 +3180,82 @@ def compute_condition_metric_record_from_rows(
             raise ValueError(
                 "Normalized cosine requested without a population-statistics cache"
             )
-        if (
-            raw_local_logfc_matrix is not None
-            and baseline_source_frame is not None
-            and baseline_context_row_indexes is not None
-        ):
-            context_key = (cell_type, time_key, dose_key)
-            context_indexes = baseline_context_row_indexes.get(context_key)
-            if context_indexes is not None and len(context_indexes) > 0:
-                normalized_context = get_baseline_context_vectors(
-                    context_rows=baseline_source_frame.iloc[
-                        np.asarray(context_indexes, dtype=np.int64)
-                    ].copy(),
-                    context_key=context_key,
-                    local_gene_keys=local_gene_keys,
-                    global_gene_keys=global_gene_keys,
-                    open_adatas=open_adatas,
-                    cache=baseline_context_vector_cache,
-                )
-                peer_row_mask = (
-                    normalized_context.rows["pubchem_cid"].astype(str).to_numpy()
-                    != pubchem_cid
-                )
-                same_compound_mask = ~peer_row_mask
-                for scope in ("raw", *normalization_scopes):
-                    suffix = (
-                        "raw"
-                        if scope == "raw"
-                        else (
-                            "dataset"
-                            if scope == DATASET_SCOPE
-                            else "dataset_cell_type"
-                        )
+        if raw_local_logfc_matrix is not None:
+            for scope in ("raw", *normalization_scopes):
+                suffix = (
+                    "raw"
+                    if scope == "raw"
+                    else (
+                        "dataset"
+                        if scope == DATASET_SCOPE
+                        else "dataset_cell_type"
                     )
-                    metric_suffix = (
-                        "raw" if scope == "raw" else f"normalized_{suffix}"
+                )
+                metric_suffix = (
+                    "raw" if scope == "raw" else f"normalized_{suffix}"
+                )
+                if scope == "raw":
+                    normalized_replicates = raw_local_logfc_matrix
+                    centroid = raw_local_baseline_logfc
+                    peer_matrix = raw_local_peer_logfc_matrix
+                else:
+                    population_stats = population_stats_cache.get(
+                        dataset_name=dataset_name,
+                        cell_type=cell_type,
+                        scope=scope,
                     )
-                    if scope == "raw":
-                        normalized_replicates = raw_local_logfc_matrix
-                        normalized_context_matrix = normalized_context.local_logfc
-                        normalized_totals = normalized_context.finite_totals[
-                            "local_logfc"
-                        ]
-                        context_row_norms = (
-                            normalized_context.cosine_row_norms["raw"]
-                        )
-                    else:
-                        population_stats = population_stats_cache.get(
-                            dataset_name=dataset_name,
-                            cell_type=cell_type,
-                            scope=scope,
-                        )
-                        normalized_replicates = normalized_matrix_for_stats(
-                            raw_local_logfc_matrix,
+                    normalized_replicates = normalized_matrix_for_stats(
+                        raw_local_logfc_matrix,
+                        gene_keys=local_gene_keys,
+                        stats_record=population_stats,
+                    )
+                    centroid = (
+                        normalized_matrix_for_stats(
+                            raw_local_baseline_logfc[np.newaxis, :],
+                            gene_keys=local_gene_keys,
+                            stats_record=population_stats,
+                        )[0]
+                        if raw_local_baseline_logfc is not None
+                        else None
+                    )
+                    peer_matrix = (
+                        normalized_matrix_for_stats(
+                            raw_local_peer_logfc_matrix,
                             gene_keys=local_gene_keys,
                             stats_record=population_stats,
                         )
-                        normalized_context_matrix = (
-                            normalized_context.normalized_local_logfc.get(scope)
-                        )
-                        if normalized_context_matrix is None:
-                            normalized_context_matrix = normalized_matrix_for_stats(
-                                normalized_context.local_logfc,
-                                gene_keys=local_gene_keys,
-                                stats_record=population_stats,
-                            )
-                            normalized_context.normalized_local_logfc[scope] = (
-                                normalized_context_matrix
-                            )
-                            normalized_context.normalized_finite_totals[scope] = (
-                                finite_column_totals(normalized_context_matrix)
-                            )
-                            normalized_context.cosine_row_norms[scope] = (
-                                complete_row_norms(normalized_context_matrix)
-                            )
-                        normalized_totals = (
-                            normalized_context.normalized_finite_totals[scope]
-                        )
-                        context_row_norms = (
-                            normalized_context.cosine_row_norms[scope]
-                        )
-                    record[f"n_cosine_genes_{suffix}"] = int(
-                        normalized_replicates.shape[1]
+                        if raw_local_peer_logfc_matrix is not None
+                        else None
                     )
-                    if (
-                        normalized_replicates.shape[1] < 2
-                        or not peer_row_mask.any()
-                    ):
-                        continue
-                    observed_values = np.asarray(
-                        [
-                            vector_cosine_similarity(
-                                normalized_replicates[left_idx],
-                                normalized_replicates[right_idx],
-                            )
-                            for left_idx, right_idx in pair_indices
-                        ],
-                        dtype=np.float64,
-                    )
-                    centroid = exact_mean_excluding_row_mask(
-                        normalized_context_matrix,
-                        same_compound_mask,
-                        total_sums=normalized_totals[0],
-                        total_counts=normalized_totals[1],
-                    )
-                    replicate_centroid_values, _ = (
-                        pairwise_replicate_baseline_values(
-                            normalized_replicates,
-                            centroid,
-                            pair_indices=pair_indices,
-                            scorer=vector_cosine_similarity,
+                record[f"n_cosine_genes_{suffix}"] = int(
+                    normalized_replicates.shape[1]
+                )
+                if normalized_replicates.shape[1] < 2:
+                    continue
+                observed_values = np.asarray(
+                    [
+                        vector_cosine_similarity(
+                            normalized_replicates[left_idx],
+                            normalized_replicates[right_idx],
                         )
+                        for left_idx, right_idx in pair_indices
+                    ],
+                    dtype=np.float64,
+                )
+                record[
+                    f"mean_replicate_cosine_logfc_{metric_suffix}"
+                ] = mean_available(observed_values)
+                record[
+                    f"n_valid_replicate_cosine_pairs_{metric_suffix}"
+                ] = int(np.isfinite(observed_values).sum())
+
+                if centroid is not None and centroid.size == normalized_replicates.shape[1]:
+                    replicate_centroid_values, _ = pairwise_replicate_baseline_values(
+                        normalized_replicates,
+                        centroid,
+                        pair_indices=pair_indices,
+                        scorer=vector_cosine_similarity,
                     )
-                    record[
-                        f"mean_replicate_cosine_logfc_{metric_suffix}"
-                    ] = mean_available(observed_values)
                     record[
                         f"mean_replicate_baseline_cosine_logfc_{metric_suffix}"
                     ] = mean_available(replicate_centroid_values)
@@ -3200,105 +3264,77 @@ def compute_condition_metric_record_from_rows(
                     ] = mean_available(
                         observed_values - replicate_centroid_values
                     )
-                    record[
-                        f"n_valid_replicate_cosine_pairs_{metric_suffix}"
-                    ] = int(np.isfinite(observed_values).sum())
 
-                    peer_context_positions = np.flatnonzero(
-                        peer_row_mask
-                        & np.isfinite(normalized_context_matrix).any(axis=1)
-                    )
-                    selected = select_peer_indices(
-                        int(peer_context_positions.size),
-                        MAX_BASELINE_PEERS,
-                        peer_seed_key,
-                        sampling_seed=PEER_SAMPLING_SEED,
-                    )
-                    scored_positions = peer_context_positions[selected]
-                    peer_matrix = normalized_context_matrix[scored_positions]
-                    selected_peer_norms = (
-                        context_row_norms[scored_positions]
-                        if context_row_norms is not None
-                        else None
-                    )
-                    if not compute_baseline_metrics:
-                        record["n_peer_rows_total"] = int(peer_row_mask.sum())
-                        record["n_peer_rows_available"] = int(
-                            peer_context_positions.size
-                        )
-                        record["n_peer_rows_scored"] = int(peer_matrix.shape[0])
-                    peer_fields: dict[str, list[float]] = defaultdict(list)
-                    peer_deltas: list[float] = []
-                    cosine_peer_scores_by_replicate: dict[int, np.ndarray] = {}
-                    for pair_position, (left_idx, right_idx) in enumerate(
-                        pair_indices
-                    ):
-                        for replicate_idx in (left_idx, right_idx):
-                            if replicate_idx not in cosine_peer_scores_by_replicate:
-                                cosine_peer_scores_by_replicate[replicate_idx] = (
-                                    cosine_against_peers(
-                                        normalized_replicates[replicate_idx],
-                                        peer_matrix,
-                                        peer_norms=selected_peer_norms,
-                                    )
+                if (
+                    peer_matrix is None
+                    or peer_matrix.shape[0] == 0
+                    or peer_matrix.shape[1] != normalized_replicates.shape[1]
+                ):
+                    continue
+                selected_peer_norms = complete_row_norms(peer_matrix)
+                peer_fields: dict[str, list[float]] = defaultdict(list)
+                peer_deltas: list[float] = []
+                cosine_peer_scores_by_replicate: dict[int, np.ndarray] = {}
+                for pair_position, (left_idx, right_idx) in enumerate(pair_indices):
+                    for replicate_idx in (left_idx, right_idx):
+                        if replicate_idx not in cosine_peer_scores_by_replicate:
+                            cosine_peer_scores_by_replicate[replicate_idx] = (
+                                cosine_against_peers(
+                                    normalized_replicates[replicate_idx],
+                                    peer_matrix,
+                                    peer_norms=selected_peer_norms,
                                 )
-                        pair_summary = replicate_pair_peer_summary(
-                            cosine_peer_scores_by_replicate[left_idx],
-                            cosine_peer_scores_by_replicate[right_idx],
+                            )
+                    pair_summary = replicate_pair_peer_summary(
+                        cosine_peer_scores_by_replicate[left_idx],
+                        cosine_peer_scores_by_replicate[right_idx],
+                        float(observed_values[pair_position]),
+                        "peer",
+                    )
+                    for field_name, field_value in pair_summary.items():
+                        peer_fields[field_name].append(float(field_value))
+                    peer_deltas.append(
+                        difference_if_both_defined(
                             float(observed_values[pair_position]),
-                            "peer",
+                            float(pair_summary["peer_mean_score"]),
                         )
-                        for field_name, field_value in pair_summary.items():
-                            peer_fields[field_name].append(float(field_value))
-                        peer_deltas.append(
-                            difference_if_both_defined(
-                                float(observed_values[pair_position]),
-                                float(pair_summary["peer_mean_score"]),
-                            )
-                        )
-                    record[
-                        f"mean_peer_baseline_cosine_logfc_{metric_suffix}"
-                    ] = mean_available(
+                    )
+                record[
+                    f"mean_peer_baseline_cosine_logfc_{metric_suffix}"
+                ] = mean_available(
+                    np.asarray(peer_fields["peer_mean_score"], dtype=np.float64)
+                )
+                record[
+                    f"mean_peer_baseline_sd_cosine_logfc_{metric_suffix}"
+                ] = mean_available(
+                    np.asarray(peer_fields["peer_sd_score"], dtype=np.float64)
+                )
+                record[
+                    "mean_peer_baseline_fraction_below_observed_cosine_logfc_"
+                    f"{metric_suffix}"
+                ] = mean_available(
+                    np.asarray(
+                        peer_fields["peer_fraction_below_observed"],
+                        dtype=np.float64,
+                    )
+                )
+                record[
+                    "mean_peer_baseline_corrected_percentile_cosine_logfc_"
+                    f"{metric_suffix}"
+                ] = mean_available(
+                    np.asarray(
+                        peer_fields["peer_corrected_percentile"],
+                        dtype=np.float64,
+                    )
+                )
+                record[
+                    f"mean_replicate_minus_peer_baseline_cosine_logfc_{metric_suffix}"
+                ] = mean_available(np.asarray(peer_deltas, dtype=np.float64))
+                record[f"n_valid_peer_cosine_pairs_{metric_suffix}"] = int(
+                    np.isfinite(
                         np.asarray(peer_fields["peer_mean_score"], dtype=np.float64)
-                    )
-                    record[
-                        f"mean_peer_baseline_sd_cosine_logfc_{metric_suffix}"
-                    ] = mean_available(
-                        np.asarray(peer_fields["peer_sd_score"], dtype=np.float64)
-                    )
-                    record[
-                        "mean_peer_baseline_fraction_below_observed_cosine_logfc_"
-                        f"{metric_suffix}"
-                    ] = mean_available(
-                        np.asarray(
-                            peer_fields["peer_fraction_below_observed"],
-                            dtype=np.float64,
-                        )
-                    )
-                    record[
-                        "mean_peer_baseline_corrected_percentile_cosine_logfc_"
-                        f"{metric_suffix}"
-                    ] = mean_available(
-                        np.asarray(
-                            peer_fields["peer_corrected_percentile"],
-                            dtype=np.float64,
-                        )
-                    )
-                    record[
-                        f"mean_replicate_minus_peer_baseline_cosine_logfc_{metric_suffix}"
-                    ] = mean_available(
-                        np.asarray(peer_deltas, dtype=np.float64)
-                    )
-                    record[
-                        f"n_valid_peer_cosine_pairs_{metric_suffix}"
-                    ] = int(
-                        np.isfinite(
-                            np.asarray(
-                                peer_fields["peer_mean_score"],
-                                dtype=np.float64,
-                            )
-                        ).sum()
-                    )
+                    ).sum()
+                )
 
     if (
         compute_deg_metrics
@@ -4486,17 +4522,12 @@ def task_source_paths_to_open(
 ) -> set[str]:
     """Return only the read-only H5AD sources required by one task.
 
-    Baseline and normalized-cosine scoring operate on the task's line/time/dose
-    contexts. Only retrieval needs the complete dataset candidate population.
-    Opening every dataset file for ordinary baseline tasks made Tahoe spend about
-    15 minutes in HDF5 setup before each small shard.
+    Baseline sources are opened lazily while building a missing context aggregate
+    or loading metadata-selected peers. Only retrieval needs the complete dataset
+    candidate population up front.
     """
     paths = set(replicates_frame["source_path"].astype(str).unique().tolist())
-    context_frame = (
-        full_dataset_source_frame
-        if compute_retrieval_metrics
-        else baseline_source_frame
-    )
+    context_frame = full_dataset_source_frame if compute_retrieval_metrics else None
     if context_frame is not None and not context_frame.empty:
         paths.update(context_frame["source_path"].astype(str).unique().tolist())
     return paths
@@ -4517,7 +4548,7 @@ def run_task(
     population_stats_root: Path,
     min_retrieval_compounds_per_line_time: int,
 ) -> None:
-    global WORKER_BASELINE_CACHE_DATASET
+    global WORKER_CONTEXT_CACHE_DATASET
     saved_config = (
         load_task_config(task_config_path(output_dir))
         if task_config_path(output_dir).exists()
@@ -4551,9 +4582,9 @@ def run_task(
 
     global_gene_keys = load_line_global_gene_keys(line_global_gene_keys_path(output_dir))
     dataset_name = str(task_row["dataset_name"])
-    if WORKER_BASELINE_CACHE_DATASET != dataset_name:
-        WORKER_BASELINE_CONTEXT_VECTOR_CACHE.clear()
-        WORKER_BASELINE_CACHE_DATASET = dataset_name
+    if WORKER_CONTEXT_CACHE_DATASET != dataset_name:
+        WORKER_CONTEXT_AGGREGATE_CACHE.clear()
+        WORKER_CONTEXT_CACHE_DATASET = dataset_name
     task_started_at = time.monotonic()
     print(
         f"[task {int(task_id):06d}] started dataset={dataset_name} "
@@ -4612,7 +4643,6 @@ def run_task(
         }
 
     open_adatas: dict[str, ad.AnnData] = {}
-    baseline_context_vector_cache = WORKER_BASELINE_CONTEXT_VECTOR_CACHE
     population_stats_cache = (
         ReplicatePopulationStatsCache(population_stats_root)
         if compute_normalized_cosine
@@ -4656,6 +4686,7 @@ def run_task(
                 record = compute_condition_metric_record_from_rows(
                     condition_row,
                     condition_rows,
+                    output_dir=output_dir,
                     line_global_shared_gene_keys=global_gene_keys,
                     top_k=top_k,
                     compute_deg_metrics=compute_deg_metrics,
@@ -4665,7 +4696,6 @@ def run_task(
                     population_stats_cache=population_stats_cache,
                     baseline_source_frame=baseline_source_frame,
                     baseline_context_row_indexes=baseline_context_row_indexes,
-                    baseline_context_vector_cache=baseline_context_vector_cache,
                     open_adatas=open_adatas,
                 )
             except Exception as exc:

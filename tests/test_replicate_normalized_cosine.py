@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -23,6 +24,199 @@ from scripts.precompute_replicate_signature_similarity import (
 
 
 class ReplicateNormalizedCosineTests(unittest.TestCase):
+    def test_condition_scoring_uses_cached_centroid_and_selected_peers(self) -> None:
+        logfc = np.asarray(
+            [
+                [1.0, 0.0, 2.0],
+                [0.8, 0.2, 2.2],
+                [-1.0, 1.0, 0.0],
+                [0.0, -1.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        t_stat = logfc * 3.0
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.h5ad"
+            source.touch()
+            rows = pd.DataFrame(
+                {
+                    "dataset_name": ["dataset_a"] * 4,
+                    "cell_type": ["line_a"] * 4,
+                    "pubchem_cid": ["1", "1", "2", "3"],
+                    "time_key": [24.0] * 4,
+                    "dose_key": [10.0] * 4,
+                    "source_path": [str(source)] * 4,
+                    "source_row_pos": np.arange(4),
+                    "condition_key": [
+                        "line_a|1|24|10",
+                        "line_a|1|24|10",
+                        "line_a|2|24|10",
+                        "line_a|3|24|10",
+                    ],
+                    "perturbagen_display": ["one", "one", "two", "three"],
+                }
+            )
+            rows = replicate_scoring.normalize_source_metadata_frame(rows)
+
+            def load_block(block, *, gene_keys, open_adatas):
+                positions = block["source_row_pos"].astype(int).to_numpy()
+                return (
+                    [logfc[position].copy() for position in positions],
+                    [t_stat[position].copy() for position in positions],
+                )
+
+            stats_record = PopulationGeneStats(
+                dataset_name="dataset_a",
+                cell_type="__all_cell_types__",
+                gene_keys=np.asarray(["g1", "g2", "g3"]),
+                finite_counts=np.asarray([4, 4, 4]),
+                means=np.asarray([0.0, 0.0, 0.0]),
+                population_sds=np.asarray([1.0, 1.0, 1.0]),
+                valid_mask=np.asarray([True, True, True]),
+                population_row_count=4,
+                fingerprint="test",
+                cache_path=root / "stats.npz",
+                scope=DATASET_SCOPE,
+            )
+
+            class StatsCache:
+                def get(self, **kwargs):
+                    return stats_record
+
+            replicate_scoring.WORKER_CONTEXT_AGGREGATE_CACHE.clear()
+            with patch.object(
+                replicate_scoring,
+                "load_vectors_for_rows",
+                side_effect=load_block,
+            ), patch.object(
+                replicate_scoring,
+                "shared_gene_keys_for_paths",
+                return_value=np.asarray(["g1", "g2", "g3"]),
+            ), patch.object(
+                replicate_scoring,
+                "MAX_BASELINE_PEERS",
+                1,
+            ):
+                record = replicate_scoring.compute_condition_metric_record_from_rows(
+                    rows.iloc[0],
+                    rows.iloc[:2].copy(),
+                    output_dir=root,
+                    line_global_shared_gene_keys={
+                        "line_a": np.asarray(["g1", "g2", "g3"])
+                    },
+                    top_k=2,
+                    compute_baseline_metrics=True,
+                    compute_normalized_cosine=True,
+                    normalization_scopes=(DATASET_SCOPE,),
+                    population_stats_cache=StatsCache(),
+                    baseline_source_frame=rows.copy(),
+                    baseline_context_row_indexes={
+                        ("line_a", "24", "10"): np.arange(4)
+                    },
+                    open_adatas={},
+                )
+
+            self.assertIsNotNone(record)
+            self.assertEqual(record["n_baseline_peer_rows"], 2)
+            self.assertEqual(record["n_peer_rows_scored"], 1)
+            self.assertTrue(
+                np.isfinite(record["mean_replicate_baseline_spearman_logfc"])
+            )
+            self.assertTrue(
+                np.isfinite(record["mean_replicate_cosine_logfc_raw"])
+            )
+            self.assertTrue(
+                np.isfinite(
+                    record["mean_replicate_cosine_logfc_normalized_dataset"]
+                )
+            )
+
+    def test_context_aggregate_is_exact_and_reused_from_disk(self) -> None:
+        logfc = np.asarray(
+            [
+                [1.0, 2.0, np.nan],
+                [3.0, 4.0, 6.0],
+                [5.0, np.nan, 8.0],
+                [7.0, 10.0, 12.0],
+            ],
+            dtype=np.float64,
+        )
+        t_stat = logfc * 2.0
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.h5ad"
+            source.touch()
+            rows = pd.DataFrame(
+                {
+                    "dataset_name": ["dataset_a"] * 4,
+                    "cell_type": ["line_a"] * 4,
+                    "pubchem_cid": ["1", "1", "2", "3"],
+                    "time_key": [24.0] * 4,
+                    "dose_key": [10.0] * 4,
+                    "source_path": [str(source)] * 4,
+                    "source_row_pos": np.arange(4),
+                    "condition_key": [
+                        "line_a|1|24|10",
+                        "line_a|1|24|10",
+                        "line_a|2|24|10",
+                        "line_a|3|24|10",
+                    ],
+                }
+            )
+
+            def load_block(block, *, gene_keys, open_adatas):
+                positions = block["source_row_pos"].astype(int).to_numpy()
+                return (
+                    [logfc[position].copy() for position in positions],
+                    [t_stat[position].copy() for position in positions],
+                )
+
+            with patch.object(
+                replicate_scoring,
+                "load_vectors_for_rows",
+                side_effect=load_block,
+            ) as loader:
+                aggregate = replicate_scoring.get_or_build_context_aggregate(
+                    output_dir=root,
+                    dataset_name="dataset_a",
+                    context_rows=rows,
+                    context_key=("line_a", "24", "10"),
+                    gene_keys=np.asarray(["g1", "g2", "g3"]),
+                    open_adatas={},
+                    rows_per_batch=2,
+                )
+                self.assertEqual(loader.call_count, 2)
+
+            observed = replicate_scoring.aggregate_mean_excluding_rows(
+                sums=aggregate.logfc_sums,
+                counts=aggregate.logfc_counts,
+                excluded_rows=logfc[:2],
+            )
+            np.testing.assert_allclose(
+                observed,
+                np.nanmean(logfc[2:], axis=0),
+            )
+
+            replicate_scoring.WORKER_CONTEXT_AGGREGATE_CACHE.clear()
+            with patch.object(
+                replicate_scoring,
+                "load_vectors_for_rows",
+                side_effect=AssertionError("disk cache should be reused"),
+            ):
+                reused = replicate_scoring.get_or_build_context_aggregate(
+                    output_dir=root,
+                    dataset_name="dataset_a",
+                    context_rows=rows,
+                    context_key=("line_a", "24", "10"),
+                    gene_keys=np.asarray(["g1", "g2", "g3"]),
+                    open_adatas={},
+                    rows_per_batch=2,
+                )
+            np.testing.assert_allclose(reused.logfc_sums, aggregate.logfc_sums)
+
     def test_normalization_uses_valid_overlapping_genes_in_requested_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             stats = PopulationGeneStats(
@@ -163,7 +357,7 @@ class ReplicateNormalizedCosineTests(unittest.TestCase):
 
         self.assertEqual(
             baseline_paths,
-            {"query.h5ad", "context_peer.h5ad"},
+            {"query.h5ad"},
         )
         self.assertEqual(
             retrieval_paths,
