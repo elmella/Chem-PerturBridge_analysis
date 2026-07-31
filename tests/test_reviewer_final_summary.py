@@ -6,16 +6,90 @@ import numpy as np
 import pandas as pd
 
 from scripts.summarize_reviewer_final_tables import (
+    TABLE5_METRICS,
+    build_table5_ci,
     _complete_dose_ci,
     _complete_dose_pair_summary,
 )
 from scripts.summarize_reviewer_minimal_metrics import (
     DOSE_METRICS,
+    W4_SIGNATURE_METRICS,
+    _w4_long_frame,
     build_retrieval_ci,
+)
+from scripts.population_zscore import (
+    PER_GENE_DATASET_CELL_TYPE_VARIANT,
 )
 
 
 class ReviewerFinalSummaryTests(unittest.TestCase):
+    def test_population_summary_accepts_dataset_cell_type_scale(self):
+        metric = W4_SIGNATURE_METRICS[0]
+        prefix = f"{PER_GENE_DATASET_CELL_TYPE_VARIANT}__"
+        frame = pd.DataFrame(
+            [
+                {
+                    "dataset_a": "a",
+                    "dataset_b": "b",
+                    "cell_type": "cell",
+                    "time_key": "24",
+                    "pubchem_cid": "1",
+                    "matched_condition_key": "condition",
+                    "left_obs_id": "left",
+                    "right_obs_id": "right",
+                    f"{prefix}{metric}": 0.25,
+                }
+            ]
+        )
+
+        result, metrics = _w4_long_frame(
+            frame,
+            metric_candidates=(metric,),
+            required_metrics=(metric,),
+            label="dataset-cell-type signature",
+            scale_variant=PER_GENE_DATASET_CELL_TYPE_VARIANT,
+        )
+
+        self.assertEqual(metrics, [metric])
+        self.assertEqual(
+            set(result["scale_variant"]),
+            {PER_GENE_DATASET_CELL_TYPE_VARIANT},
+        )
+        self.assertEqual(float(result.loc[0, metric]), 0.25)
+
+    def test_table5_summarizes_direction_agreement_and_peer_baselines(self):
+        rows = []
+        for index in range(6):
+            row = {
+                "dataset_a": "a",
+                "dataset_b": "b",
+                "cell_type": "cell",
+                "time_key": "24",
+                "pubchem_cid": str(100 + index),
+                "matched_condition_key": f"condition-{index}",
+                "left_obs_id": f"left-{index}",
+            }
+            row.update(
+                {
+                    metric: 0.5 + (0.01 * index)
+                    for metric in TABLE5_METRICS
+                }
+            )
+            rows.append(row)
+
+        ci = build_table5_ci(
+            pd.DataFrame(rows),
+            n_boot=20,
+            seed=20260505,
+            workers=1,
+            progress=False,
+        )
+
+        self.assertEqual(set(ci["metric"]), set(TABLE5_METRICS))
+        self.assertEqual(set(ci["dataset_a"]), {"a"})
+        self.assertEqual(set(ci["dataset_b"]), {"b"})
+        self.assertEqual(set(ci["ci_status"]), {"ok"})
+
     def test_l2_retrieval_ci_accepts_explicit_similarity_and_scale(self):
         rows = []
         for direction in ("A_to_B", "B_to_A"):

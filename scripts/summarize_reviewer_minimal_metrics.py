@@ -259,8 +259,9 @@ def _w4_long_frame(
     metric_candidates: Sequence[str],
     required_metrics: Sequence[str],
     label: str,
+    scale_variant: str = PER_GENE_DATASET_VARIANT,
 ) -> tuple[pd.DataFrame, list[str]]:
-    prefix = f"{PER_GENE_DATASET_VARIANT}__"
+    prefix = f"{scale_variant}__"
     identity_columns = [
         column
         for column in (
@@ -294,7 +295,7 @@ def _w4_long_frame(
             for column in metric_columns
         }
     )
-    result.insert(2, "scale_variant", PER_GENE_DATASET_VARIANT)
+    result.insert(2, "scale_variant", scale_variant)
     return result, [column[len(prefix) :] for column in metric_columns]
 
 

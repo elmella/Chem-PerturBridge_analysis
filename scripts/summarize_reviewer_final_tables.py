@@ -30,6 +30,11 @@ from scripts.population_zscore import (
 from scripts.summarize_reviewer_minimal_metrics import (
     DOSE_METRICS,
     RETRIEVAL_CI_METRICS,
+    W4_DEG_METRICS,
+    W4_IDENTITY_COLUMNS,
+    W4_SIGNATURE_METRICS,
+    _w4_ci,
+    _w4_long_frame,
     _read_metrics,
     _summary_input_columns,
     build_retrieval_ci,
@@ -50,6 +55,21 @@ DEFAULT_PEER_SUMMARY = Path(
 )
 DEFAULT_OUTPUT_DIR = Path(
     "results/parallel_cross_source/reviewer_final_summary"
+)
+DEFAULT_RAW_DEG_METRICS = Path(
+    "results/parallel_cross_source/deg/production/deg_scored_metrics.tsv"
+)
+DEFAULT_DATASET_CELL_TYPE_DEG_METRICS = Path(
+    "results/parallel_cross_source/deg/normalized_dataset_cell_type/"
+    "deg_scored_metrics.tsv"
+)
+DEFAULT_DATASET_CELL_TYPE_SIGNATURE_METRICS = Path(
+    "results/parallel_cross_source/signature/normalized_dataset_cell_type/"
+    "signature_scored_metrics.tsv"
+)
+DEFAULT_DATASET_CELL_TYPE_RETRIEVAL_METRICS = Path(
+    "results/parallel_cross_source/retrieval/normalized_dataset_cell_type/"
+    "retrieval_scored_metrics.tsv"
 )
 L2_SCALE_VARIANTS = (
     "raw",
@@ -102,6 +122,160 @@ CI_IDENTITY_COLUMNS = (
     "scale_variant",
     "metric",
 )
+TABLE5_METRICS = (
+    "observed_direction_agreement_p05",
+    "baseline_pair_direction_agreement_p05",
+    "delta_vs_baseline_pair_direction_agreement_p05",
+    "raw_source_centroid_direction_agreement_pair_p05",
+    "raw_delta_vs_source_centroid_direction_agreement_p05",
+    "raw_target_centroid_direction_agreement_pair_p05",
+    "raw_delta_vs_target_centroid_direction_agreement_p05",
+    "raw_source_peer_direction_agreement_pair_p05",
+    "raw_delta_vs_source_peer_direction_agreement_p05",
+    "raw_source_peer_direction_agreement_pair_p05_sd_score",
+    "raw_source_peer_direction_agreement_pair_p05_fraction_below_observed",
+    "raw_source_peer_direction_agreement_pair_p05_corrected_percentile",
+    "raw_target_peer_direction_agreement_pair_p05",
+    "raw_delta_vs_target_peer_direction_agreement_p05",
+    "raw_target_peer_direction_agreement_pair_p05_sd_score",
+    "raw_target_peer_direction_agreement_pair_p05_fraction_below_observed",
+    "raw_target_peer_direction_agreement_pair_p05_corrected_percentile",
+)
+
+
+def build_table5_ci(
+    deg: pd.DataFrame,
+    *,
+    n_boot: int,
+    seed: int,
+    workers: int = 1,
+    bootstrap_batch_size: int = 64,
+    progress: bool = False,
+) -> pd.DataFrame:
+    """Summarize raw cross-source direction agreement for reviewer Table 5."""
+    required = (
+        "dataset_a",
+        "dataset_b",
+        "cell_type",
+        "time_key",
+        "pubchem_cid",
+        "matched_condition_key",
+        "left_obs_id",
+        *TABLE5_METRICS,
+    )
+    _require_columns(deg, required, label="Table 5 DEG metrics")
+    focused = deg.loc[:, required].copy()
+    focused.insert(2, "scale_variant", "raw")
+    return _w4_ci(
+        focused,
+        metrics=TABLE5_METRICS,
+        n_boot=n_boot,
+        seed=seed,
+        summary_level="table_5_dataset_pair",
+        workers=workers,
+        bootstrap_batch_size=bootstrap_batch_size,
+        progress=progress,
+    )
+
+
+def build_population_ci(
+    frame: pd.DataFrame,
+    *,
+    metric_candidates: Sequence[str],
+    required_metrics: Sequence[str],
+    scale_variant: str,
+    summary_level: str,
+    n_boot: int,
+    seed: int,
+    workers: int = 1,
+    bootstrap_batch_size: int = 64,
+    progress: bool = False,
+) -> pd.DataFrame:
+    normalized, metrics = _w4_long_frame(
+        frame,
+        metric_candidates=metric_candidates,
+        required_metrics=required_metrics,
+        label=f"{summary_level} metrics",
+        scale_variant=scale_variant,
+    )
+    return _w4_ci(
+        normalized,
+        metrics=metrics,
+        n_boot=n_boot,
+        seed=seed,
+        summary_level=summary_level,
+        workers=workers,
+        bootstrap_batch_size=bootstrap_batch_size,
+        progress=progress,
+    )
+
+
+def _population_input_columns(
+    metrics: Sequence[str],
+    *,
+    scale_variant: str,
+) -> set[str]:
+    prefix = f"{scale_variant}__"
+    return {
+        *W4_IDENTITY_COLUMNS,
+        *(f"{prefix}{metric}" for metric in metrics),
+    }
+
+
+def _ci_presentation(
+    ci: pd.DataFrame,
+    *,
+    pair_labels: dict[tuple[str, str], str],
+) -> pd.DataFrame:
+    required = (
+        "dataset_a",
+        "dataset_b",
+        "scale_variant",
+        "metric",
+        "mean",
+        "ci_low",
+        "ci_high",
+        "n_rows",
+        "n_finite_rows",
+        "n_compounds",
+        "ci_status",
+    )
+    _require_columns(ci, required, label="confidence intervals")
+    result = ci.loc[:, required].copy()
+    result.insert(
+        0,
+        "dataset_pair",
+        [
+            pair_labels.get(
+                (str(dataset_a), str(dataset_b)),
+                _fallback_pair_label(dataset_a, dataset_b),
+            )
+            for dataset_a, dataset_b in zip(
+                result["dataset_a"], result["dataset_b"]
+            )
+        ],
+    )
+    result["estimate_95_ci"] = [
+        _format_ci(
+            mean,
+            low,
+            high,
+            signed=(
+                str(metric).startswith("delta")
+                or "_delta_" in str(metric)
+            ),
+        )
+        for mean, low, high, metric in zip(
+            result["mean"],
+            result["ci_low"],
+            result["ci_high"],
+            result["metric"],
+        )
+    ]
+    return result.sort_values(
+        ["scale_variant", "dataset_a", "dataset_b", "metric"],
+        kind="stable",
+    ).reset_index(drop=True)
 
 
 def _require_columns(
@@ -477,6 +651,34 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_PEER_SUMMARY,
     )
+    parser.add_argument(
+        "--include-additional-tables",
+        action="store_true",
+        help=(
+            "Also build raw direction-agreement Table 5 and dataset-by-cell-type "
+            "normalization comparisons for Tables 4, 6, and 9."
+        ),
+    )
+    parser.add_argument(
+        "--raw-deg-metrics",
+        type=Path,
+        default=DEFAULT_RAW_DEG_METRICS,
+    )
+    parser.add_argument(
+        "--dataset-cell-type-deg-metrics",
+        type=Path,
+        default=DEFAULT_DATASET_CELL_TYPE_DEG_METRICS,
+    )
+    parser.add_argument(
+        "--dataset-cell-type-signature-metrics",
+        type=Path,
+        default=DEFAULT_DATASET_CELL_TYPE_SIGNATURE_METRICS,
+    )
+    parser.add_argument(
+        "--dataset-cell-type-retrieval-metrics",
+        type=Path,
+        default=DEFAULT_DATASET_CELL_TYPE_RETRIEVAL_METRICS,
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--bootstrap-iterations", type=int, default=2000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260505)
@@ -524,16 +726,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary_dir / "reviewer_minimal_retrieval_cluster_bca_ci.tsv",
         label="reviewer-minimal retrieval CI",
     )
-    combined_ci = pd.concat(
-        [minimal_ci, l2_ci],
-        ignore_index=True,
-    )
+    retrieval_ci_parts = [minimal_ci, l2_ci]
+    dataset_cell_type_retrieval_ci = None
+    if args.include_additional_tables:
+        dataset_cell_type_retrieval = _read_metrics(
+            args.dataset_cell_type_retrieval_metrics,
+            label="dataset-by-cell-type retrieval metrics",
+            columns=_summary_input_columns("retrieval"),
+        )
+        dataset_cell_type_retrieval_ci = build_retrieval_ci(
+            dataset_cell_type_retrieval,
+            n_boot=int(args.bootstrap_iterations),
+            seed=int(args.bootstrap_seed),
+            similarity_metrics=("cosine", "spearman"),
+            scale_variants=(PER_GENE_DATASET_CELL_TYPE_VARIANT,),
+            summary_level=(
+                "reviewer_dataset_cell_type_retrieval_dataset_pair"
+            ),
+            workers=int(args.workers),
+            bootstrap_batch_size=int(args.bootstrap_batch_size),
+            progress=progress,
+        )
+        retrieval_ci_parts.append(dataset_cell_type_retrieval_ci)
+    combined_ci = pd.concat(retrieval_ci_parts, ignore_index=True)
     _validate_retrieval_ci(combined_ci)
     pair_labels = _dataset_pair_labels(summary_dir)
     numeric = _table9_numeric_long(
         combined_ci,
         pair_labels=pair_labels,
     )
+    cosine_spearman_scales = ["raw", PER_GENE_DATASET_VARIANT]
+    if args.include_additional_tables:
+        cosine_spearman_scales.append(
+            PER_GENE_DATASET_CELL_TYPE_VARIANT
+        )
     panels = {
         (
             f"table9_{metric}_{scale}.tsv"
@@ -549,8 +775,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             scale_variant=scale,
         )
         for metric, scales in (
-            ("cosine", ("raw", PER_GENE_DATASET_VARIANT)),
-            ("spearman", ("raw", PER_GENE_DATASET_VARIANT)),
+            ("cosine", tuple(cosine_spearman_scales)),
+            ("spearman", tuple(cosine_spearman_scales)),
             ("negative_l2", L2_SCALE_VARIANTS),
         )
         for scale in scales
@@ -579,6 +805,123 @@ def main(argv: Sequence[str] | None = None) -> int:
             "All-peer sensitivity summary contains non-OK intervals"
         )
 
+    additional_outputs: dict[str, pd.DataFrame] = {}
+    additional_input_paths: list[Path] = []
+    if args.include_additional_tables:
+        raw_deg = _read_metrics(
+            args.raw_deg_metrics,
+            label="raw DEG metrics for Table 5",
+            columns={*W4_IDENTITY_COLUMNS, *TABLE5_METRICS},
+        )
+        table5_ci = build_table5_ci(
+            raw_deg,
+            n_boot=int(args.bootstrap_iterations),
+            seed=int(args.bootstrap_seed),
+            workers=int(args.workers),
+            bootstrap_batch_size=int(args.bootstrap_batch_size),
+            progress=progress,
+        )
+
+        dataset_cell_type_deg = _read_metrics(
+            args.dataset_cell_type_deg_metrics,
+            label="dataset-by-cell-type DEG metrics",
+            columns=_population_input_columns(
+                W4_DEG_METRICS,
+                scale_variant=PER_GENE_DATASET_CELL_TYPE_VARIANT,
+            ),
+        )
+        table4_cell_type_ci = build_population_ci(
+            dataset_cell_type_deg,
+            metric_candidates=W4_DEG_METRICS,
+            required_metrics=(
+                "w4_observed_deg_lfc_spearman_sym_p05",
+            ),
+            scale_variant=PER_GENE_DATASET_CELL_TYPE_VARIANT,
+            summary_level="table_4_dataset_cell_type_dataset_pair",
+            n_boot=int(args.bootstrap_iterations),
+            seed=int(args.bootstrap_seed),
+            workers=int(args.workers),
+            bootstrap_batch_size=int(args.bootstrap_batch_size),
+            progress=progress,
+        )
+        dataset_table4_ci = _read_tsv(
+            summary_dir / "w4_deg_cluster_bca_ci.tsv",
+            label="dataset-wide Table 4 confidence intervals",
+        )
+        table4_comparison_ci = pd.concat(
+            [dataset_table4_ci, table4_cell_type_ci],
+            ignore_index=True,
+        )
+
+        dataset_cell_type_signature = _read_metrics(
+            args.dataset_cell_type_signature_metrics,
+            label="dataset-by-cell-type signature metrics",
+            columns=_population_input_columns(
+                W4_SIGNATURE_METRICS,
+                scale_variant=PER_GENE_DATASET_CELL_TYPE_VARIANT,
+            ),
+        )
+        table6_cell_type_ci = build_population_ci(
+            dataset_cell_type_signature,
+            metric_candidates=W4_SIGNATURE_METRICS,
+            required_metrics=("w4_observed_spearman_logfc",),
+            scale_variant=PER_GENE_DATASET_CELL_TYPE_VARIANT,
+            summary_level="table_6_dataset_cell_type_dataset_pair",
+            n_boot=int(args.bootstrap_iterations),
+            seed=int(args.bootstrap_seed),
+            workers=int(args.workers),
+            bootstrap_batch_size=int(args.bootstrap_batch_size),
+            progress=progress,
+        )
+        dataset_table6_ci = _read_tsv(
+            summary_dir / "w4_signature_cluster_bca_ci.tsv",
+            label="dataset-wide Table 6 confidence intervals",
+        )
+        table6_comparison_ci = pd.concat(
+            [dataset_table6_ci, table6_cell_type_ci],
+            ignore_index=True,
+        )
+
+        additional_outputs = {
+            "table5_direction_agreement_cluster_bca_ci.tsv": table5_ci,
+            "table5_direction_agreement.tsv": _ci_presentation(
+                table5_ci,
+                pair_labels=pair_labels,
+            ),
+            "table4_dataset_cell_type_cluster_bca_ci.tsv": (
+                table4_cell_type_ci
+            ),
+            "table4_normalization_comparison_cluster_bca_ci.tsv": (
+                table4_comparison_ci
+            ),
+            "table4_normalization_comparison.tsv": _ci_presentation(
+                table4_comparison_ci,
+                pair_labels=pair_labels,
+            ),
+            "table6_dataset_cell_type_cluster_bca_ci.tsv": (
+                table6_cell_type_ci
+            ),
+            "table6_normalization_comparison_cluster_bca_ci.tsv": (
+                table6_comparison_ci
+            ),
+            "table6_normalization_comparison.tsv": _ci_presentation(
+                table6_comparison_ci,
+                pair_labels=pair_labels,
+            ),
+        }
+        if dataset_cell_type_retrieval_ci is not None:
+            additional_outputs[
+                "retrieval_dataset_cell_type_cluster_bca_ci.tsv"
+            ] = dataset_cell_type_retrieval_ci
+        additional_input_paths = [
+            Path(args.raw_deg_metrics),
+            Path(args.dataset_cell_type_deg_metrics),
+            Path(args.dataset_cell_type_signature_metrics),
+            Path(args.dataset_cell_type_retrieval_metrics),
+            summary_dir / "w4_deg_cluster_bca_ci.tsv",
+            summary_dir / "w4_signature_cluster_bca_ci.tsv",
+        ]
+
     outputs = {
         "retrieval_l2_cluster_bca_ci.tsv": l2_ci,
         "retrieval_combined_cluster_bca_ci.tsv": combined_ci,
@@ -590,6 +933,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         "dose_threshold_deg_cluster_bca_ci_complete.tsv": complete_dose_ci,
         **panels,
+        **additional_outputs,
     }
     with output_directory_lock(output_dir):
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -613,6 +957,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         / "dose_threshold_deg_metric_summary.tsv",
                         summary_dir
                         / "dose_threshold_deg_cluster_bca_ci.tsv",
+                        *additional_input_paths,
                     )
                 ],
                 "outputs": sorted([*outputs, "run_metadata.json"]),

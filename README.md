@@ -235,6 +235,53 @@ cap remains 512 for bounded exploratory runs; eligible and scored peer counts
 are recorded separately. The second dataset-by-cell-type W4 scale remains
 available through `--w4-scales all`.
 
+### Table 5 and dataset-by-cell-type normalization sensitivity
+
+The raw DEG scorer already writes the source- and target-side individual-peer
+direction-agreement metrics needed for Table 5. Dataset-by-cell-type normalized
+Tables 4, 6, and 9 can be calculated independently, without repeating raw or
+dataset-wide scoring:
+
+```bash
+uv run python scripts/run_overlap_group_rep_deg_metrics.py \
+  --compute w4-dataset-cell-type \
+  --max-baseline-peers 0 \
+  --workers 8 \
+  --run-tag normalized_dataset_cell_type \
+  --progress always
+
+uv run python scripts/run_overlap_group_rep_signature_similarity.py \
+  --compute w4-dataset-cell-type \
+  --max-baseline-peers 0 \
+  --workers 8 \
+  --run-tag normalized_dataset_cell_type \
+  --progress always
+
+uv run python scripts/run_overlap_group_rep_retrieval_metrics.py \
+  --compute w4-dataset-cell-type-cosine,w4-dataset-cell-type-spearman \
+  --max-baseline-peers 0 \
+  --workers 8 \
+  --run-tag normalized_dataset_cell_type \
+  --progress always
+```
+
+After those three runs finish, extend the existing final summary without
+opening an H5AD or repeating any scoring:
+
+```bash
+uv run python scripts/summarize_reviewer_final_tables.py \
+  --include-additional-tables \
+  --bootstrap-iterations 2000 \
+  --workers 8 \
+  --bootstrap-batch-size 64 \
+  --progress always
+```
+
+This adds the compound-clustered Table 5 direction-agreement summary, direct
+dataset-wide versus dataset-by-cell-type normalization comparisons for Tables
+4 and 6, and dataset-by-cell-type cosine/Spearman panels in the combined Table
+9 outputs. The path flags shown by `--help` can override any run directory.
+
 ## What Is Implemented
 
 - Dataset loading for `sciplex`, `tahoe`, `l1000_phase1`, `l1000_phase2` using paths from `notebooks/load_data.ipynb`.
