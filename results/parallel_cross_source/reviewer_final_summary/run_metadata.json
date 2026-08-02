@@ -1,0 +1,91 @@
+{
+  "analysis": "reviewer-final-summary",
+  "bootstrap_iterations": 2000,
+  "bootstrap_seed": 20260505,
+  "inputs": [
+    {
+      "mtime_ns": 1785187641602490461,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/parallel_cross_source/retrieval/l2_raw_w4_both/retrieval_scored_metrics.tsv",
+      "size": 202965136
+    },
+    {
+      "mtime_ns": 1785191976300516550,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/parallel_cross_source/retrieval/peer_sensitivity_raw_summary/retrieval_peer_sensitivity_cluster_bca_ci.tsv",
+      "size": 112623
+    },
+    {
+      "mtime_ns": 1785182895539511778,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/parallel_cross_source/reviewer_minimal_summary/reviewer_minimal_retrieval_cluster_bca_ci.tsv",
+      "size": 585182
+    },
+    {
+      "mtime_ns": 1785182943140038421,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/parallel_cross_source/reviewer_minimal_summary/dose_threshold_deg_metric_summary.tsv",
+      "size": 6849
+    },
+    {
+      "mtime_ns": 1785182943160038643,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/parallel_cross_source/reviewer_minimal_summary/dose_threshold_deg_cluster_bca_ci.tsv",
+      "size": 377168
+    },
+    {
+      "mtime_ns": 1785179786744998482,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/parallel_cross_source/deg/production/deg_scored_metrics.tsv",
+      "size": 197082211
+    },
+    {
+      "mtime_ns": 1785214522450671400,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/parallel_cross_source/deg/normalized_dataset_cell_type/deg_scored_metrics.tsv",
+      "size": 82777565
+    },
+    {
+      "mtime_ns": 1785658818483763540,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/parallel_cross_source/signature/normalized_dataset_cell_type/signature_scored_metrics.tsv",
+      "size": 84792914
+    },
+    {
+      "mtime_ns": 1785632159798997059,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/parallel_cross_source/retrieval/normalized_dataset_cell_type/retrieval_scored_metrics.tsv",
+      "size": 141007387
+    },
+    {
+      "mtime_ns": 1785182943140038421,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/parallel_cross_source/reviewer_minimal_summary/w4_deg_cluster_bca_ci.tsv",
+      "size": 59057
+    },
+    {
+      "mtime_ns": 1785182947720089097,
+      "path": "/home/cirro/Chem-PerturBridge_analysis/results/parallel_cross_source/reviewer_minimal_summary/w4_signature_cluster_bca_ci.tsv",
+      "size": 58389
+    }
+  ],
+  "outputs": [
+    "dose_threshold_deg_cluster_bca_ci_complete.tsv",
+    "dose_threshold_deg_metric_summary_complete.tsv",
+    "retrieval_combined_cluster_bca_ci.tsv",
+    "retrieval_dataset_cell_type_cluster_bca_ci.tsv",
+    "retrieval_l2_cluster_bca_ci.tsv",
+    "retrieval_peer_sensitivity_all.tsv",
+    "run_metadata.json",
+    "table4_dataset_cell_type_cluster_bca_ci.tsv",
+    "table4_normalization_comparison.tsv",
+    "table4_normalization_comparison_cluster_bca_ci.tsv",
+    "table5_direction_agreement.tsv",
+    "table5_direction_agreement_cluster_bca_ci.tsv",
+    "table6_dataset_cell_type_cluster_bca_ci.tsv",
+    "table6_normalization_comparison.tsv",
+    "table6_normalization_comparison_cluster_bca_ci.tsv",
+    "table9_cosine_raw.tsv",
+    "table9_cosine_w4_dataset.tsv",
+    "table9_cosine_w4_dataset_cell_type.tsv",
+    "table9_l2_raw.tsv",
+    "table9_l2_w4_dataset.tsv",
+    "table9_l2_w4_dataset_cell_type.tsv",
+    "table9_retrieval_combined.tsv",
+    "table9_retrieval_combined_numeric_long.tsv",
+    "table9_spearman_raw.tsv",
+    "table9_spearman_w4_dataset.tsv",
+    "table9_spearman_w4_dataset_cell_type.tsv"
+  ],
+  "workers": 8
+}

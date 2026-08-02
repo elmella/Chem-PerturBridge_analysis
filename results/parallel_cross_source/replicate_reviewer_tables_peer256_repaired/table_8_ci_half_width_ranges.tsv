@@ -1,0 +1,9 @@
+summary_level	metric	n_intervals	min_ci_half_width	median_ci_half_width	max_ci_half_width	min_n_compounds	max_n_compounds	ci_methods	ci_statuses
+table_8_dataset	centroid_baseline_direction_agreement_p05	6	0.0038094698279406702	0.00972187509079453	0.025899503174766525	114	10310	bca	ok
+table_8_dataset	delta_vs_centroid_direction_agreement_p05	6	0.005490473716074543	0.015020431517555	0.045509397685864254	103	4065	bca	ok
+table_8_dataset	delta_vs_individual_peer_direction_agreement_p05	6	0.004325190695566694	0.010081049591607036	0.04577017838945748	103	4065	bca	ok
+table_8_dataset	individual_peer_corrected_percentile_direction_agreement_p05	6	0.005452790354681825	0.010052150702416635	0.0612837663783366	103	4065	bca	ok
+table_8_dataset	individual_peer_fraction_below_observed_direction_agreement_p05	6	0.005898854825515498	0.010191652709991894	0.06195042600776485	103	4065	bca	ok
+table_8_dataset	individual_peer_mean_direction_agreement_p05	6	0.0013688985470877713	0.005539987181031075	0.02214908486261591	103	4065	bca	ok
+table_8_dataset	individual_peer_sd_direction_agreement_p05	6	0.0020898863702610015	0.004585434167766196	0.007814663962034597	103	4065	bca	ok
+table_8_dataset	observed_direction_agreement_p05	6	0.00328724258574431	0.010435321546047038	0.05741511393394205	103	4065	bca	ok
