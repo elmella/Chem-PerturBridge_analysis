@@ -204,6 +204,45 @@ TABLE_METRICS: dict[int, dict[str, str]] = {
     },
 }
 
+for _scale_label, _scale_suffix in (
+    ("dataset_normalized", "normalized_dataset"),
+    ("dataset_cell_type_normalized", "normalized_dataset_cell_type"),
+):
+    for _output_stem, _source_stem in (
+        ("observed_replicate_spearman_logfc", "mean_replicate_spearman_logfc"),
+        (
+            "centroid_baseline_spearman_logfc",
+            "mean_replicate_baseline_spearman_logfc",
+        ),
+        (
+            "delta_vs_centroid_spearman_logfc",
+            "mean_replicate_minus_baseline_spearman_logfc",
+        ),
+        (
+            "individual_peer_mean_spearman_logfc",
+            "mean_peer_baseline_spearman_logfc",
+        ),
+        (
+            "individual_peer_sd_spearman_logfc",
+            "mean_peer_baseline_sd_spearman_logfc",
+        ),
+        (
+            "individual_peer_fraction_below_observed_spearman_logfc",
+            "mean_peer_baseline_fraction_below_observed_spearman_logfc",
+        ),
+        (
+            "individual_peer_corrected_percentile_spearman_logfc",
+            "mean_peer_baseline_corrected_percentile_spearman_logfc",
+        ),
+        (
+            "delta_vs_individual_peer_spearman_logfc",
+            "mean_replicate_minus_peer_baseline_spearman_logfc",
+        ),
+    ):
+        TABLE_METRICS[10][f"{_scale_label}_{_output_stem}"] = (
+            f"{_source_stem}_{_scale_suffix}"
+        )
+
 TABLE_PRIMARY_METRICS = {
     7: (
         "observed_deg_lfc_spearman_sym_p05",
@@ -248,6 +287,22 @@ TABLE_PRIMARY_METRICS = {
         "dataset_cell_type_normalized_individual_peer_corrected_percentile_cosine",
     ),
 }
+
+TABLE_PRIMARY_METRICS[10] += tuple(
+    f"{scale_label}_{metric_name}"
+    for scale_label in (
+        "dataset_normalized",
+        "dataset_cell_type_normalized",
+    )
+    for metric_name in (
+        "observed_replicate_spearman_logfc",
+        "centroid_baseline_spearman_logfc",
+        "delta_vs_centroid_spearman_logfc",
+        "individual_peer_mean_spearman_logfc",
+        "delta_vs_individual_peer_spearman_logfc",
+        "individual_peer_corrected_percentile_spearman_logfc",
+    )
+)
 
 
 def _sha256(path: Path) -> str:

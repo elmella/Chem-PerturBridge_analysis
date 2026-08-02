@@ -377,11 +377,20 @@ def add_common_run_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--compute-normalized-spearman",
+        action="store_true",
+        help=(
+            "Compute per-gene population-normalized within-dataset replicate "
+            "Spearman agreement, including centroid and individual-peer baselines. "
+            "Existing population statistics are reused; none are fitted here."
+        ),
+    )
+    parser.add_argument(
         "--normalization-scales",
         choices=("all", "dataset", "dataset-cell-type"),
         default="all",
         help=(
-            "Population normalization scopes for normalized cosine. "
+            "Population normalization scopes for normalized cosine or Spearman. "
             "Default: both dataset and dataset-by-cell-type."
         ),
     )
@@ -571,6 +580,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--compute-normalized-cosine",
         action="store_true",
         help="Compute normalized replicate cosine and its centroid/peer baselines.",
+    )
+    run_task_parser.add_argument(
+        "--compute-normalized-spearman",
+        action="store_true",
+        help="Compute normalized replicate Spearman and its centroid/peer baselines.",
     )
     run_task_parser.add_argument(
         "--normalization-scales",
@@ -2583,6 +2597,7 @@ def compute_condition_metric_record_from_rows(
     compute_deg_metrics: bool = False,
     compute_baseline_metrics: bool = False,
     compute_normalized_cosine: bool = False,
+    compute_normalized_spearman: bool = False,
     normalization_scopes: tuple[str, ...] = NORMALIZATION_SCOPES,
     population_stats_cache: Optional[ReplicatePopulationStatsCache] = None,
     baseline_source_frame: Optional[pd.DataFrame] = None,
@@ -2742,6 +2757,28 @@ def compute_condition_metric_record_from_rows(
             record[f"n_cosine_genes_{suffix}"] = 0
             record[f"n_valid_replicate_cosine_pairs_{metric_suffix}"] = 0
             record[f"n_valid_peer_cosine_pairs_{metric_suffix}"] = 0
+    if compute_normalized_spearman:
+        for scope in normalization_scopes:
+            suffix = (
+                "dataset"
+                if scope == DATASET_SCOPE
+                else "dataset_cell_type"
+            )
+            metric_suffix = f"normalized_{suffix}"
+            for field_name in (
+                "mean_replicate_spearman_logfc",
+                "mean_replicate_baseline_spearman_logfc",
+                "mean_replicate_minus_baseline_spearman_logfc",
+                "mean_peer_baseline_spearman_logfc",
+                "mean_peer_baseline_sd_spearman_logfc",
+                "mean_peer_baseline_fraction_below_observed_spearman_logfc",
+                "mean_peer_baseline_corrected_percentile_spearman_logfc",
+                "mean_replicate_minus_peer_baseline_spearman_logfc",
+            ):
+                record[f"{field_name}_{metric_suffix}"] = float("nan")
+            record[f"n_spearman_genes_{suffix}"] = 0
+            record[f"n_valid_replicate_spearman_pairs_{metric_suffix}"] = 0
+            record[f"n_valid_peer_spearman_pairs_{metric_suffix}"] = 0
 
     raw_local_logfc_matrix: Optional[np.ndarray] = None
     raw_local_t_matrix: Optional[np.ndarray] = None
@@ -3331,6 +3368,154 @@ def compute_condition_metric_record_from_rows(
                     f"mean_replicate_minus_peer_baseline_cosine_logfc_{metric_suffix}"
                 ] = mean_available(np.asarray(peer_deltas, dtype=np.float64))
                 record[f"n_valid_peer_cosine_pairs_{metric_suffix}"] = int(
+                    np.isfinite(
+                        np.asarray(peer_fields["peer_mean_score"], dtype=np.float64)
+                    ).sum()
+                )
+
+    if compute_normalized_spearman:
+        if population_stats_cache is None:
+            raise ValueError(
+                "Normalized Spearman requested without a population-statistics cache"
+            )
+        if raw_local_logfc_matrix is not None:
+            for scope in normalization_scopes:
+                suffix = (
+                    "dataset"
+                    if scope == DATASET_SCOPE
+                    else "dataset_cell_type"
+                )
+                metric_suffix = f"normalized_{suffix}"
+                population_stats = population_stats_cache.get(
+                    dataset_name=dataset_name,
+                    cell_type=cell_type,
+                    scope=scope,
+                )
+                normalized_replicates = normalized_matrix_for_stats(
+                    raw_local_logfc_matrix,
+                    gene_keys=local_gene_keys,
+                    stats_record=population_stats,
+                )
+                centroid = (
+                    normalized_matrix_for_stats(
+                        raw_local_baseline_logfc[np.newaxis, :],
+                        gene_keys=local_gene_keys,
+                        stats_record=population_stats,
+                    )[0]
+                    if raw_local_baseline_logfc is not None
+                    else None
+                )
+                peer_matrix = (
+                    normalized_matrix_for_stats(
+                        raw_local_peer_logfc_matrix,
+                        gene_keys=local_gene_keys,
+                        stats_record=population_stats,
+                    )
+                    if raw_local_peer_logfc_matrix is not None
+                    else None
+                )
+                record[f"n_spearman_genes_{suffix}"] = int(
+                    normalized_replicates.shape[1]
+                )
+                if normalized_replicates.shape[1] < 2:
+                    continue
+                observed_values = np.asarray(
+                    [
+                        vector_spearman_similarity(
+                            normalized_replicates[left_idx],
+                            normalized_replicates[right_idx],
+                        )
+                        for left_idx, right_idx in pair_indices
+                    ],
+                    dtype=np.float64,
+                )
+                record[
+                    f"mean_replicate_spearman_logfc_{metric_suffix}"
+                ] = mean_available(observed_values)
+                record[
+                    f"n_valid_replicate_spearman_pairs_{metric_suffix}"
+                ] = int(np.isfinite(observed_values).sum())
+
+                if centroid is not None and centroid.size == normalized_replicates.shape[1]:
+                    replicate_centroid_values, _ = pairwise_replicate_baseline_values(
+                        normalized_replicates,
+                        centroid,
+                        pair_indices=pair_indices,
+                        scorer=vector_spearman_similarity,
+                    )
+                    record[
+                        f"mean_replicate_baseline_spearman_logfc_{metric_suffix}"
+                    ] = mean_available(replicate_centroid_values)
+                    record[
+                        f"mean_replicate_minus_baseline_spearman_logfc_{metric_suffix}"
+                    ] = mean_available(
+                        observed_values - replicate_centroid_values
+                    )
+
+                if (
+                    peer_matrix is None
+                    or peer_matrix.shape[0] == 0
+                    or peer_matrix.shape[1] != normalized_replicates.shape[1]
+                ):
+                    continue
+                peer_fields: dict[str, list[float]] = defaultdict(list)
+                peer_deltas: list[float] = []
+                peer_scores_by_replicate: dict[int, np.ndarray] = {}
+                for pair_position, (left_idx, right_idx) in enumerate(pair_indices):
+                    for replicate_idx in (left_idx, right_idx):
+                        if replicate_idx not in peer_scores_by_replicate:
+                            peer_scores_by_replicate[replicate_idx] = (
+                                spearman_against_peers(
+                                    normalized_replicates[replicate_idx],
+                                    peer_matrix,
+                                )
+                            )
+                    pair_summary = replicate_pair_peer_summary(
+                        peer_scores_by_replicate[left_idx],
+                        peer_scores_by_replicate[right_idx],
+                        float(observed_values[pair_position]),
+                        "peer",
+                    )
+                    for field_name, field_value in pair_summary.items():
+                        peer_fields[field_name].append(float(field_value))
+                    peer_deltas.append(
+                        difference_if_both_defined(
+                            float(observed_values[pair_position]),
+                            float(pair_summary["peer_mean_score"]),
+                        )
+                    )
+                record[
+                    f"mean_peer_baseline_spearman_logfc_{metric_suffix}"
+                ] = mean_available(
+                    np.asarray(peer_fields["peer_mean_score"], dtype=np.float64)
+                )
+                record[
+                    f"mean_peer_baseline_sd_spearman_logfc_{metric_suffix}"
+                ] = mean_available(
+                    np.asarray(peer_fields["peer_sd_score"], dtype=np.float64)
+                )
+                record[
+                    "mean_peer_baseline_fraction_below_observed_spearman_logfc_"
+                    f"{metric_suffix}"
+                ] = mean_available(
+                    np.asarray(
+                        peer_fields["peer_fraction_below_observed"],
+                        dtype=np.float64,
+                    )
+                )
+                record[
+                    "mean_peer_baseline_corrected_percentile_spearman_logfc_"
+                    f"{metric_suffix}"
+                ] = mean_available(
+                    np.asarray(
+                        peer_fields["peer_corrected_percentile"],
+                        dtype=np.float64,
+                    )
+                )
+                record[
+                    f"mean_replicate_minus_peer_baseline_spearman_logfc_{metric_suffix}"
+                ] = mean_available(np.asarray(peer_deltas, dtype=np.float64))
+                record[f"n_valid_peer_spearman_pairs_{metric_suffix}"] = int(
                     np.isfinite(
                         np.asarray(peer_fields["peer_mean_score"], dtype=np.float64)
                     ).sum()
@@ -4164,6 +4349,7 @@ def prepare(
     deg_definitions: str = "all",
     compute_retrieval_metrics: bool = False,
     compute_normalized_cosine: bool = False,
+    compute_normalized_spearman: bool = False,
     normalization_scales: str = "all",
     population_stats_root: Path = DEFAULT_POPULATION_STATS_ROOT,
     min_retrieval_compounds_per_line_time: int = DEFAULT_MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME,
@@ -4396,7 +4582,7 @@ def prepare(
         )
         for dataset_name in active_datasets
     }
-    if compute_normalized_cosine:
+    if compute_normalized_cosine or compute_normalized_spearman:
         cache_reader = ReplicatePopulationStatsCache(population_stats_root)
         requested_scopes = resolve_normalization_scopes(normalization_scales)
         missing_caches: list[str] = []
@@ -4450,6 +4636,7 @@ def prepare(
             ),
             "compute_retrieval_metrics": bool(compute_retrieval_metrics),
             "compute_normalized_cosine": bool(compute_normalized_cosine),
+            "compute_normalized_spearman": bool(compute_normalized_spearman),
             "normalization_scales": str(normalization_scales),
             "population_stats_root": str(Path(population_stats_root).resolve()),
             "min_retrieval_compounds_per_line_time": int(min_retrieval_compounds_per_line_time),
@@ -4544,6 +4731,7 @@ def run_task(
     compute_deg_metrics: bool,
     compute_retrieval_metrics: bool,
     compute_normalized_cosine: bool,
+    compute_normalized_spearman: bool,
     normalization_scales: str,
     population_stats_root: Path,
     min_retrieval_compounds_per_line_time: int,
@@ -4614,6 +4802,7 @@ def run_task(
         compute_baseline_metrics
         or compute_retrieval_metrics
         or compute_normalized_cosine
+        or compute_normalized_spearman
     ):
         full_dataset_source_frame = pd.read_csv(
             dataset_metadata_cache_path(output_dir, dataset_name),
@@ -4625,7 +4814,9 @@ def run_task(
             full_dataset_source_frame["condition_key"].astype(str).isin(retained_condition_keys)
         ].copy()
     if (
-        compute_baseline_metrics or compute_normalized_cosine
+        compute_baseline_metrics
+        or compute_normalized_cosine
+        or compute_normalized_spearman
     ) and full_dataset_source_frame is not None:
         baseline_source_frame = full_dataset_source_frame.copy()
         task_contexts = conditions_frame[["cell_type", "time_key", "dose_key"]].drop_duplicates().copy()
@@ -4645,7 +4836,7 @@ def run_task(
     open_adatas: dict[str, ad.AnnData] = {}
     population_stats_cache = (
         ReplicatePopulationStatsCache(population_stats_root)
-        if compute_normalized_cosine
+        if compute_normalized_cosine or compute_normalized_spearman
         else None
     )
     normalization_scope_values = resolve_normalization_scopes(
@@ -4692,6 +4883,7 @@ def run_task(
                     compute_deg_metrics=compute_deg_metrics,
                     compute_baseline_metrics=compute_baseline_metrics,
                     compute_normalized_cosine=compute_normalized_cosine,
+                    compute_normalized_spearman=compute_normalized_spearman,
                     normalization_scopes=normalization_scope_values,
                     population_stats_cache=population_stats_cache,
                     baseline_source_frame=baseline_source_frame,
@@ -5168,6 +5360,9 @@ def merge_task_outputs(
     expect_normalized_cosine = bool(
         config.get("compute_normalized_cosine", False)
     )
+    expect_normalized_spearman = bool(
+        config.get("compute_normalized_spearman", False)
+    )
     expected_peer_config_fingerprint = config_fingerprint(config) if config else None
     existing_results_dir = existing_results_dir.resolve() if existing_results_dir is not None else None
     current_dataset_names = read_dataset_names_from_selection_summary(output_dir)
@@ -5305,6 +5500,26 @@ def merge_task_outputs(
         if missing_normalized_columns:
             raise ValueError(
                 "Normalized cosine was requested in the saved prepare config, "
+                "but merged task outputs are missing columns: "
+                f"{missing_normalized_columns}. Rerun the scoring tasks."
+            )
+    if expect_normalized_spearman:
+        expected_normalized_columns = {
+            (
+                "mean_replicate_spearman_logfc_normalized_dataset"
+                if scope == DATASET_SCOPE
+                else "mean_replicate_spearman_logfc_normalized_dataset_cell_type"
+            )
+            for scope in resolve_normalization_scopes(
+                str(config.get("normalization_scales", "all"))
+            )
+        }
+        missing_normalized_columns = sorted(
+            expected_normalized_columns - set(condition_metric_summary.columns)
+        )
+        if missing_normalized_columns:
+            raise ValueError(
+                "Normalized Spearman was requested in the saved prepare config, "
                 "but merged task outputs are missing columns: "
                 f"{missing_normalized_columns}. Rerun the scoring tasks."
             )
@@ -5525,6 +5740,7 @@ def _run_prepared_task_worker(payload: dict[str, object]) -> int:
         compute_deg_metrics=bool(payload["compute_deg_metrics"]),
         compute_retrieval_metrics=bool(payload["compute_retrieval_metrics"]),
         compute_normalized_cosine=bool(payload["compute_normalized_cosine"]),
+        compute_normalized_spearman=bool(payload["compute_normalized_spearman"]),
         normalization_scales=str(payload["normalization_scales"]),
         population_stats_root=Path(str(payload["population_stats_root"])),
         min_retrieval_compounds_per_line_time=int(
@@ -5566,6 +5782,7 @@ def run_all(args: argparse.Namespace) -> None:
             ),
             "compute_retrieval_metrics": bool(args.compute_retrieval_metrics),
             "compute_normalized_cosine": bool(args.compute_normalized_cosine),
+            "compute_normalized_spearman": bool(args.compute_normalized_spearman),
             "normalization_scales": str(args.normalization_scales),
             "population_stats_root": str(
                 Path(args.population_stats_root).resolve()
@@ -5611,6 +5828,7 @@ def run_all(args: argparse.Namespace) -> None:
             deg_definitions=args.deg_definitions,
             compute_retrieval_metrics=args.compute_retrieval_metrics,
             compute_normalized_cosine=args.compute_normalized_cosine,
+            compute_normalized_spearman=args.compute_normalized_spearman,
             normalization_scales=args.normalization_scales,
             population_stats_root=args.population_stats_root,
             min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
@@ -5651,6 +5869,7 @@ def run_all(args: argparse.Namespace) -> None:
         "deg_definitions": str(args.deg_definitions),
         "compute_retrieval_metrics": bool(args.compute_retrieval_metrics),
         "compute_normalized_cosine": bool(args.compute_normalized_cosine),
+        "compute_normalized_spearman": bool(args.compute_normalized_spearman),
         "normalization_scales": str(args.normalization_scales),
         "population_stats_root": str(Path(args.population_stats_root).resolve()),
         "min_retrieval_compounds_per_line_time": int(
@@ -5745,6 +5964,7 @@ def main() -> None:
             deg_definitions=args.deg_definitions,
             compute_retrieval_metrics=args.compute_retrieval_metrics,
             compute_normalized_cosine=args.compute_normalized_cosine,
+            compute_normalized_spearman=args.compute_normalized_spearman,
             normalization_scales=args.normalization_scales,
             population_stats_root=args.population_stats_root,
             min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
@@ -5770,6 +5990,7 @@ def main() -> None:
             compute_deg_metrics=args.compute_deg_metrics,
             compute_retrieval_metrics=args.compute_retrieval_metrics,
             compute_normalized_cosine=args.compute_normalized_cosine,
+            compute_normalized_spearman=args.compute_normalized_spearman,
             normalization_scales=args.normalization_scales,
             population_stats_root=args.population_stats_root,
             min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,

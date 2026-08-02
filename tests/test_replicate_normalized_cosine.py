@@ -109,6 +109,7 @@ class ReplicateNormalizedCosineTests(unittest.TestCase):
                     top_k=2,
                     compute_baseline_metrics=True,
                     compute_normalized_cosine=True,
+                    compute_normalized_spearman=True,
                     normalization_scopes=(DATASET_SCOPE,),
                     population_stats_cache=StatsCache(),
                     baseline_source_frame=rows.copy(),
@@ -130,6 +131,18 @@ class ReplicateNormalizedCosineTests(unittest.TestCase):
             self.assertTrue(
                 np.isfinite(
                     record["mean_replicate_cosine_logfc_normalized_dataset"]
+                )
+            )
+            self.assertTrue(
+                np.isfinite(
+                    record["mean_replicate_spearman_logfc_normalized_dataset"]
+                )
+            )
+            self.assertTrue(
+                np.isfinite(
+                    record[
+                        "mean_peer_baseline_spearman_logfc_normalized_dataset"
+                    ]
                 )
             )
 
