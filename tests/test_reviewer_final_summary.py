@@ -7,6 +7,7 @@ import pandas as pd
 
 from scripts.summarize_reviewer_final_tables import (
     TABLE5_METRICS,
+    TABLE5_SCORER_ALIASES,
     build_table5_ci,
     _complete_dose_ci,
     _complete_dose_pair_summary,
@@ -71,7 +72,9 @@ class ReviewerFinalSummaryTests(unittest.TestCase):
             }
             row.update(
                 {
-                    metric: 0.5 + (0.01 * index)
+                    TABLE5_SCORER_ALIASES.get(metric, metric): (
+                        0.5 + (0.01 * index)
+                    )
                     for metric in TABLE5_METRICS
                 }
             )

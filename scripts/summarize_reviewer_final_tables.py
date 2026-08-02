@@ -141,6 +141,11 @@ TABLE5_METRICS = (
     "raw_target_peer_direction_agreement_pair_p05_fraction_below_observed",
     "raw_target_peer_direction_agreement_pair_p05_corrected_percentile",
 )
+TABLE5_SCORER_ALIASES = {
+    metric: metric.replace("raw_", "pb_", 1)
+    for metric in TABLE5_METRICS
+    if metric.startswith("raw_")
+}
 
 
 def build_table5_ci(
@@ -153,6 +158,10 @@ def build_table5_ci(
     progress: bool = False,
 ) -> pd.DataFrame:
     """Summarize raw cross-source direction agreement for reviewer Table 5."""
+    deg = deg.copy()
+    for presentation_name, scorer_name in TABLE5_SCORER_ALIASES.items():
+        if presentation_name not in deg.columns and scorer_name in deg.columns:
+            deg[presentation_name] = deg[scorer_name]
     required = (
         "dataset_a",
         "dataset_b",
@@ -811,7 +820,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         raw_deg = _read_metrics(
             args.raw_deg_metrics,
             label="raw DEG metrics for Table 5",
-            columns={*W4_IDENTITY_COLUMNS, *TABLE5_METRICS},
+            columns={
+                *W4_IDENTITY_COLUMNS,
+                *TABLE5_METRICS,
+                *TABLE5_SCORER_ALIASES.values(),
+            },
         )
         table5_ci = build_table5_ci(
             raw_deg,
