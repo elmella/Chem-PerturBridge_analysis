@@ -49,6 +49,7 @@ from scripts.cross_source_scoring import (
     score_signature_baselines,
     select_source_peers,
 )
+from scripts.cross_source_strata import SignatureStratum
 from scripts.population_zscore import (
     PER_GENE_DATASET_CELL_TYPE_VARIANT,
     PER_GENE_DATASET_VARIANT,
@@ -539,6 +540,7 @@ def _w4_signature_columns(
     state: Mapping[str, Any],
     w4_catalog,
     scale_variant: str,
+    prepared_strata: dict[tuple[Any, ...], SignatureStratum],
 ) -> dict[str, Any]:
     left_source = state["left_source"]
     right_source = state["right_source"]
@@ -550,54 +552,68 @@ def _w4_signature_columns(
     right_full = state["right_logfc_full"]
     pubchem_cid = str(state["pubchem_cid"])
 
-    left_standardized_full = w4_catalog.standardize_vector(
+    left_sample = w4_catalog.standardize_aligned_vector(
         left_source,
-        left_full,
+        np.asarray(left_full, dtype=np.float64)[left_positions],
+        left_positions,
         scale_variant=scale_variant,
     )
-    right_standardized_full = w4_catalog.standardize_vector(
+    right_sample = w4_catalog.standardize_aligned_vector(
         right_source,
-        right_full,
+        np.asarray(right_full, dtype=np.float64)[right_positions],
+        right_positions,
         scale_variant=scale_variant,
     )
-    left_sample = left_standardized_full[left_positions]
-    right_sample = right_standardized_full[right_positions]
     observed = cross_source_core.signed_spearman(left_sample, right_sample)
 
-    left_stratum_standardized = w4_catalog.standardize_matrix(
+    def prepared_stratum(source, selected, positions) -> SignatureStratum:
+        raw_stratum = selected.stratum
+        cache_key = (
+            id(raw_stratum),
+            str(scale_variant),
+            np.asarray(positions, dtype=np.int64).tobytes(),
+        )
+        prepared = prepared_strata.get(cache_key)
+        if prepared is None:
+            selected_values = np.asarray(
+                raw_stratum.values[:, positions],
+                dtype=np.float64,
+            )
+            standardized = w4_catalog.standardize_aligned_matrix(
+                source,
+                selected_values,
+                np.asarray(positions, dtype=np.int64),
+                scale_variant=scale_variant,
+            )
+            prepared = SignatureStratum(
+                raw_stratum.compounds,
+                standardized,
+                gene_keys=np.asarray(raw_stratum.gene_keys)[positions],
+                max_prepared_cache_bytes=0,
+            )
+            prepared_strata[cache_key] = prepared
+        return prepared
+
+    left_prepared = prepared_stratum(
         left_source,
-        left_selected.stratum.values,
-        scale_variant=scale_variant,
-    )[:, left_positions]
-    right_stratum_standardized = w4_catalog.standardize_matrix(
+        left_selected,
+        left_positions,
+    )
+    right_prepared = prepared_stratum(
         right_source,
-        right_selected.stratum.values,
-        scale_variant=scale_variant,
-    )[:, right_positions]
-    left_all_peer_rows = (
-        left_selected.stratum.different_compound_peer_indices(pubchem_cid)
+        right_selected,
+        right_positions,
     )
-    right_all_peer_rows = (
-        right_selected.stratum.different_compound_peer_indices(pubchem_cid)
+    left_centroid = left_prepared.different_compound_centroid(
+        pubchem_cid,
+        require_all_finite=True,
     )
-    left_centroid = (
-        None
-        if not len(left_all_peer_rows)
-        else left_stratum_standardized[left_all_peer_rows].mean(
-            axis=0,
-            dtype=np.float64,
-        )
+    right_centroid = right_prepared.different_compound_centroid(
+        pubchem_cid,
+        require_all_finite=True,
     )
-    right_centroid = (
-        None
-        if not len(right_all_peer_rows)
-        else right_stratum_standardized[right_all_peer_rows].mean(
-            axis=0,
-            dtype=np.float64,
-        )
-    )
-    left_peers = left_stratum_standardized[left_selected.row_indices]
-    right_peers = right_stratum_standardized[right_selected.row_indices]
+    left_peers = left_prepared.values[left_selected.row_indices]
+    right_peers = right_prepared.values[right_selected.row_indices]
     prefix = f"{scale_variant}__w4"
     values: dict[str, Any] = {
         f"{scale_variant}__n_common_genes": int(len(left_positions)),
@@ -658,7 +674,12 @@ def score_signature_row(
     sampling_seed: int,
     include_raw_metrics: bool = True,
     w4_scale_variants: tuple[str, ...] = POPULATION_SCALE_VARIANTS,
+    prepared_strata: Optional[
+        dict[tuple[Any, ...], SignatureStratum]
+    ] = None,
 ) -> dict[str, Any]:
+    if prepared_strata is None:
+        prepared_strata = {}
     if include_raw_metrics:
         record, state = _raw_signature_record(
             row,
@@ -679,6 +700,7 @@ def score_signature_row(
                 state=state,
                 w4_catalog=w4_catalog,
                 scale_variant=scale_variant,
+                prepared_strata=prepared_strata,
             )
         )
     return record
@@ -693,6 +715,7 @@ def score_task(
     catalog = make_worker_catalog(config)
     diagnostics: list[dict[str, Any]] = []
     records: list[dict[str, Any]] = []
+    prepared_strata: dict[tuple[Any, ...], SignatureStratum] = {}
     try:
         w4_catalog = (
             make_worker_w4_catalog(config, catalog)
@@ -714,6 +737,7 @@ def score_task(
                         w4_scale_variants=tuple(
                             settings["w4_scale_variants"]
                         ),
+                        prepared_strata=prepared_strata,
                     )
                 )
             except KeyError as exc:
@@ -790,7 +814,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "computations": list(selected_computations),
         "include_raw_metrics": "raw" in selected_computations,
         "w4_scale_variants": list(w4_scale_variants),
-        "scorer_version": "parallel-signature-v3",
+        "scorer_version": "parallel-signature-v4",
     }
     run_analysis(
         analysis=ANALYSIS,

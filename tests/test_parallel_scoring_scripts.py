@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import anndata as ad
 import numpy as np
@@ -16,6 +17,7 @@ from scripts.population_zscore import (
     PER_GENE_DATASET_CELL_TYPE_VARIANT,
     PER_GENE_DATASET_VARIANT,
     POPULATION_SCALE_VARIANTS,
+    PopulationStatsCatalog,
     load_or_fit_dataset_population_stats_from_source_stats,
     load_or_fit_population_stats,
 )
@@ -221,6 +223,51 @@ def _common_arguments(
 
 
 class ParallelScoringScriptTests(unittest.TestCase):
+    def test_signature_standardizes_each_source_stratum_once_per_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_root, overlap_dir, w4_root, _ = build_fixture(root)
+            output = root / "results" / "signature-context-cache"
+            calls: list[tuple[str, str]] = []
+            original = PopulationStatsCatalog.standardize_aligned_matrix
+
+            def counted(catalog, source, values, positions, **kwargs):
+                calls.append((source.dataset_name, source.cell_type))
+                return original(
+                    catalog,
+                    source,
+                    values,
+                    positions,
+                    **kwargs,
+                )
+
+            with patch.object(
+                PopulationStatsCatalog,
+                "standardize_aligned_matrix",
+                new=counted,
+            ):
+                self.assertEqual(
+                    run_signature(
+                        [
+                            *_common_arguments(
+                                data_root=data_root,
+                                overlap_dir=overlap_dir,
+                                w4_root=w4_root,
+                                output_dir=output,
+                                workers=1,
+                            ),
+                            "--compute",
+                            "w4-dataset-cell-type",
+                        ]
+                    ),
+                    0,
+                )
+
+            # The fixture is four task shards, each containing one context and
+            # two source strata. Without the context cache this is 40 calls
+            # (one per matched row and source) rather than eight.
+            self.assertEqual(len(calls), 8)
+
     def test_computation_selectors_are_repeatable_canonical_and_validated(self):
         self.assertEqual(
             resolve_computations(
