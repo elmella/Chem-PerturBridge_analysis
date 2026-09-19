@@ -15,7 +15,7 @@
       "size": 1286
     }
   },
-  "fingerprint": "7cdb6e96102054f236469436a7e3547ea67a3f9f4942f7525758ae4482223357",
+  "fingerprint": "d024306fe1d82ee8c1246741d826dcac46a9ff0cef2ae56e93cc448a5ac47476",
   "input_path": "/home/cirro/Chem-PerturBridge_analysis/results/replicate_signature_similarity_sep_rep_normalized_cosine/condition_deg_metric_summary.tsv",
   "n_ci_rows": 48,
   "n_condition_rows": 43142,
