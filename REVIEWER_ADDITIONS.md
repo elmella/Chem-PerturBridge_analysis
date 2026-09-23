@@ -121,6 +121,41 @@ population mean, which can flip the sign of a logFC, so "agreement in direction"
 would stop meaning agreement in biological direction. Table 10 keeps its existing
 raw and normalized cosine and Spearman variants.
 
+## Replicate retrieval
+
+`scripts/replicate_retrieval.py` asks, within a dataset, whether a replicate
+can find its own condition. Each replicate is a query; its candidates are every
+other replicate in the same dataset x cell line x time stratum; its positives
+are the other replicates of its condition. It reports the Table 9 quantities --
+normalized best-positive rank, Recall@1, AUROC, the exact null expectation, and
+an injected same-dose centroid -- for cosine and Spearman on raw logFC and both
+per-gene population z-scores, with compound-clustered BCa intervals.
+
+It replaces the scorer's `--compute-retrieval-metrics`, which now refuses to
+run. That path paired replicates cyclically, so with three replicates a query's
+own sample was also one of its targets and was retrieved at rank 1 (402 of 406
+OP3 queries), and it rebuilt each stratum once per task. On OP3 the corrected
+observed rank is 0.77-0.81 against a null of 0.663; the old path reported 0.997.
+
+There is no individual-peer baseline here, by design. In Table 9 a peer is a
+signature from the other dataset injected into the pool; within a dataset every
+different-compound replicate is already a candidate, so their mean rank is the
+middle of the pool by construction (0.499 on OP3, no spread). The exact null
+answers the same question without the tautology.
+
+Verified against a naive per-pair reference built from the
+`cross_source_scoring.py` metric functions and `scipy.stats.spearmanr`: exact
+agreement on synthetic strata and on 60 real OP3 queries per representation
+(`tests/test_replicate_retrieval.py`).
+
+```bash
+python scripts/replicate_retrieval.py --prepared-dir results/replicate_full_v1 \
+  --output-dir results/replicate_retrieval_v1 --threads 16
+```
+
+`scripts/run_replicate_jobs.sh` runs it for all twelve datasets after scoring and
+writes one combined table to `results/replicate_retrieval_all12/tables/`.
+
 ## File map
 
 | Reviewer point | Tables | File | Relationship to the published code |

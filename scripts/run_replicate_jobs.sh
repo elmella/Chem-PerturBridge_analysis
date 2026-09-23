@@ -53,4 +53,45 @@ for job in "${JOBS[@]}"; do
   fi
   echo "[jobs] $(date -u +%H:%M:%S) $out merged"
 done
-echo "[jobs] $(date -u +%H:%M:%S) all replicate jobs complete"
+echo "[jobs] $(date -u +%H:%M:%S) all replicate scoring jobs complete"
+
+# Replicate retrieval (scripts/replicate_retrieval.py), from each scoring
+# run's prepared inputs so the conditions match Tables 7/8/10. sci-Plex and
+# Tahoe appear in both scoring runs with identical conditions, so they are
+# retrieved once, from the first. Each run checkpoints per stratum and
+# refuses to resume under different settings.
+RETRIEVAL_THREADS="${RETRIEVAL_THREADS:-16}"
+RETRIEVAL_JOBS=(
+  "results/replicate_full_v1|results/replicate_retrieval_v1|op3,dilimap_train_val,gdpx2,sciplex,tahoe,vcpi_0002,vcpi_0001,novartis_batch_2500"
+  "results/replicate_l1000_cigs_v1|results/replicate_retrieval_l1000_cigs_v1|cigs_mce,cigs_tcm,l1000_phase1,l1000_phase2"
+)
+for job in "${RETRIEVAL_JOBS[@]}"; do
+  IFS="|" read -r prepared out datasets <<< "$job"
+  if [[ -f "$out/tables/replicate_retrieval_table.tsv" ]]; then
+    echo "[jobs] $(date -u +%H:%M:%S) $out already complete; skipping"
+    continue
+  fi
+  echo "[jobs] $(date -u +%H:%M:%S) retrieval into $out ($datasets)"
+  if ! "$PY" scripts/replicate_retrieval.py --prepared-dir "$prepared" --output-dir "$out" \
+      --datasets "$datasets" --threads "$RETRIEVAL_THREADS"; then
+    echo "[jobs] $(date -u +%H:%M:%S) $out stopped; rerun this script to continue"
+    exit 1
+  fi
+done
+
+# One table across all twelve datasets.
+COMBINED=results/replicate_retrieval_all12
+if [[ ! -f "$COMBINED/tables/replicate_retrieval_table.tsv" ]]; then
+  mkdir -p "$COMBINED"
+  "$PY" - <<'PY'
+import pandas as pd
+parts = [pd.read_csv(f"{d}/condition_retrieval_summary.tsv", sep="\t", dtype={"pubchem_cid": str})
+         for d in ("results/replicate_retrieval_v1", "results/replicate_retrieval_l1000_cigs_v1")]
+merged = pd.concat(parts, ignore_index=True)
+assert not merged.duplicated(["dataset_name", "condition_key", "similarity_metric", "scale_variant"]).any()
+merged.to_csv("results/replicate_retrieval_all12/condition_retrieval_summary.tsv", sep="\t", index=False)
+print(f"[jobs] combined {merged.dataset_name.nunique()} datasets, {len(merged):,} rows")
+PY
+  "$PY" scripts/replicate_retrieval.py --output-dir "$COMBINED" --tables-only --threads 8
+fi
+echo "[jobs] $(date -u +%H:%M:%S) all jobs complete"

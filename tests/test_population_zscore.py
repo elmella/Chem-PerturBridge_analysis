@@ -19,6 +19,7 @@ from scripts.precompute_population_zscore import (
     build_parser as build_precompute_parser,
     run as run_precompute,
 )
+from scripts.lazy_h5ad import open_lazy_h5ad
 from scripts.population_zscore import (
     DATASET_CELL_TYPE_SCOPE,
     DATASET_SCOPE,
@@ -459,7 +460,7 @@ class PopulationZScoreTests(unittest.TestCase):
                 verbose=False,
             )
             with patch(
-                "scripts.population_zscore.ad.read_h5ad",
+                "scripts.population_zscore.open_lazy_h5ad",
                 side_effect=AssertionError(
                     "readiness checks must not open source H5ADs"
                 ),
@@ -575,11 +576,16 @@ class PopulationZScoreTests(unittest.TestCase):
                     str(qc_path),
                     "--row-chunk-size",
                     "1",
+                    # Serial, so the opens happen in this process where the
+                    # patch below can count them; the default now spawns
+                    # workers.
+                    "--workers",
+                    "1",
                 ]
             )
-            real_read_h5ad = ad.read_h5ad
+            real_read_h5ad = open_lazy_h5ad
             with patch(
-                "scripts.population_zscore.ad.read_h5ad",
+                "scripts.population_zscore.open_lazy_h5ad",
                 wraps=real_read_h5ad,
             ) as read_h5ad:
                 with redirect_stdout(io.StringIO()):
@@ -840,9 +846,9 @@ class PopulationZScoreTests(unittest.TestCase):
                 np.asarray([[1.0, 10.0], [2.0, 20.0], [4.0, 40.0]]),
                 cell_type="CVCL_TEST",
             )
-            real_read_h5ad = ad.read_h5ad
+            real_read_h5ad = open_lazy_h5ad
             with patch(
-                "scripts.population_zscore.ad.read_h5ad",
+                "scripts.population_zscore.open_lazy_h5ad",
                 wraps=real_read_h5ad,
             ) as read_h5ad:
                 first = load_or_fit_population_stats(
@@ -856,7 +862,7 @@ class PopulationZScoreTests(unittest.TestCase):
             self.assertEqual(read_h5ad.call_count, 1)
 
             with patch(
-                "scripts.population_zscore.ad.read_h5ad",
+                "scripts.population_zscore.open_lazy_h5ad",
                 wraps=real_read_h5ad,
             ) as read_h5ad:
                 cached = load_or_fit_population_stats(

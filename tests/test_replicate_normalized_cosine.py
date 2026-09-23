@@ -60,11 +60,14 @@ class ReplicateNormalizedCosineTests(unittest.TestCase):
             )
             rows = replicate_scoring.normalize_source_metadata_frame(rows)
 
-            def load_block(block, *, gene_keys, open_adatas):
+            def load_block(block, *, gene_keys, open_adatas, load_t=True):
+                # Mirrors load_vectors_for_rows: no t vectors when not asked.
                 positions = block["source_row_pos"].astype(int).to_numpy()
                 return (
                     [logfc[position].copy() for position in positions],
-                    [t_stat[position].copy() for position in positions],
+                    [t_stat[position].copy() for position in positions]
+                    if load_t
+                    else [None] * len(positions),
                 )
 
             stats_record = PopulationGeneStats(
@@ -180,11 +183,14 @@ class ReplicateNormalizedCosineTests(unittest.TestCase):
                 }
             )
 
-            def load_block(block, *, gene_keys, open_adatas):
+            def load_block(block, *, gene_keys, open_adatas, load_t=True):
+                # Mirrors load_vectors_for_rows: no t vectors when not asked.
                 positions = block["source_row_pos"].astype(int).to_numpy()
                 return (
                     [logfc[position].copy() for position in positions],
-                    [t_stat[position].copy() for position in positions],
+                    [t_stat[position].copy() for position in positions]
+                    if load_t
+                    else [None] * len(positions),
                 )
 
             with patch.object(

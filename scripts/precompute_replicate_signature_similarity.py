@@ -6320,9 +6320,21 @@ def run_all(args: argparse.Namespace) -> None:
     )
 
 
+RETRIEVAL_RETIRED_MESSAGE = (
+    "--compute-retrieval-metrics is retired: its replicate pairing is cyclic, "
+    "(0,1), (1,2), (2,0), so with three replicates a query's own sample is also "
+    "one of its targets and is retrieved at rank 1 (402 of 406 OP3 queries). "
+    "It also rebuilt each line/time stratum once per task. Use "
+    "scripts/replicate_retrieval.py, which excludes the query from its "
+    "candidates and scores each stratum once."
+)
+
+
 def main() -> None:
     global ACTIVE_DEG_DEFINITIONS, MAX_BASELINE_PEERS, PEER_SAMPLING_SEED
     args = parse_args()
+    if getattr(args, "compute_retrieval_metrics", False):
+        raise SystemExit(RETRIEVAL_RETIRED_MESSAGE)
     # Read at call time inside the scoring functions, so setting it here covers every command.
     requested_max_peers = getattr(args, "max_baseline_peers", None)
     if requested_max_peers is not None and int(requested_max_peers) < 0:
