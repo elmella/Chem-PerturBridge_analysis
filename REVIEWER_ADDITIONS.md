@@ -109,8 +109,17 @@ W4 reports raw logFC beside both
   centroid is the mean of the exact same overlap-filtered, metric-valid peer matrix used
   for the corresponding individual-peer distribution.
 
-Within-source Tables 7, 8, and 10 and Table 5 direction agreement are intentionally
-outside W4 scope.
+Table 7 also accepts W4 via `--compute-normalized-deg`, on the same convention as
+Table 4: DEG membership stays on the raw `adj.P.Value < 0.05` masks and only the
+ranked logFC values are standardized. Because standardization keeps only genes the
+population cache covers with a valid SD, the mask is applied to exactly those
+surviving genes, so mask and values cannot drift apart.
+
+Table 8 direction agreement and Table 5 direction agreement stay outside W4 scope,
+and this is deliberate rather than pending: a per-gene z-score subtracts a
+population mean, which can flip the sign of a logFC, so "agreement in direction"
+would stop meaning agreement in biological direction. Table 10 keeps its existing
+raw and normalized cosine and Spearman variants.
 
 ## File map
 

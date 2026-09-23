@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import rankdata
 
+from scripts.dataset_layout import dge_dataset_dir
 from scripts.cross_source_strata import SignatureStratum
 from scripts.notebook_cache import cached_frame, stable_json_fingerprint
 
@@ -125,10 +126,27 @@ def source_dataset_dirs(data_root: Path, profile: str) -> dict[str, Path]:
     data_root = Path(data_root)
     profile = _validate_profile(profile)
     return {
-        spec.name: data_root.joinpath(*spec.relative_source_dir)
+        spec.name: _resolve_source_dir(data_root, spec)
         for spec in DATASET_SPECS
         if profile in spec.profiles
     }
+
+
+def _resolve_source_dir(data_root: Path, spec: "DatasetSpec") -> Path:
+    """Prefer the spec's recorded location, else resolve the dataset's layout.
+
+    The recorded paths describe how each dataset was staged when the specs
+    were written. Restaging a tarball-only dataset can land it elsewhere, so
+    fall back to the shared resolver rather than returning a path that does
+    not exist.
+    """
+    recorded = data_root.joinpath(*spec.relative_source_dir)
+    if recorded.is_dir() and any(recorded.glob("*_de.h5ad")):
+        return recorded
+    resolved = dge_dataset_dir(data_root, spec.name, "group_rep")
+    if resolved.is_dir() and any(resolved.glob("*_de.h5ad")):
+        return resolved
+    return recorded
 
 
 def selected_dataset_order(

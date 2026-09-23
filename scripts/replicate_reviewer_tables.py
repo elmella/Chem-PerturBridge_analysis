@@ -51,6 +51,12 @@ TABLE_INPUT_FILES = {
     10: "condition_metric_summary.tsv",
 }
 
+# Metric families that need an extra --compute-* flag, so an input without
+# them is normal rather than broken.
+OPTIONAL_METRIC_PREFIXES: dict[int, tuple[str, ...]] = {
+    7: ("dataset_normalized_", "dataset_cell_type_normalized_"),
+}
+
 TABLE_METRICS: dict[int, dict[str, str]] = {
     7: {
         "observed_deg_lfc_spearman_sym_p05": (
@@ -76,6 +82,54 @@ TABLE_METRICS: dict[int, dict[str, str]] = {
         ),
         "delta_vs_individual_peer_deg_lfc_spearman_sym_p05": (
             "mean_delta_vs_peer_baseline_deg_lfc_spearman_sym_p05"
+        ),
+        "dataset_normalized_observed_deg_lfc_spearman_sym_p05": (
+            "mean_replicate_deg_lfc_spearman_sym_p05_normalized_dataset"
+        ),
+        "dataset_normalized_centroid_baseline_deg_lfc_spearman_sym_p05": (
+            "mean_baseline_pair_deg_lfc_spearman_sym_p05_normalized_dataset"
+        ),
+        "dataset_normalized_delta_vs_centroid_deg_lfc_spearman_sym_p05": (
+            "mean_delta_vs_baseline_pair_deg_lfc_spearman_sym_p05_normalized_dataset"
+        ),
+        "dataset_normalized_individual_peer_mean_deg_lfc_spearman_sym_p05": (
+            "mean_peer_baseline_deg_lfc_spearman_sym_p05_normalized_dataset"
+        ),
+        "dataset_normalized_individual_peer_sd_deg_lfc_spearman_sym_p05": (
+            "mean_peer_baseline_deg_lfc_spearman_sym_sd_p05_normalized_dataset"
+        ),
+        "dataset_normalized_individual_peer_fraction_below_observed_deg_lfc_spearman_sym_p05": (
+            "mean_peer_baseline_deg_lfc_spearman_sym_fraction_below_observed_p05_normalized_dataset"
+        ),
+        "dataset_normalized_individual_peer_corrected_percentile_deg_lfc_spearman_sym_p05": (
+            "mean_peer_baseline_deg_lfc_spearman_sym_corrected_percentile_p05_normalized_dataset"
+        ),
+        "dataset_normalized_delta_vs_individual_peer_deg_lfc_spearman_sym_p05": (
+            "mean_delta_vs_peer_baseline_deg_lfc_spearman_sym_p05_normalized_dataset"
+        ),
+        "dataset_cell_type_normalized_observed_deg_lfc_spearman_sym_p05": (
+            "mean_replicate_deg_lfc_spearman_sym_p05_normalized_dataset_cell_type"
+        ),
+        "dataset_cell_type_normalized_centroid_baseline_deg_lfc_spearman_sym_p05": (
+            "mean_baseline_pair_deg_lfc_spearman_sym_p05_normalized_dataset_cell_type"
+        ),
+        "dataset_cell_type_normalized_delta_vs_centroid_deg_lfc_spearman_sym_p05": (
+            "mean_delta_vs_baseline_pair_deg_lfc_spearman_sym_p05_normalized_dataset_cell_type"
+        ),
+        "dataset_cell_type_normalized_individual_peer_mean_deg_lfc_spearman_sym_p05": (
+            "mean_peer_baseline_deg_lfc_spearman_sym_p05_normalized_dataset_cell_type"
+        ),
+        "dataset_cell_type_normalized_individual_peer_sd_deg_lfc_spearman_sym_p05": (
+            "mean_peer_baseline_deg_lfc_spearman_sym_sd_p05_normalized_dataset_cell_type"
+        ),
+        "dataset_cell_type_normalized_individual_peer_fraction_below_observed_deg_lfc_spearman_sym_p05": (
+            "mean_peer_baseline_deg_lfc_spearman_sym_fraction_below_observed_p05_normalized_dataset_cell_type"
+        ),
+        "dataset_cell_type_normalized_individual_peer_corrected_percentile_deg_lfc_spearman_sym_p05": (
+            "mean_peer_baseline_deg_lfc_spearman_sym_corrected_percentile_p05_normalized_dataset_cell_type"
+        ),
+        "dataset_cell_type_normalized_delta_vs_individual_peer_deg_lfc_spearman_sym_p05": (
+            "mean_delta_vs_peer_baseline_deg_lfc_spearman_sym_p05_normalized_dataset_cell_type"
         ),
     },
     8: {
@@ -288,6 +342,22 @@ TABLE_PRIMARY_METRICS = {
     ),
 }
 
+TABLE_PRIMARY_METRICS[7] += tuple(
+    f"{scale_label}_{metric_name}"
+    for scale_label in (
+        "dataset_normalized",
+        "dataset_cell_type_normalized",
+    )
+    for metric_name in (
+        "observed_deg_lfc_spearman_sym_p05",
+        "centroid_baseline_deg_lfc_spearman_sym_p05",
+        "delta_vs_centroid_deg_lfc_spearman_sym_p05",
+        "individual_peer_mean_deg_lfc_spearman_sym_p05",
+        "delta_vs_individual_peer_deg_lfc_spearman_sym_p05",
+        "individual_peer_corrected_percentile_deg_lfc_spearman_sym_p05",
+    )
+)
+
 TABLE_PRIMARY_METRICS[10] += tuple(
     f"{scale_label}_{metric_name}"
     for scale_label in (
@@ -373,13 +443,56 @@ def _fingerprint(
     ).hexdigest()
 
 
+def active_table_metrics(table: int, header: Sequence[str]) -> dict[str, str]:
+    """Metrics for ``table`` that the input actually carries.
+
+    Optional families are dropped when absent so an older run, or one without
+    the corresponding ``--compute-*`` flag, still builds its mandatory rows.
+    A partially present family is still an error: silently emitting half a
+    normalization variant would misreport what was computed.
+    """
+    table = int(table)
+    available = set(header)
+    active: dict[str, str] = {}
+    for output_name, source_column in TABLE_METRICS[table].items():
+        prefix = OPTIONAL_METRIC_PREFIXES.get(table, ())
+        optional = any(output_name.startswith(item) for item in prefix)
+        if source_column in available:
+            active[output_name] = source_column
+        elif not optional:
+            active[output_name] = source_column  # reported as missing below
+    for family in OPTIONAL_METRIC_PREFIXES.get(table, ()):
+        family_columns = {
+            output_name: source_column
+            for output_name, source_column in TABLE_METRICS[table].items()
+            if output_name.startswith(family)
+        }
+        present = {
+            output_name
+            for output_name, source_column in family_columns.items()
+            if source_column in available
+        }
+        if present and len(present) != len(family_columns):
+            absent = sorted(
+                family_columns[output_name]
+                for output_name in family_columns
+                if output_name not in present
+            )
+            raise KeyError(
+                f"Table {table} input is missing part of the {family!r} metric "
+                f"family: {absent}. Rerun the scoring so the family is complete."
+            )
+    return active
+
+
 def _read_table_input(path: Path, table: int) -> pd.DataFrame:
+    header = pd.read_csv(path, sep="\t", nrows=0).columns.tolist()
+    metrics = active_table_metrics(table, header)
     required = {
         "dataset_name",
         "pubchem_cid",
-        *TABLE_METRICS[int(table)].values(),
+        *metrics.values(),
     }
-    header = pd.read_csv(path, sep="\t", nrows=0).columns.tolist()
     missing = sorted(required - set(header))
     if missing:
         raise KeyError(
@@ -413,10 +526,13 @@ def build_table_ci(
     table = int(table)
     if table not in TABLE_METRICS:
         raise ValueError(f"Unsupported table {table}; choose 7, 8, or 10")
+    # Score only the metric families this input carries, so a run without an
+    # optional --compute-* flag still builds its mandatory rows.
+    metrics = active_table_metrics(table, frame.columns.tolist())
     result = cluster_bca_nested_mean_ci_table(
         frame,
         group_cols=["dataset_name"],
-        metric_cols=TABLE_METRICS[table],
+        metric_cols=metrics,
         cluster_col="pubchem_cid",
         n_boot=int(bootstrap_iterations),
         seed=int(bootstrap_seed),
@@ -428,7 +544,7 @@ def build_table_ci(
     )
     metric_order = {
         metric: position
-        for position, metric in enumerate(TABLE_METRICS[table])
+        for position, metric in enumerate(metrics)
     }
     result["_metric_order"] = result["metric"].map(metric_order)
     result = result.sort_values(
@@ -463,8 +579,16 @@ def build_presentation_table(ci: pd.DataFrame, *, table: int) -> pd.DataFrame:
         columns="metric",
         values="estimate_ci",
     )
+    # Keep the canonical order, but only for metrics this run actually
+    # produced: an optional family that was not computed should be absent
+    # rather than present and empty.
+    present = [
+        metric_name
+        for metric_name in TABLE_PRIMARY_METRICS[int(table)]
+        if metric_name in wide.columns
+    ]
     return (
-        wide.reindex(columns=TABLE_PRIMARY_METRICS[int(table)])
+        wide.reindex(columns=present)
         .reset_index()
         .rename_axis(columns=None)
     )

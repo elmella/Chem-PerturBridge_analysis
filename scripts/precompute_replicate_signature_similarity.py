@@ -29,12 +29,17 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 from scipy import stats
+from scipy.spatial.distance import cdist
 from tqdm.auto import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from dataset_layout import dge_dataset_dir
+from dense_layer_cache import dense_layers_for, ensure_dense_layers
+from lazy_h5ad import LazyH5AD, open_lazy_h5ad
+from page_cache import prewarm_h5ad
 from peer_baselines import (
     DEFAULT_PEER_SAMPLING_SEED,
     direction_agreement_against_peers,
@@ -73,62 +78,23 @@ SOURCE_DATA_ROOT = _default_source_data_root()
 
 
 def sep_rep_dataset_dir(dataset_name: str, filter_min_cells: int) -> Path:
-    """Resolve a dataset's separate-replicate DEG directory across both known layouts.
+    """Resolve a dataset's separate-replicate DEG directory.
 
-    The published release stages files flat, as `<dataset>/sep_rep/`; the cluster keeps the
-    full pipeline path. Prefer whichever exists so the same code runs in both places, and
-    fall back to the cluster shape when neither is present, which keeps the error message
-    pointing at the canonical location.
+    Layout resolution lives in ``scripts/dataset_layout.py`` so the population
+    precompute and the cross-source core cannot disagree with this scorer
+    about where a restaged archive landed.
     """
-    dataset_root = SOURCE_DATA_ROOT / dataset_name
-    relative_pipeline_path = (
-        Path("deg_data")
-        / "sep_rep"
-        / "full"
-        / "qc_false"
-        / f"filter_min_cells_{int(filter_min_cells)}"
-        / "results"
+    return dge_dataset_dir(
+        SOURCE_DATA_ROOT, dataset_name, "sep_rep", filter_min_cells
     )
-    candidates = (
-        dataset_root / "sep_rep",
-        dataset_root / relative_pipeline_path,
-        dataset_root / "sep_rep_extracted" / relative_pipeline_path,
-        dataset_root
-        / "sep_rep_extracted"
-        / dataset_name
-        / relative_pipeline_path,
-    )
-    for candidate in candidates:
-        if candidate.is_dir() and any(candidate.glob("*_de.h5ad")):
-            return candidate
 
-    # Downloaded archives can add an extra wrapper directory whose name is not
-    # stable. Accept it only when recursive discovery identifies one unique DGE
-    # directory, avoiding a silent choice between different filtering runs.
-    discovered = sorted(
-        {
-            path.parent
-            for path in dataset_root.rglob("*_de.h5ad")
-            if "sep_rep" in path.parts or "sep_rep_extracted" in path.parts
-        }
-    )
-    if len(discovered) == 1:
-        return discovered[0]
-    if len(discovered) > 1:
-        locations = "\n".join(f"- {path}" for path in discovered)
-        raise RuntimeError(
-            f"Multiple separate-replicate DGE directories found for "
-            f"{dataset_name}; cannot choose safely:\n{locations}"
-        )
 
-    # Preserve the canonical path in downstream missing-input messages.
-    return dataset_root / relative_pipeline_path
 DEFAULT_SOURCE_DATASET_DIRS = {
     "sciplex": sep_rep_dataset_dir("sciplex", 10),
     "tahoe": sep_rep_dataset_dir("tahoe", 50),
     "op3": sep_rep_dataset_dir("op3", 10),
     "cigs_mce": sep_rep_dataset_dir("cigs_mce", 0),
-    "novartis_batch_1000": sep_rep_dataset_dir("novartis_batch_1000", 0),
+    "novartis_batch_2500": sep_rep_dataset_dir("novartis_batch_2500", 0),
     "vcpi_0001": sep_rep_dataset_dir("vcpi_0001", 0),
     "cigs_tcm": sep_rep_dataset_dir("cigs_tcm", 0),
     "vcpi_0002": sep_rep_dataset_dir("vcpi_0002", 0),
@@ -146,7 +112,7 @@ PRETTY_DATASET_LABELS = {
     "tahoe": "Tahoe-100M",
     "op3": "OP3",
     "cigs_mce": "CIGS-MCE",
-    "novartis_batch_1000": "Novartis DRUG-seq",
+    "novartis_batch_2500": "Novartis DRUG-seq",
     "vcpi_0001": "VCPI-0001",
     "cigs_tcm": "CIGS-TCM",
     "vcpi_0002": "VCPI-0002",
@@ -183,6 +149,34 @@ ADJ_PVALUE_LAYER_PREFERENCES = (
     "adj.P.Value.within_one_contrast",
     "adj.P.Value.across_all_contrasts",
 )
+# Layers every scored condition reads, used to scope page-cache warming.
+SCORED_LAYER_NAMES = ("logFC", "t")
+# Layers served from an uncompressed float32 copy (scripts/dense_layer_cache.py).
+# logFC is the one read at random, once per peer per condition; t and the
+# adjusted p-values are read only for a condition's own few replicate rows.
+DENSE_CACHED_LAYERS = ("logFC",)
+
+
+def default_worker_count(*, cap: int) -> int:
+    """Spawned workers to use when nothing is requested.
+
+    Condition scoring is CPU-bound, not I/O-bound: each condition is compared
+    against up to ``--max-baseline-peers`` different-compound peers across
+    every requested metric family, which on the largest sources runs about a
+    minute per condition. Conditions are independent, so this should claim
+    most of the machine.
+
+    A quarter of the cores was right only while a backed H5AD open pulled
+    every layer into memory and each worker held 14-23 GB (see
+    ``scripts/lazy_h5ad.py``). Workers now sit near 2 GB, so cores rather than
+    memory set the limit; BLAS is pinned to one thread each, so one worker per
+    core does not oversubscribe.
+    """
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cores = os.cpu_count() or 2
+    return int(min(cap, max(2, cores - 2)))
 METADATA_OBS_COLUMNS = [
     "id",
     "cell_type",
@@ -386,6 +380,17 @@ def add_common_run_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--compute-normalized-deg",
+        action="store_true",
+        help=(
+            "Compute per-gene population-normalized DEG-restricted replicate "
+            "logFC Spearman (Table 7), including centroid and individual-peer "
+            "baselines. DEG membership stays on the raw adj.P.Value masks; only "
+            "the ranked values are standardized. Reuses existing population "
+            "statistics."
+        ),
+    )
+    parser.add_argument(
         "--normalization-scales",
         choices=("all", "dataset", "dataset-cell-type"),
         default="all",
@@ -448,10 +453,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_all_parser.add_argument(
         "--workers",
         type=int,
-        default=2,
+        default=default_worker_count(cap=32),
         help=(
             "Spawned task workers. Each worker opens its own read-only H5AD "
-            "handles. Use 1 for deterministic serial debugging. Default: 2."
+            "handles. Use 1 for deterministic serial debugging. Defaults to the "
+            "core count minus two, capped at 32."
         ),
     )
     run_all_parser.add_argument(
@@ -475,6 +481,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Reuse the existing task manifest and inputs in --output-dir instead "
             "of rescanning metadata. Completed nonempty task shards are skipped."
+        ),
+    )
+    run_all_parser.add_argument(
+        "--page-cache-prewarm",
+        choices=("blocking", "background", "off"),
+        help=(
+            "Read each H5AD sequentially before scoring it, so the small "
+            "gzip-chunk reads are served from RAM. 'blocking' (default) warms "
+            "then scores; 'background' lets scoring race the warmer. Sets "
+            "CPB_PAGE_CACHE_PREWARM for this run and its spawned workers."
         ),
     )
 
@@ -585,6 +601,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--compute-normalized-spearman",
         action="store_true",
         help="Compute normalized replicate Spearman and its centroid/peer baselines.",
+    )
+    run_task_parser.add_argument(
+        "--compute-normalized-deg",
+        action="store_true",
+        help="Compute normalized DEG-restricted replicate logFC Spearman (Table 7).",
     )
     run_task_parser.add_argument(
         "--normalization-scales",
@@ -944,6 +965,46 @@ def normalized_matrix_for_stats(
     return normalized
 
 
+def normalized_columns_for_stats(
+    matrix: np.ndarray,
+    *,
+    gene_keys: np.ndarray,
+    stats_record: PopulationGeneStats,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Normalize, and report which input columns survived.
+
+    Standardization keeps only genes the population cache covers with a valid
+    SD, so the normalized gene axis is a subset of the input one. DEG-restricted
+    scoring has to apply a mask built from raw logFC and adjusted p-values to
+    those same genes, which needs the surviving positions, not just the values.
+    """
+    matrix = np.asarray(matrix, dtype=np.float64)
+    requested = np.asarray(gene_keys).astype(str)
+    valid_source_keys = {
+        str(gene_key)
+        for position, gene_key in enumerate(stats_record.gene_keys)
+        if bool(stats_record.valid_mask[position])
+    }
+    local_positions = np.asarray(
+        [
+            position
+            for position, gene_key in enumerate(requested)
+            if str(gene_key) in valid_source_keys
+        ],
+        dtype=np.int64,
+    )
+    normalized = normalized_matrix_for_stats(
+        matrix,
+        gene_keys=gene_keys,
+        stats_record=stats_record,
+    )
+    if normalized.shape[1] != local_positions.size:
+        # Guard the invariant the DEG path depends on rather than silently
+        # scoring a mask against the wrong genes.
+        return normalized, np.asarray([], dtype=np.int64)
+    return normalized, local_positions
+
+
 def resolve_normalization_scopes(value: str) -> tuple[str, ...]:
     normalized = str(value).strip().lower()
     if normalized == "all":
@@ -967,12 +1028,20 @@ def resolve_deg_definitions(value: str) -> tuple[str, ...]:
 
 
 def negative_l2_similarity_matrix(query_matrix: np.ndarray, candidate_matrix: np.ndarray) -> np.ndarray:
-    query_matrix = np.asarray(query_matrix, dtype=np.float64)
-    candidate_matrix = np.asarray(candidate_matrix, dtype=np.float64)
-    diff = query_matrix[:, None, :] - candidate_matrix[None, :, :]
-    with np.errstate(invalid="ignore"):
-        distances = np.sqrt(np.sum(diff * diff, axis=2))
-    return -distances
+    """Pairwise negative Euclidean distance.
+
+    Uses ``cdist`` rather than broadcasting a ``(n_query, n_candidate, n_gene)``
+    difference tensor. Replicate retrieval strata get large -- GDPx2 reaches
+    2,232 conditions over 10,245 genes, where the tensor alone is 408 GB --
+    while the output it reduces to is only 40 MB. ``cdist`` matches the
+    broadcast result to floating-point roundoff and propagates NaN over a pair
+    identically, which `scripts/cross_source_scoring.py` already relies on.
+    """
+    return -cdist(
+        np.asarray(query_matrix, dtype=np.float64),
+        np.asarray(candidate_matrix, dtype=np.float64),
+        metric="euclidean",
+    )
 
 
 def normalized_best_positive_rank(scores: np.ndarray, positive_mask: np.ndarray) -> tuple[float, float]:
@@ -992,28 +1061,76 @@ def difference_if_both_defined(observed: float, baseline: float) -> float:
     return float(observed - baseline)
 
 
-def read_h5ad_safely(path: str | Path, *, backed: str = "r") -> ad.AnnData:
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="Observation names are not unique.*",
-            category=UserWarning,
-        )
-        return ad.read_h5ad(path, backed=backed)
+def read_h5ad_safely(path: str | Path, *, backed: str = "r") -> LazyH5AD:
+    # Warm the layers this scorer reads before h5py touches them: they are
+    # stored as small gzip chunks, which this storage serves at a fraction of
+    # its sequential rate. Only one adj.P.Value variant exists per source, so
+    # both are offered as optional.
+    prewarm_h5ad(
+        path,
+        layer_names=SCORED_LAYER_NAMES,
+        optional_layer_names=ADJ_PVALUE_LAYER_PREFERENCES,
+        verbose=True,
+    )
+    # Deliberately not ad.read_h5ad(backed="r"): anndata backs only X, and
+    # these files have no X, so a backed open loads all eleven layers into
+    # memory. See scripts/lazy_h5ad.py for the measurements.
+    return open_lazy_h5ad(path)
 
 
-def ensure_open_adata(source_path: str, open_adatas: dict[str, ad.AnnData]) -> ad.AnnData:
+def open_scoring_source(source_path: str | Path) -> LazyH5AD:
+    """Open a source for scoring, with its dense layer cache ready.
+
+    Every scoring open goes through here -- both the up-front opens in
+    ``run_task`` and lazy ones in ``ensure_open_adata`` -- so no path can
+    silently skip the cache and fall back to compressed row reads.
+    Metadata-only reads keep using ``read_h5ad_safely`` directly.
+    """
+    adata = read_h5ad_safely(source_path, backed="r")
+    ensure_dense_layers(
+        source_path,
+        DENSE_CACHED_LAYERS,
+        prewarm_layers=SCORED_LAYER_NAMES + ADJ_PVALUE_LAYER_PREFERENCES,
+    )
+    return adata
+
+
+def ensure_open_adata(source_path: str, open_adatas: dict[str, LazyH5AD]) -> LazyH5AD:
     if source_path not in open_adatas:
-        open_adatas[source_path] = read_h5ad_safely(source_path, backed="r")
+        open_adatas[source_path] = open_scoring_source(source_path)
     return open_adatas[source_path]
+
+
+def layer_rows_float32(
+    adata: LazyH5AD,
+    layer_name: str,
+    row_positions: np.ndarray,
+    gene_positions: np.ndarray,
+) -> np.ndarray:
+    """Rows of one layer as float32, from the dense cache when it has them.
+
+    Every caller casts to float32 anyway, and casting commutes with row and
+    column selection, so the cached path returns exactly what the compressed
+    H5AD would.
+    """
+    dense = dense_layers_for(adata.path).get(layer_name)
+    source = dense if dense is not None else adata.layers[layer_name]
+    return np.asarray(source[row_positions][:, gene_positions], dtype=np.float32)
 
 
 def load_vectors_for_rows(
     rows: pd.DataFrame,
     *,
     gene_keys: np.ndarray,
-    open_adatas: dict[str, ad.AnnData],
+    open_adatas: dict[str, LazyH5AD],
+    load_t: bool = True,
 ) -> tuple[list[Optional[np.ndarray]], list[Optional[np.ndarray]]]:
+    """Load logFC (and, unless ``load_t`` is False, t) vectors for ``rows``.
+
+    Callers that discard the t vectors should pass ``load_t=False``: those
+    are the peer and retrieval loads, which touch far more rows than anything
+    else, and reading t there doubles their cost for nothing.
+    """
     indexed_rows = rows.reset_index(drop=True)
     logfc_vectors: list[Optional[np.ndarray]] = [None] * len(indexed_rows)
     t_vectors: list[Optional[np.ndarray]] = [None] * len(indexed_rows)
@@ -1027,14 +1144,16 @@ def load_vectors_for_rows(
         if gene_positions.size < 2:
             continue
         adata = ensure_open_adata(str(source_path), open_adatas)
-        logfc = np.asarray(adata.layers["logFC"][row_positions][:, gene_positions], dtype=np.float32)
-        t_stat = np.asarray(adata.layers["t"][row_positions][:, gene_positions], dtype=np.float32)
+        logfc = layer_rows_float32(adata, "logFC", row_positions, gene_positions)
         if logfc.ndim == 1:
             logfc = logfc[np.newaxis, :]
-        if t_stat.ndim == 1:
-            t_stat = t_stat[np.newaxis, :]
         for idx_value, vector in zip(source_index, logfc):
             logfc_vectors[int(idx_value)] = np.asarray(vector, dtype=np.float32)
+        if not load_t:
+            continue
+        t_stat = layer_rows_float32(adata, "t", row_positions, gene_positions)
+        if t_stat.ndim == 1:
+            t_stat = t_stat[np.newaxis, :]
         for idx_value, vector in zip(source_index, t_stat):
             t_vectors[int(idx_value)] = np.asarray(vector, dtype=np.float32)
     return logfc_vectors, t_vectors
@@ -1042,7 +1161,7 @@ def load_vectors_for_rows(
 
 def adjusted_pvalue_layer_for_source_path(
     source_path: str,
-    open_adatas: dict[str, ad.AnnData],
+    open_adatas: dict[str, LazyH5AD],
 ) -> str:
     if source_path not in ADJ_PVALUE_LAYER_CACHE:
         adata = ensure_open_adata(source_path, open_adatas)
@@ -1063,7 +1182,7 @@ def load_adjusted_pvalue_vectors_for_rows(
     rows: pd.DataFrame,
     *,
     gene_keys: np.ndarray,
-    open_adatas: dict[str, ad.AnnData],
+    open_adatas: dict[str, LazyH5AD],
 ) -> list[Optional[np.ndarray]]:
     indexed_rows = rows.reset_index(drop=True)
     adj_p_vectors: list[Optional[np.ndarray]] = [None] * len(indexed_rows)
@@ -1078,7 +1197,7 @@ def load_adjusted_pvalue_vectors_for_rows(
             continue
         adata = ensure_open_adata(str(source_path), open_adatas)
         adj_layer_name = adjusted_pvalue_layer_for_source_path(str(source_path), open_adatas)
-        adj_p = np.asarray(adata.layers[adj_layer_name][row_positions][:, gene_positions], dtype=np.float32)
+        adj_p = layer_rows_float32(adata, adj_layer_name, row_positions, gene_positions)
         if adj_p.ndim == 1:
             adj_p = adj_p[np.newaxis, :]
         for idx_value, vector in zip(source_index, adj_p):
@@ -1219,7 +1338,7 @@ def get_or_build_context_aggregate(
     context_rows: pd.DataFrame,
     context_key: tuple[str, str, str],
     gene_keys: np.ndarray,
-    open_adatas: dict[str, ad.AnnData],
+    open_adatas: dict[str, LazyH5AD],
     rows_per_batch: int = 512,
 ) -> ContextAggregate:
     """Load or atomically build one exact context aggregate.
@@ -1689,7 +1808,7 @@ def compute_retrieval_condition_task_summary(
     dataset_metadata_frame: pd.DataFrame,
     line_global_shared_gene_keys: dict[str, np.ndarray],
     min_retrieval_compounds_per_line_time: int,
-    open_adatas: dict[str, ad.AnnData],
+    open_adatas: dict[str, LazyH5AD],
 ) -> pd.DataFrame:
     task_conditions = task_conditions.copy()
     dataset_metadata_frame = normalize_source_metadata_frame(dataset_metadata_frame)
@@ -1738,11 +1857,13 @@ def compute_retrieval_condition_task_summary(
             query_rows,
             gene_keys=local_gene_keys,
             open_adatas=open_adatas,
+            load_t=False,
         )
         target_logfc_vectors, _ = load_vectors_for_rows(
             target_rows,
             gene_keys=local_gene_keys,
             open_adatas=open_adatas,
+            load_t=False,
         )
 
         if not all(vector is not None for vector in query_logfc_vectors):
@@ -1895,7 +2016,7 @@ def compute_retrieval_condition_task_summary(
 
 def resolve_dataset_file_paths(dataset_dir: Path) -> list[Path]:
     paths = sorted(dataset_dir.glob("*.h5ad"))
-    if "novartis_batch_1000" not in str(dataset_dir):
+    if "novartis_batch" not in str(dataset_dir):
         return paths
 
     selected_by_cell_type: dict[str, Path] = {}
@@ -2598,11 +2719,12 @@ def compute_condition_metric_record_from_rows(
     compute_baseline_metrics: bool = False,
     compute_normalized_cosine: bool = False,
     compute_normalized_spearman: bool = False,
+    compute_normalized_deg: bool = False,
     normalization_scopes: tuple[str, ...] = NORMALIZATION_SCOPES,
     population_stats_cache: Optional[ReplicatePopulationStatsCache] = None,
     baseline_source_frame: Optional[pd.DataFrame] = None,
     baseline_context_row_indexes: Optional[dict[tuple[str, str, str], np.ndarray]] = None,
-    open_adatas: Optional[dict[str, ad.AnnData]] = None,
+    open_adatas: Optional[dict[str, LazyH5AD]] = None,
 ) -> Optional[dict[str, object]]:
     condition_rows = normalize_source_metadata_frame(condition_rows)
     dataset_name = str(condition_row["dataset_name"])
@@ -2779,6 +2901,35 @@ def compute_condition_metric_record_from_rows(
             record[f"n_spearman_genes_{suffix}"] = 0
             record[f"n_valid_replicate_spearman_pairs_{metric_suffix}"] = 0
             record[f"n_valid_peer_spearman_pairs_{metric_suffix}"] = 0
+    if compute_normalized_deg:
+        for scope in normalization_scopes:
+            suffix = (
+                "dataset"
+                if scope == DATASET_SCOPE
+                else "dataset_cell_type"
+            )
+            metric_suffix = f"normalized_{suffix}"
+            record[f"n_deg_normalized_genes_{suffix}"] = 0
+            for definition_key in ACTIVE_DEG_DEFINITIONS:
+                stem = f"deg_lfc_spearman_sym_{definition_key}_{metric_suffix}"
+                for prefix in (
+                    "mean_replicate",
+                    "mean_baseline_pair",
+                    "mean_delta_vs_baseline_pair",
+                    "mean_delta_vs_peer_baseline",
+                ):
+                    record[f"{prefix}_{stem}"] = float("nan")
+                record[f"n_valid_replicate_{stem}_pairs"] = 0
+                for record_suffix in (
+                    "",
+                    "_sd",
+                    "_fraction_below_observed",
+                    "_corrected_percentile",
+                ):
+                    record[
+                        f"mean_peer_baseline_deg_lfc_spearman_sym{record_suffix}"
+                        f"_{definition_key}_{metric_suffix}"
+                    ] = float("nan")
 
     raw_local_logfc_matrix: Optional[np.ndarray] = None
     raw_local_t_matrix: Optional[np.ndarray] = None
@@ -2973,6 +3124,7 @@ def compute_condition_metric_record_from_rows(
                     selected_peer_rows,
                     gene_keys=local_gene_keys,
                     open_adatas=open_adatas,
+                    load_t=False,
                 )
                 raw_local_peer_logfc_matrix = optional_vectors_to_matrix(
                     selected_logfc_vectors,
@@ -3679,6 +3831,199 @@ def compute_condition_metric_record_from_rows(
                 record[f"mean_delta_vs_baseline_pair_{metric_name}_{definition_key}"] = mean_available(delta_array)
                 record[f"median_delta_vs_baseline_pair_{metric_name}_{definition_key}"] = median_available(delta_array)
 
+    # Table 7 under per-gene population standardization. DEG membership stays
+    # on the raw adj.P.Value masks and only the ranked values are standardized,
+    # matching the cross-source Table 4 convention. Direction agreement
+    # (Table 8) is deliberately not standardized: z-scoring subtracts a per-gene
+    # population mean, which can flip a sign, so "agreement in direction" would
+    # no longer mean agreement in biological direction.
+    if (
+        compute_normalized_deg
+        and local_logfc_matrix is not None
+        and local_adj_p_matrix is not None
+        and local_logfc_matrix.shape[1] >= 2
+        and local_adj_p_matrix.shape[1] >= 2
+    ):
+        if population_stats_cache is None:
+            raise ValueError(
+                "Normalized DEG requested without a population-statistics cache"
+            )
+        metric_name = "deg_lfc_spearman_sym"
+        for scope in normalization_scopes:
+            suffix = (
+                "dataset" if scope == DATASET_SCOPE else "dataset_cell_type"
+            )
+            metric_suffix = f"normalized_{suffix}"
+            population_stats = population_stats_cache.get(
+                dataset_name=dataset_name,
+                cell_type=cell_type,
+                scope=scope,
+            )
+            normalized_replicates, kept_positions = normalized_columns_for_stats(
+                local_logfc_matrix,
+                gene_keys=local_gene_keys_eval,
+                stats_record=population_stats,
+            )
+            record[f"n_deg_normalized_genes_{suffix}"] = int(kept_positions.size)
+            if kept_positions.size < 2:
+                continue
+            # The mask is built from raw values on exactly the genes that
+            # survived standardization, so mask and values stay aligned.
+            masked_logfc = local_logfc_matrix[:, kept_positions]
+            masked_adj_p = local_adj_p_matrix[:, kept_positions]
+            normalized_centroid = (
+                normalized_matrix_for_stats(
+                    local_baseline_logfc[np.newaxis, :],
+                    gene_keys=local_gene_keys_eval,
+                    stats_record=population_stats,
+                )[0]
+                if local_baseline_logfc is not None
+                and local_baseline_logfc.shape[0] == local_logfc_matrix.shape[1]
+                else None
+            )
+            normalized_peers = (
+                normalized_matrix_for_stats(
+                    local_peer_logfc_matrix,
+                    gene_keys=local_gene_keys_eval,
+                    stats_record=population_stats,
+                )
+                if local_peer_logfc_matrix is not None
+                and local_peer_logfc_matrix.size
+                and local_peer_logfc_matrix.shape[1] == local_logfc_matrix.shape[1]
+                else None
+            )
+            if normalized_peers is not None and (
+                normalized_peers.shape[0] == 0
+                or normalized_peers.shape[1] != normalized_replicates.shape[1]
+            ):
+                normalized_peers = None
+
+            for definition_key in ACTIVE_DEG_DEFINITIONS:
+                observed_values: list[float] = []
+                centroid_values: list[float] = []
+                delta_values: list[float] = []
+                peer_fields: dict[str, list[float]] = defaultdict(list)
+                peer_deltas: list[float] = []
+                masks_by_replicate: dict[int, np.ndarray] = {}
+                peer_scores_by_replicate: dict[int, np.ndarray] = {}
+
+                for left_idx, right_idx in pair_indices:
+                    for replicate_idx in (left_idx, right_idx):
+                        if replicate_idx not in masks_by_replicate:
+                            masks_by_replicate[replicate_idx] = deg_mask(
+                                masked_logfc[replicate_idx],
+                                masked_adj_p[replicate_idx],
+                                definition_key,
+                            )
+                    left_mask = masks_by_replicate[left_idx]
+                    right_mask = masks_by_replicate[right_idx]
+                    observed_value = strict_mean_if_all_defined(
+                        np.asarray(
+                            [
+                                deg_restricted_lfc_spearman(
+                                    normalized_replicates[left_idx],
+                                    normalized_replicates[right_idx],
+                                    left_mask,
+                                ),
+                                deg_restricted_lfc_spearman(
+                                    normalized_replicates[left_idx],
+                                    normalized_replicates[right_idx],
+                                    right_mask,
+                                ),
+                            ],
+                            dtype=np.float64,
+                        )
+                    )
+                    observed_values.append(float(observed_value))
+
+                    if normalized_centroid is not None:
+                        centroid_value = mean_available(
+                            np.asarray(
+                                [
+                                    deg_restricted_lfc_spearman(
+                                        normalized_replicates[left_idx],
+                                        normalized_centroid,
+                                        left_mask,
+                                    ),
+                                    deg_restricted_lfc_spearman(
+                                        normalized_replicates[right_idx],
+                                        normalized_centroid,
+                                        right_mask,
+                                    ),
+                                ],
+                                dtype=np.float64,
+                            )
+                        )
+                    else:
+                        centroid_value = float("nan")
+                    centroid_values.append(float(centroid_value))
+                    delta_values.append(
+                        difference_if_both_defined(
+                            float(observed_value), float(centroid_value)
+                        )
+                    )
+
+                    if normalized_peers is None:
+                        continue
+                    for replicate_idx in (left_idx, right_idx):
+                        if replicate_idx not in peer_scores_by_replicate:
+                            peer_scores_by_replicate[replicate_idx] = (
+                                spearman_against_peers(
+                                    normalized_replicates[replicate_idx],
+                                    normalized_peers,
+                                    masks_by_replicate[replicate_idx],
+                                )
+                            )
+                    pair_summary = replicate_pair_peer_summary(
+                        peer_scores_by_replicate[left_idx],
+                        peer_scores_by_replicate[right_idx],
+                        float(observed_value),
+                        "peer",
+                    )
+                    for field_name, field_value in pair_summary.items():
+                        peer_fields[field_name].append(float(field_value))
+                    peer_deltas.append(
+                        difference_if_both_defined(
+                            float(observed_value),
+                            float(pair_summary["peer_mean_score"]),
+                        )
+                    )
+
+                stem = f"{metric_name}_{definition_key}_{metric_suffix}"
+                record[f"mean_replicate_{stem}"] = mean_available(
+                    np.asarray(observed_values, dtype=np.float64)
+                )
+                record[f"mean_baseline_pair_{stem}"] = mean_available(
+                    np.asarray(centroid_values, dtype=np.float64)
+                )
+                record[f"mean_delta_vs_baseline_pair_{stem}"] = mean_available(
+                    np.asarray(delta_values, dtype=np.float64)
+                )
+                record[f"n_valid_replicate_{stem}_pairs"] = int(
+                    np.isfinite(
+                        np.asarray(observed_values, dtype=np.float64)
+                    ).sum()
+                )
+                if not peer_fields:
+                    continue
+                for record_suffix, field_name in (
+                    ("", "peer_mean_score"),
+                    ("_sd", "peer_sd_score"),
+                    ("_fraction_below_observed", "peer_fraction_below_observed"),
+                    ("_corrected_percentile", "peer_corrected_percentile"),
+                ):
+                    record[
+                        f"mean_peer_baseline_{metric_name}{record_suffix}"
+                        f"_{definition_key}_{metric_suffix}"
+                    ] = mean_available(
+                        np.asarray(
+                            peer_fields.get(field_name, []), dtype=np.float64
+                        )
+                    )
+                record[f"mean_delta_vs_peer_baseline_{stem}"] = mean_available(
+                    np.asarray(peer_deltas, dtype=np.float64)
+                )
+
     if record["n_local_shared_genes"] < 2 and record["n_global_shared_genes"] < 2:
         return None
     return record
@@ -4350,6 +4695,7 @@ def prepare(
     compute_retrieval_metrics: bool = False,
     compute_normalized_cosine: bool = False,
     compute_normalized_spearman: bool = False,
+    compute_normalized_deg: bool = False,
     normalization_scales: str = "all",
     population_stats_root: Path = DEFAULT_POPULATION_STATS_ROOT,
     min_retrieval_compounds_per_line_time: int = DEFAULT_MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME,
@@ -4582,7 +4928,11 @@ def prepare(
         )
         for dataset_name in active_datasets
     }
-    if compute_normalized_cosine or compute_normalized_spearman:
+    if (
+        compute_normalized_cosine
+        or compute_normalized_spearman
+        or compute_normalized_deg
+    ):
         cache_reader = ReplicatePopulationStatsCache(population_stats_root)
         requested_scopes = resolve_normalization_scopes(normalization_scales)
         missing_caches: list[str] = []
@@ -4637,6 +4987,7 @@ def prepare(
             "compute_retrieval_metrics": bool(compute_retrieval_metrics),
             "compute_normalized_cosine": bool(compute_normalized_cosine),
             "compute_normalized_spearman": bool(compute_normalized_spearman),
+            "compute_normalized_deg": bool(compute_normalized_deg),
             "normalization_scales": str(normalization_scales),
             "population_stats_root": str(Path(population_stats_root).resolve()),
             "min_retrieval_compounds_per_line_time": int(min_retrieval_compounds_per_line_time),
@@ -4732,6 +5083,7 @@ def run_task(
     compute_retrieval_metrics: bool,
     compute_normalized_cosine: bool,
     compute_normalized_spearman: bool,
+    compute_normalized_deg: bool,
     normalization_scales: str,
     population_stats_root: Path,
     min_retrieval_compounds_per_line_time: int,
@@ -4803,6 +5155,7 @@ def run_task(
         or compute_retrieval_metrics
         or compute_normalized_cosine
         or compute_normalized_spearman
+        or compute_normalized_deg
     ):
         full_dataset_source_frame = pd.read_csv(
             dataset_metadata_cache_path(output_dir, dataset_name),
@@ -4817,6 +5170,7 @@ def run_task(
         compute_baseline_metrics
         or compute_normalized_cosine
         or compute_normalized_spearman
+        or compute_normalized_deg
     ) and full_dataset_source_frame is not None:
         baseline_source_frame = full_dataset_source_frame.copy()
         task_contexts = conditions_frame[["cell_type", "time_key", "dose_key"]].drop_duplicates().copy()
@@ -4833,10 +5187,10 @@ def run_task(
             ).groups.items()
         }
 
-    open_adatas: dict[str, ad.AnnData] = {}
+    open_adatas: dict[str, LazyH5AD] = {}
     population_stats_cache = (
         ReplicatePopulationStatsCache(population_stats_root)
-        if compute_normalized_cosine or compute_normalized_spearman
+        if compute_normalized_cosine or compute_normalized_spearman or compute_normalized_deg
         else None
     )
     normalization_scope_values = resolve_normalization_scopes(
@@ -4853,7 +5207,7 @@ def run_task(
             compute_retrieval_metrics=compute_retrieval_metrics,
         )
         for source_path in sorted(source_paths_to_open):
-            open_adatas[source_path] = read_h5ad_safely(source_path, backed="r")
+            open_adatas[source_path] = open_scoring_source(source_path)
 
         for condition_position, (_, condition_row) in enumerate(
             conditions_frame.iterrows(),
@@ -4884,6 +5238,7 @@ def run_task(
                     compute_baseline_metrics=compute_baseline_metrics,
                     compute_normalized_cosine=compute_normalized_cosine,
                     compute_normalized_spearman=compute_normalized_spearman,
+                    compute_normalized_deg=compute_normalized_deg,
                     normalization_scopes=normalization_scope_values,
                     population_stats_cache=population_stats_cache,
                     baseline_source_frame=baseline_source_frame,
@@ -5363,6 +5718,7 @@ def merge_task_outputs(
     expect_normalized_spearman = bool(
         config.get("compute_normalized_spearman", False)
     )
+    expect_normalized_deg = bool(config.get("compute_normalized_deg", False))
     expected_peer_config_fingerprint = config_fingerprint(config) if config else None
     existing_results_dir = existing_results_dir.resolve() if existing_results_dir is not None else None
     current_dataset_names = read_dataset_names_from_selection_summary(output_dir)
@@ -5520,6 +5876,29 @@ def merge_task_outputs(
         if missing_normalized_columns:
             raise ValueError(
                 "Normalized Spearman was requested in the saved prepare config, "
+                "but merged task outputs are missing columns: "
+                f"{missing_normalized_columns}. Rerun the scoring tasks."
+            )
+    if expect_normalized_deg:
+        expected_normalized_columns = {
+            "mean_replicate_deg_lfc_spearman_sym_"
+            + definition_key
+            + (
+                "_normalized_dataset"
+                if scope == DATASET_SCOPE
+                else "_normalized_dataset_cell_type"
+            )
+            for scope in resolve_normalization_scopes(
+                str(config.get("normalization_scales", "all"))
+            )
+            for definition_key in ACTIVE_DEG_DEFINITIONS
+        }
+        missing_normalized_columns = sorted(
+            expected_normalized_columns - set(condition_metric_summary.columns)
+        )
+        if missing_normalized_columns:
+            raise ValueError(
+                "Normalized DEG was requested in the saved prepare config, "
                 "but merged task outputs are missing columns: "
                 f"{missing_normalized_columns}. Rerun the scoring tasks."
             )
@@ -5741,6 +6120,7 @@ def _run_prepared_task_worker(payload: dict[str, object]) -> int:
         compute_retrieval_metrics=bool(payload["compute_retrieval_metrics"]),
         compute_normalized_cosine=bool(payload["compute_normalized_cosine"]),
         compute_normalized_spearman=bool(payload["compute_normalized_spearman"]),
+        compute_normalized_deg=bool(payload.get("compute_normalized_deg", False)),
         normalization_scales=str(payload["normalization_scales"]),
         population_stats_root=Path(str(payload["population_stats_root"])),
         min_retrieval_compounds_per_line_time=int(
@@ -5751,6 +6131,9 @@ def _run_prepared_task_worker(payload: dict[str, object]) -> int:
 
 
 def run_all(args: argparse.Namespace) -> None:
+    if getattr(args, "page_cache_prewarm", None):
+        # Set before workers are spawned so they inherit the same policy.
+        os.environ["CPB_PAGE_CACHE_PREWARM"] = args.page_cache_prewarm
     if int(args.workers) < 1:
         raise ValueError("--workers must be positive")
     if args.existing_results_dir is not None:
@@ -5783,6 +6166,7 @@ def run_all(args: argparse.Namespace) -> None:
             "compute_retrieval_metrics": bool(args.compute_retrieval_metrics),
             "compute_normalized_cosine": bool(args.compute_normalized_cosine),
             "compute_normalized_spearman": bool(args.compute_normalized_spearman),
+            "compute_normalized_deg": bool(args.compute_normalized_deg),
             "normalization_scales": str(args.normalization_scales),
             "population_stats_root": str(
                 Path(args.population_stats_root).resolve()
@@ -5829,6 +6213,7 @@ def run_all(args: argparse.Namespace) -> None:
             compute_retrieval_metrics=args.compute_retrieval_metrics,
             compute_normalized_cosine=args.compute_normalized_cosine,
             compute_normalized_spearman=args.compute_normalized_spearman,
+            compute_normalized_deg=args.compute_normalized_deg,
             normalization_scales=args.normalization_scales,
             population_stats_root=args.population_stats_root,
             min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
@@ -5870,6 +6255,7 @@ def run_all(args: argparse.Namespace) -> None:
         "compute_retrieval_metrics": bool(args.compute_retrieval_metrics),
         "compute_normalized_cosine": bool(args.compute_normalized_cosine),
         "compute_normalized_spearman": bool(args.compute_normalized_spearman),
+        "compute_normalized_deg": bool(args.compute_normalized_deg),
         "normalization_scales": str(args.normalization_scales),
         "population_stats_root": str(Path(args.population_stats_root).resolve()),
         "min_retrieval_compounds_per_line_time": int(
@@ -5965,6 +6351,7 @@ def main() -> None:
             compute_retrieval_metrics=args.compute_retrieval_metrics,
             compute_normalized_cosine=args.compute_normalized_cosine,
             compute_normalized_spearman=args.compute_normalized_spearman,
+            compute_normalized_deg=args.compute_normalized_deg,
             normalization_scales=args.normalization_scales,
             population_stats_root=args.population_stats_root,
             min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
@@ -5991,6 +6378,7 @@ def main() -> None:
             compute_retrieval_metrics=args.compute_retrieval_metrics,
             compute_normalized_cosine=args.compute_normalized_cosine,
             compute_normalized_spearman=args.compute_normalized_spearman,
+            compute_normalized_deg=args.compute_normalized_deg,
             normalization_scales=args.normalization_scales,
             population_stats_root=args.population_stats_root,
             min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,

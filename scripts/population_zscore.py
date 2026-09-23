@@ -36,6 +36,13 @@ import fcntl
 import numpy as np
 import pandas as pd
 
+try:
+    from lazy_h5ad import LazyH5AD, open_lazy_h5ad
+    from page_cache import prewarm_h5ad
+except ImportError:  # imported as ``scripts.population_zscore``
+    from scripts.lazy_h5ad import LazyH5AD, open_lazy_h5ad
+    from scripts.page_cache import prewarm_h5ad
+
 
 ENGINE_VERSION = 1
 DEFAULT_ROW_CHUNK_SIZE = 256
@@ -225,8 +232,36 @@ def eligible_population_mask(obs: pd.DataFrame, cell_type: str) -> np.ndarray:
     )
     if "cell_type" in obs.columns:
         observed_cell_type = _sanitized_strings(obs["cell_type"]).to_numpy(dtype=str)
-        eligible &= observed_cell_type == str(cell_type)
+        eligible &= observed_cell_type == resolve_source_cell_type(obs, cell_type)
     return eligible
+
+
+def resolve_source_cell_type(obs: pd.DataFrame, cell_type: str) -> str:
+    """Map a file-derived cell-type key onto the value actually stored in obs.
+
+    The key comes from the filename, which usually is the cell type. Some
+    sources split one line across several files with a trailing numeric
+    component instead -- GDPx2 ships ``CL_0000515_0.0625_de.h5ad`` for three
+    seeding densities of ``CL_0000515``. The suffix cannot simply be stripped,
+    because real identifiers end in digits too (``CVCL_0042``), so the stored
+    value decides.
+
+    An exact match always wins, which leaves every source that already agreed
+    untouched. Otherwise a file carrying exactly one cell type is taken at its
+    word: the guard exists to stop a multi-line file being treated as one
+    population, and a single-valued file cannot violate that.
+    """
+    if "cell_type" not in obs.columns:
+        return str(cell_type)
+    observed = _sanitized_strings(obs["cell_type"])
+    key = str(cell_type)
+    present = set(observed.to_numpy(dtype=str).tolist())
+    if key in present:
+        return key
+    distinct = sorted(value for value in present if value)
+    if len(distinct) == 1:
+        return distinct[0]
+    return key
 
 
 def unique_gene_index(var: pd.DataFrame, var_names: pd.Index) -> tuple[np.ndarray, np.ndarray]:
@@ -356,7 +391,7 @@ def _source_fingerprint(
 
 def _inspect_population_source(
     *,
-    adata: ad.AnnData,
+    adata: LazyH5AD,
     source_path: Path,
     dataset_name: str,
     cell_type: str,
@@ -563,7 +598,7 @@ def _stats_from_accumulators(
 
 def _fit_population_stats_from_open_adata(
     *,
-    adata: ad.AnnData,
+    adata: LazyH5AD,
     source_path: Path,
     dataset_name: str,
     cell_type: str,
@@ -658,7 +693,16 @@ def fit_population_stats(
     """Fit one source with a single backed-H5AD open."""
     source_path = Path(source_path)
     cache_path = Path(cache_path)
-    adata = ad.read_h5ad(source_path, backed="r")
+    prewarm_h5ad(
+        source_path,
+        layer_names=(layer_name,),
+        label=f"{dataset_name}/{cell_type}",
+        verbose=verbose,
+    )
+    # Deliberately not ad.read_h5ad(backed="r"): anndata backs only X, and
+    # these files have no X, so a backed open reads all eleven layers into
+    # memory. See scripts/lazy_h5ad.py for the measurements.
+    adata = open_lazy_h5ad(source_path)
     try:
         inspection = _inspect_population_source(
             adata=adata,
@@ -966,7 +1010,16 @@ def load_or_fit_population_stats(
             f"[w4_stats] inspecting {dataset_name}/{cell_type}: {source_path}",
             flush=True,
         )
-    adata = ad.read_h5ad(source_path, backed="r")
+    prewarm_h5ad(
+        source_path,
+        layer_names=(layer_name,),
+        label=f"{dataset_name}/{cell_type}",
+        verbose=verbose,
+    )
+    # Deliberately not ad.read_h5ad(backed="r"): anndata backs only X, and
+    # these files have no X, so a backed open reads all eleven layers into
+    # memory. See scripts/lazy_h5ad.py for the measurements.
+    adata = open_lazy_h5ad(source_path)
     try:
         inspection = _inspect_population_source(
             adata=adata,
@@ -1253,8 +1306,15 @@ def fit_dataset_population_stats(
     source_stats: Sequence[PopulationGeneStats],
     cache_path: Path,
     fingerprint: Optional[str] = None,
+    cell_type: str = DATASET_WIDE_CELL_TYPE,
+    scope: str = DATASET_SCOPE,
 ) -> PopulationGeneStats:
-    """Pool line-level sufficient statistics with gene-key-aware Chan merges."""
+    """Pool line-level sufficient statistics with gene-key-aware Chan merges.
+
+    Defaults pool every line into one dataset-wide population. Passing
+    ``cell_type``/``scope`` instead pools a subset into a single cell type,
+    which is what sources split across several files per line require.
+    """
     source_stats = sorted(
         list(source_stats),
         key=lambda stats: (stats.cell_type, stats.fingerprint),
@@ -1319,7 +1379,7 @@ def fit_dataset_population_stats(
     )
     return _stats_from_accumulators(
         dataset_name=dataset_name,
-        cell_type=DATASET_WIDE_CELL_TYPE,
+        cell_type=cell_type,
         gene_keys=gene_keys,
         counts=counts,
         means=means,
@@ -1329,8 +1389,88 @@ def fit_dataset_population_stats(
         ),
         fingerprint=expected_fingerprint,
         cache_path=cache_path,
-        scope=DATASET_SCOPE,
+        scope=scope,
     )
+
+
+def load_or_fit_cell_type_population_stats_from_source_stats(
+    *,
+    source_stats: Sequence[PopulationGeneStats],
+    dataset_name: str,
+    cell_type: str,
+    cache_root: Path,
+    force: bool = False,
+    verbose: bool = True,
+) -> PopulationGeneStats:
+    """Pool several line files that describe one cell type into its cache.
+
+    Most sources ship one file per cell type, so the file's own cache already
+    sits at the right path. GDPx2 instead splits each line across seeding
+    densities (``CL_0000515_0.0625_de.h5ad`` and two siblings), and downstream
+    scorers look the population up by the ``cell_type`` recorded in ``obs``.
+    Without this the lookup misses and normalization cannot run.
+    """
+    source_stats = sorted(
+        list(source_stats),
+        key=lambda stats: (stats.cell_type, stats.fingerprint),
+    )
+    if not source_stats:
+        raise ValueError("At least one line-level PopulationGeneStats is required")
+    cache_path = stats_cache_path(cache_root, dataset_name, cell_type)
+    fingerprint = _dataset_fingerprint_from_source_records(
+        dataset_name=f"{dataset_name}/{cell_type}",
+        source_records=[
+            (stats.cell_type, stats.fingerprint) for stats in source_stats
+        ],
+    )
+
+    def _cached() -> Optional[PopulationGeneStats]:
+        return _load_cache(
+            cache_path=cache_path,
+            expected_fingerprint=fingerprint,
+            dataset_name=dataset_name,
+            cell_type=cell_type,
+            expected_scope=DATASET_CELL_TYPE_SCOPE,
+        )
+
+    if not force:
+        cached = _cached()
+        if cached is not None:
+            if verbose:
+                print(
+                    f"[w4_stats:cell-type] reloaded {dataset_name}/{cell_type}: "
+                    f"{cached.population_row_count:,} rows from "
+                    f"{len(source_stats):,} files",
+                    flush=True,
+                )
+            return cached
+
+    with _exclusive_cache_lock(
+        cache_path,
+        label=f"cell-type/{dataset_name}/{cell_type}",
+        verbose=verbose,
+    ):
+        if not force:
+            cached = _cached()
+            if cached is not None:
+                return cached
+        stats = fit_dataset_population_stats(
+            dataset_name=dataset_name,
+            source_stats=source_stats,
+            cache_path=cache_path,
+            fingerprint=fingerprint,
+            cell_type=cell_type,
+            scope=DATASET_CELL_TYPE_SCOPE,
+        )
+        _write_cache(stats)
+        if verbose:
+            print(
+                f"[w4_stats:cell-type] pooled {dataset_name}/{cell_type} from "
+                f"{len(source_stats):,} files: {stats.population_row_count:,} rows, "
+                f"{stats.n_valid_genes:,}/{stats.n_genes:,} valid genes",
+                flush=True,
+            )
+        return stats
 
 
 def load_or_fit_dataset_population_stats_from_source_stats(
