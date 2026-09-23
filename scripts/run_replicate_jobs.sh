@@ -4,6 +4,11 @@
 #
 #   nohup scripts/run_replicate_jobs.sh > logs/replicate_jobs.log 2>&1 &
 #
+# Scoring is CPU-bound and every condition is independent, so on a larger
+# instance raise the worker count; the scorer's own default is capped at 32:
+#
+#   SCORING_WORKERS=126 RETRIEVAL_THREADS=64 nohup scripts/run_replicate_jobs.sh ...
+#
 # A job counts as finished once its shards have been merged into
 # condition_metric_summary.tsv. Unfinished jobs resume from their own saved
 # config (scripts/resume_replicate_run.py), so completed shards are reused and
@@ -13,6 +18,10 @@ cd "$(dirname "$0")/.."
 
 PY=./.venv/bin/python
 SCORER=scripts/precompute_replicate_signature_similarity.py
+WORKER_FLAGS=()
+if [[ -n "${SCORING_WORKERS:-}" ]]; then
+  WORKER_FLAGS=(--workers "$SCORING_WORKERS")
+fi
 
 # Shared settings, identical across jobs so the tables are comparable.
 COMMON_FLAGS=(
@@ -41,10 +50,10 @@ for job in "${JOBS[@]}"; do
   fi
   if [[ -f "$out/task_inputs/task_config.json" && -f "$out/task_manifest.tsv" ]]; then
     echo "[jobs] $(date -u +%H:%M:%S) resuming $out"
-    "$PY" scripts/resume_replicate_run.py --output-dir "$out"
+    "$PY" scripts/resume_replicate_run.py --output-dir "$out" "${WORKER_FLAGS[@]}"
   else
     echo "[jobs] $(date -u +%H:%M:%S) starting $out ($datasets)"
-    "$PY" "$SCORER" --datasets "$datasets" --output-dir "$out" "${COMMON_FLAGS[@]}"
+    "$PY" "$SCORER" --datasets "$datasets" --output-dir "$out" "${COMMON_FLAGS[@]}" "${WORKER_FLAGS[@]}"
   fi
   status=$?
   if [[ $status -ne 0 || ! -f "$out/condition_metric_summary.tsv" ]]; then
