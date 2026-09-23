@@ -1061,17 +1061,22 @@ def difference_if_both_defined(observed: float, baseline: float) -> float:
     return float(observed - baseline)
 
 
-def read_h5ad_safely(path: str | Path, *, backed: str = "r") -> LazyH5AD:
+def read_h5ad_safely(
+    path: str | Path, *, backed: str = "r", prewarm: bool = True
+) -> LazyH5AD:
     # Warm the layers this scorer reads before h5py touches them: they are
     # stored as small gzip chunks, which this storage serves at a fraction of
     # its sequential rate. Only one adj.P.Value variant exists per source, so
-    # both are offered as optional.
-    prewarm_h5ad(
-        path,
-        layer_names=SCORED_LAYER_NAMES,
-        optional_layer_names=ADJ_PVALUE_LAYER_PREFERENCES,
-        verbose=True,
-    )
+    # both are offered as optional. Metadata-only reads pass prewarm=False:
+    # they touch obs/var alone, and warming layers there runs serially in the
+    # parent during prepare.
+    if prewarm:
+        prewarm_h5ad(
+            path,
+            layer_names=SCORED_LAYER_NAMES,
+            optional_layer_names=ADJ_PVALUE_LAYER_PREFERENCES,
+            verbose=True,
+        )
     # Deliberately not ad.read_h5ad(backed="r"): anndata backs only X, and
     # these files have no X, so a backed open loads all eleven layers into
     # memory. See scripts/lazy_h5ad.py for the measurements.
@@ -2111,7 +2116,7 @@ def resolve_processed_sep_rep_h5ad(dataset_name: str, data_root: Path = DEFAULT_
 
 def load_processed_sep_rep_metadata(dataset_name: str, data_root: Path = DEFAULT_PROCESSED_DATA_ROOT) -> pd.DataFrame:
     path = resolve_processed_sep_rep_h5ad(dataset_name, data_root=data_root)
-    adata = read_h5ad_safely(path, backed="r")
+    adata = read_h5ad_safely(path, backed="r", prewarm=False)
     try:
         available_columns = [column_name for column_name in METADATA_OBS_COLUMNS if column_name in adata.obs.columns]
         obs = adata.obs[available_columns].copy()
@@ -2165,7 +2170,7 @@ def load_processed_sep_rep_metadata(dataset_name: str, data_root: Path = DEFAULT
 
 
 def load_source_metadata(path: Path) -> pd.DataFrame:
-    adata = read_h5ad_safely(path, backed="r")
+    adata = read_h5ad_safely(path, backed="r", prewarm=False)
     try:
         available_columns = [column_name for column_name in METADATA_OBS_COLUMNS if column_name in adata.obs.columns]
         obs = adata.obs[available_columns].copy()
@@ -2240,7 +2245,7 @@ def load_gene_info(path: str | Path) -> GeneInfo:
     if path_str in GENE_INFO_CACHE:
         return GENE_INFO_CACHE[path_str]
 
-    adata = read_h5ad_safely(path_str, backed="r")
+    adata = read_h5ad_safely(path_str, backed="r", prewarm=False)
     try:
         var = adata.var.copy()
     finally:
