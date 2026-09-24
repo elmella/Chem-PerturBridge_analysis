@@ -103,4 +103,39 @@ print(f"[jobs] combined {merged.dataset_name.nunique()} datasets, {len(merged):,
 PY
   "$PY" scripts/replicate_retrieval.py --output-dir "$COMBINED" --tables-only --threads 8
 fi
+
+# Individual-peer baseline for replicate Spearman on the moderated t-statistic
+# (Table 10's t rows). Same dataset groupings, peer cap and seed as the main
+# runs, so conditions and sampled peers are identical and only the t-peer
+# columns are new. DEG metrics stay on so genes are masked exactly as in the
+# main runs; the normalized families, which dominate cost, are left off.
+TPEER_FLAGS=(
+  --compute-baseline-metrics --compute-deg-metrics --deg-definitions p05
+  --compute-t-peers --max-baseline-peers 256 --peer-sampling-seed 20260505
+  --conditions-per-task 25 --progress off
+)
+TPEER_JOBS=(
+  "results/replicate_tpeers_full_v1|op3,dilimap_train_val,gdpx2,sciplex,tahoe,vcpi_0002,vcpi_0001,novartis_batch_2500"
+  "results/replicate_tpeers_l1000_cigs_v1|cigs_mce,cigs_tcm,sciplex,tahoe,l1000_phase1,l1000_phase2"
+)
+for job in "${TPEER_JOBS[@]}"; do
+  out="${job%%|*}"
+  datasets="${job##*|}"
+  if [[ -f "$out/condition_metric_summary.tsv" ]]; then
+    echo "[jobs] $(date -u +%H:%M:%S) $out already merged; skipping"
+    continue
+  fi
+  if [[ -f "$out/task_inputs/task_config.json" && -f "$out/task_manifest.tsv" ]]; then
+    echo "[jobs] $(date -u +%H:%M:%S) resuming $out"
+    "$PY" scripts/resume_replicate_run.py --output-dir "$out" "${WORKER_FLAGS[@]}"
+  else
+    echo "[jobs] $(date -u +%H:%M:%S) starting $out ($datasets)"
+    "$PY" "$SCORER" --datasets "$datasets" --output-dir "$out" "${TPEER_FLAGS[@]}" "${WORKER_FLAGS[@]}"
+  fi
+  if [[ ! -f "$out/condition_metric_summary.tsv" ]]; then
+    echo "[jobs] $(date -u +%H:%M:%S) $out stopped; rerun this script to continue"
+    exit 1
+  fi
+  echo "[jobs] $(date -u +%H:%M:%S) $out merged"
+done
 echo "[jobs] $(date -u +%H:%M:%S) all jobs complete"

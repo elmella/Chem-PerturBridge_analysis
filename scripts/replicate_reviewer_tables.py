@@ -55,6 +55,11 @@ TABLE_INPUT_FILES = {
 # them is normal rather than broken.
 OPTIONAL_METRIC_PREFIXES: dict[int, tuple[str, ...]] = {
     7: ("dataset_normalized_", "dataset_cell_type_normalized_"),
+    # Replicate Spearman on the moderated t-statistic. Observed and centroid
+    # are computed by every baseline run; the peer family needs
+    # --compute-t-peers, so they are separate families rather than one
+    # family that older runs would carry only half of.
+    10: ("tstat_", "tpeer_"),
 }
 
 TABLE_METRICS: dict[int, dict[str, str]] = {
@@ -297,6 +302,25 @@ for _scale_label, _scale_suffix in (
             f"{_source_stem}_{_scale_suffix}"
         )
 
+TABLE_METRICS[10].update(
+    {
+        "tstat_observed_replicate_spearman": "mean_replicate_spearman_t",
+        "tstat_centroid_baseline_spearman": "mean_replicate_baseline_spearman_t",
+        "tstat_delta_vs_centroid_spearman": "mean_replicate_minus_baseline_spearman_t",
+        "tpeer_individual_peer_mean_spearman": "mean_peer_baseline_spearman_t",
+        "tpeer_individual_peer_sd_spearman": "mean_peer_baseline_sd_spearman_t",
+        "tpeer_individual_peer_fraction_below_observed_spearman": (
+            "mean_peer_baseline_fraction_below_observed_spearman_t"
+        ),
+        "tpeer_individual_peer_corrected_percentile_spearman": (
+            "mean_peer_baseline_corrected_percentile_spearman_t"
+        ),
+        "tpeer_delta_vs_individual_peer_spearman": (
+            "mean_replicate_minus_peer_baseline_spearman_t"
+        ),
+    }
+)
+
 TABLE_PRIMARY_METRICS = {
     7: (
         "observed_deg_lfc_spearman_sym_p05",
@@ -358,6 +382,14 @@ TABLE_PRIMARY_METRICS[7] += tuple(
     )
 )
 
+TABLE_PRIMARY_METRICS[10] += (
+    "tstat_observed_replicate_spearman",
+    "tstat_centroid_baseline_spearman",
+    "tstat_delta_vs_centroid_spearman",
+    "tpeer_individual_peer_mean_spearman",
+    "tpeer_delta_vs_individual_peer_spearman",
+    "tpeer_individual_peer_corrected_percentile_spearman",
+)
 TABLE_PRIMARY_METRICS[10] += tuple(
     f"{scale_label}_{metric_name}"
     for scale_label in (

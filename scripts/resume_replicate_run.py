@@ -43,6 +43,7 @@ STORE_TRUE_FLAGS = {
     "compute_normalized_cosine": "--compute-normalized-cosine",
     "compute_normalized_spearman": "--compute-normalized-spearman",
     "compute_normalized_deg": "--compute-normalized-deg",
+    "compute_t_peers": "--compute-t-peers",
     "test_one_line_per_dataset": "--test-one-line-per-dataset",
 }
 VALUE_FLAGS = {

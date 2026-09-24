@@ -149,6 +149,97 @@ class ReplicateNormalizedCosineTests(unittest.TestCase):
                 )
             )
 
+    def test_t_peer_baseline_scores_the_same_peers_on_t(self) -> None:
+        from scipy.stats import spearmanr
+
+        rng = np.random.default_rng(5)
+        # t is drawn independently of logFC, so a t block that silently reused
+        # the logFC peers would disagree with the reference below.
+        logfc = rng.normal(size=(4, 6))
+        t_stat = rng.normal(size=(4, 6))
+        genes = np.asarray([f"g{i}" for i in range(6)])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.h5ad"
+            source.touch()
+            rows = replicate_scoring.normalize_source_metadata_frame(
+                pd.DataFrame(
+                    {
+                        "dataset_name": ["dataset_a"] * 4,
+                        "cell_type": ["line_a"] * 4,
+                        "pubchem_cid": ["1", "1", "2", "3"],
+                        "time_key": [24.0] * 4,
+                        "dose_key": [10.0] * 4,
+                        "source_path": [str(source)] * 4,
+                        "source_row_pos": np.arange(4),
+                        "condition_key": ["line_a|1|24|10"] * 2
+                        + ["line_a|2|24|10", "line_a|3|24|10"],
+                        "perturbagen_display": ["one", "one", "two", "three"],
+                    }
+                )
+            )
+
+            def load_block(block, *, gene_keys, open_adatas, load_t=True):
+                positions = block["source_row_pos"].astype(int).to_numpy()
+                return (
+                    [logfc[position].copy() for position in positions],
+                    [t_stat[position].copy() for position in positions]
+                    if load_t
+                    else [None] * len(positions),
+                )
+
+            def score(compute_t_peers: bool) -> dict:
+                replicate_scoring.WORKER_CONTEXT_AGGREGATE_CACHE.clear()
+                with patch.object(
+                    replicate_scoring, "load_vectors_for_rows", side_effect=load_block
+                ), patch.object(
+                    replicate_scoring, "shared_gene_keys_for_paths", return_value=genes
+                ), patch.object(replicate_scoring, "MAX_BASELINE_PEERS", None):
+                    return replicate_scoring.compute_condition_metric_record_from_rows(
+                        rows.iloc[0],
+                        rows.iloc[:2].copy(),
+                        output_dir=root,
+                        line_global_shared_gene_keys={"line_a": genes},
+                        top_k=2,
+                        compute_baseline_metrics=True,
+                        compute_t_peers=compute_t_peers,
+                        baseline_source_frame=rows.copy(),
+                        baseline_context_row_indexes={("line_a", "24", "10"): np.arange(4)},
+                        open_adatas={},
+                    )
+
+            with_t = score(True)
+            without_t = score(False)
+
+        observed = spearmanr(t_stat[0], t_stat[1]).correlation
+        # Each peer's score is the mean of its Spearman with the two replicates.
+        peers = [
+            np.mean([spearmanr(t_stat[r], t_stat[p]).correlation for r in (0, 1)])
+            for p in (2, 3)
+        ]
+        below = sum(score < observed for score in peers)
+        self.assertAlmostEqual(with_t["mean_replicate_spearman_t"], observed, places=12)
+        self.assertAlmostEqual(with_t["mean_peer_baseline_spearman_t"], np.mean(peers), places=12)
+        self.assertAlmostEqual(
+            with_t["mean_peer_baseline_corrected_percentile_spearman_t"],
+            (below + 1) / (len(peers) + 1),
+            places=12,
+        )
+        self.assertAlmostEqual(
+            with_t["mean_replicate_minus_peer_baseline_spearman_t"],
+            observed - np.mean(peers),
+            places=12,
+        )
+        self.assertEqual(with_t["n_valid_peer_baseline_t_pairs"], 1)
+        # Adding the t peers changes nothing that was already computed.
+        for key, value in without_t.items():
+            if isinstance(value, float) and np.isnan(value):
+                self.assertTrue(np.isnan(with_t[key]), key)
+            else:
+                self.assertEqual(with_t[key], value, key)
+        self.assertNotIn("mean_peer_baseline_spearman_t", without_t)
+
     def test_context_aggregate_is_exact_and_reused_from_disk(self) -> None:
         logfc = np.asarray(
             [

@@ -155,6 +155,23 @@ SCORED_LAYER_NAMES = ("logFC", "t")
 # logFC is the one read at random, once per peer per condition; t and the
 # adjusted p-values are read only for a condition's own few replicate rows.
 DENSE_CACHED_LAYERS = ("logFC",)
+def dense_layers_for_run(compute_t_peers: bool) -> tuple[str, ...]:
+    """Layers to serve from the dense cache for this run's flags.
+
+    Peer t rows are read at random exactly like peer logFC rows, so without a
+    dense copy they would fall back to decompressing whole chunk bands.
+    """
+    return ("logFC", "t") if compute_t_peers else ("logFC",)
+
+
+# Individual-peer baseline for replicate Spearman on the moderated t-statistic.
+T_PEER_FIELDS = (
+    "mean_peer_baseline_spearman_t",
+    "mean_peer_baseline_sd_spearman_t",
+    "mean_peer_baseline_fraction_below_observed_spearman_t",
+    "mean_peer_baseline_corrected_percentile_spearman_t",
+    "mean_replicate_minus_peer_baseline_spearman_t",
+)
 
 
 def default_worker_count(*, cap: int) -> int:
@@ -377,6 +394,16 @@ def add_common_run_args(parser: argparse.ArgumentParser) -> None:
             "Compute per-gene population-normalized within-dataset replicate "
             "Spearman agreement, including centroid and individual-peer baselines. "
             "Existing population statistics are reused; none are fitted here."
+        ),
+    )
+    parser.add_argument(
+        "--compute-t-peers",
+        action="store_true",
+        help=(
+            "Add the individual-peer baseline for replicate Spearman on the "
+            "moderated t-statistic (observed and centroid are always computed). "
+            "Requires --compute-baseline-metrics; keep --compute-deg-metrics on "
+            "so genes are masked exactly as in the other Table 10 columns."
         ),
     )
     parser.add_argument(
@@ -606,6 +633,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--compute-normalized-deg",
         action="store_true",
         help="Compute normalized DEG-restricted replicate logFC Spearman (Table 7).",
+    )
+    run_task_parser.add_argument(
+        "--compute-t-peers",
+        action="store_true",
+        help="Add the individual-peer baseline for replicate Spearman on t.",
     )
     run_task_parser.add_argument(
         "--normalization-scales",
@@ -2725,6 +2757,7 @@ def compute_condition_metric_record_from_rows(
     compute_normalized_cosine: bool = False,
     compute_normalized_spearman: bool = False,
     compute_normalized_deg: bool = False,
+    compute_t_peers: bool = False,
     normalization_scopes: tuple[str, ...] = NORMALIZATION_SCOPES,
     population_stats_cache: Optional[ReplicatePopulationStatsCache] = None,
     baseline_source_frame: Optional[pd.DataFrame] = None,
@@ -2906,6 +2939,10 @@ def compute_condition_metric_record_from_rows(
             record[f"n_spearman_genes_{suffix}"] = 0
             record[f"n_valid_replicate_spearman_pairs_{metric_suffix}"] = 0
             record[f"n_valid_peer_spearman_pairs_{metric_suffix}"] = 0
+    if compute_t_peers:
+        for field_name in T_PEER_FIELDS:
+            record[field_name] = float("nan")
+        record["n_valid_peer_baseline_t_pairs"] = 0
     if compute_normalized_deg:
         for scope in normalization_scopes:
             suffix = (
@@ -3049,6 +3086,8 @@ def compute_condition_metric_record_from_rows(
     global_baseline_logfc: Optional[np.ndarray] = None
     local_peer_logfc_matrix: Optional[np.ndarray] = None
     raw_local_peer_logfc_matrix: Optional[np.ndarray] = None
+    local_peer_t_matrix: Optional[np.ndarray] = None
+    raw_local_peer_t_matrix: Optional[np.ndarray] = None
     selected_peer_rows = pd.DataFrame()
     local_context_aggregate: Optional[ContextAggregate] = None
     peer_seed_key = "|".join([dataset_name, cell_type, pubchem_cid, time_key, dose_key])
@@ -3125,11 +3164,11 @@ def compute_condition_metric_record_from_rows(
                     sampling_seed=PEER_SAMPLING_SEED,
                 )
                 selected_peer_rows = baseline_rows.iloc[selected_positions].copy()
-                selected_logfc_vectors, _ = load_vectors_for_rows(
+                selected_logfc_vectors, selected_t_vectors = load_vectors_for_rows(
                     selected_peer_rows,
                     gene_keys=local_gene_keys,
                     open_adatas=open_adatas,
-                    load_t=False,
+                    load_t=compute_t_peers,
                 )
                 raw_local_peer_logfc_matrix = optional_vectors_to_matrix(
                     selected_logfc_vectors,
@@ -3142,6 +3181,15 @@ def compute_condition_metric_record_from_rows(
                 raw_local_peer_logfc_matrix = raw_local_peer_logfc_matrix[
                     available_peer_mask
                 ]
+                raw_local_peer_t_matrix = (
+                    optional_vectors_to_matrix(
+                        selected_t_vectors,
+                        n_columns=int(local_gene_keys.size),
+                        dtype=np.float64,
+                    )[available_peer_mask]
+                    if compute_t_peers
+                    else None
+                )
                 selected_peer_rows = selected_peer_rows.iloc[
                     np.flatnonzero(available_peer_mask)
                 ].reset_index(drop=True)
@@ -3163,6 +3211,14 @@ def compute_condition_metric_record_from_rows(
                         == local_logfc_matrix.shape[1]
                     ):
                         local_peer_logfc_matrix = raw_local_peer_logfc_matrix
+                if raw_local_peer_t_matrix is not None and raw_local_peer_t_matrix.size:
+                    # Exactly the genes the observed and centroid t scores use.
+                    if local_adj_p_matrix is not None:
+                        local_peer_t_matrix = raw_local_peer_t_matrix[:, finite_local_mask]
+                    elif local_t_matrix is not None and (
+                        raw_local_peer_t_matrix.shape[1] == local_t_matrix.shape[1]
+                    ):
+                        local_peer_t_matrix = raw_local_peer_t_matrix
 
                 if local_baseline_logfc is not None and local_logfc_matrix is not None:
                     if local_adj_p_matrix is not None:
@@ -3313,6 +3369,65 @@ def compute_condition_metric_record_from_rows(
                                 np.asarray(peer_summary_fields["peer_mean_score"], dtype=np.float64)
                             ).sum()
                         )
+
+                # The same peers, scored on the moderated t-statistic, so the
+                # t row of Table 10 gets the individual-peer baseline its
+                # logFC row already has.
+                if (
+                    compute_t_peers
+                    and local_t_matrix is not None
+                    and local_peer_t_matrix is not None
+                    and local_peer_t_matrix.shape[0] > 0
+                    and local_peer_t_matrix.shape[1] == local_t_matrix.shape[1]
+                ):
+                    t_peer_fields: dict[str, list[float]] = defaultdict(list)
+                    t_peer_deltas: list[float] = []
+                    t_peer_scores: dict[int, np.ndarray] = {}
+                    for pair_position, (left_idx, right_idx) in enumerate(pair_indices):
+                        for replicate_idx in (left_idx, right_idx):
+                            if replicate_idx not in t_peer_scores:
+                                t_peer_scores[replicate_idx] = spearman_against_peers(
+                                    local_t_matrix[replicate_idx],
+                                    local_peer_t_matrix,
+                                )
+                        observed_t = (
+                            float(t_values[pair_position])
+                            if pair_position < len(t_values)
+                            else float("nan")
+                        )
+                        summary = replicate_pair_peer_summary(
+                            t_peer_scores[left_idx],
+                            t_peer_scores[right_idx],
+                            observed_t,
+                            "peer",
+                        )
+                        for field_name, field_value in summary.items():
+                            t_peer_fields[field_name].append(float(field_value))
+                        t_peer_deltas.append(
+                            difference_if_both_defined(
+                                observed_t, float(summary["peer_mean_score"])
+                            )
+                        )
+                    for record_name, field_name in zip(
+                        T_PEER_FIELDS[:4],
+                        (
+                            "peer_mean_score",
+                            "peer_sd_score",
+                            "peer_fraction_below_observed",
+                            "peer_corrected_percentile",
+                        ),
+                    ):
+                        record[record_name] = mean_available(
+                            np.asarray(t_peer_fields[field_name], dtype=np.float64)
+                        )
+                    record[T_PEER_FIELDS[4]] = mean_available(
+                        np.asarray(t_peer_deltas, dtype=np.float64)
+                    )
+                    record["n_valid_peer_baseline_t_pairs"] = int(
+                        np.isfinite(
+                            np.asarray(t_peer_fields["peer_mean_score"], dtype=np.float64)
+                        ).sum()
+                    )
 
                 if (
                     global_logfc_matrix is not None
@@ -4701,6 +4816,7 @@ def prepare(
     compute_normalized_cosine: bool = False,
     compute_normalized_spearman: bool = False,
     compute_normalized_deg: bool = False,
+    compute_t_peers: bool = False,
     normalization_scales: str = "all",
     population_stats_root: Path = DEFAULT_POPULATION_STATS_ROOT,
     min_retrieval_compounds_per_line_time: int = DEFAULT_MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME,
@@ -4993,6 +5109,7 @@ def prepare(
             "compute_normalized_cosine": bool(compute_normalized_cosine),
             "compute_normalized_spearman": bool(compute_normalized_spearman),
             "compute_normalized_deg": bool(compute_normalized_deg),
+            "compute_t_peers": bool(compute_t_peers),
             "normalization_scales": str(normalization_scales),
             "population_stats_root": str(Path(population_stats_root).resolve()),
             "min_retrieval_compounds_per_line_time": int(min_retrieval_compounds_per_line_time),
@@ -5089,6 +5206,7 @@ def run_task(
     compute_normalized_cosine: bool,
     compute_normalized_spearman: bool,
     compute_normalized_deg: bool,
+    compute_t_peers: bool,
     normalization_scales: str,
     population_stats_root: Path,
     min_retrieval_compounds_per_line_time: int,
@@ -5244,6 +5362,7 @@ def run_task(
                     compute_normalized_cosine=compute_normalized_cosine,
                     compute_normalized_spearman=compute_normalized_spearman,
                     compute_normalized_deg=compute_normalized_deg,
+                    compute_t_peers=compute_t_peers,
                     normalization_scopes=normalization_scope_values,
                     population_stats_cache=population_stats_cache,
                     baseline_source_frame=baseline_source_frame,
@@ -5724,6 +5843,7 @@ def merge_task_outputs(
         config.get("compute_normalized_spearman", False)
     )
     expect_normalized_deg = bool(config.get("compute_normalized_deg", False))
+    expect_t_peers = bool(config.get("compute_t_peers", False))
     expected_peer_config_fingerprint = config_fingerprint(config) if config else None
     existing_results_dir = existing_results_dir.resolve() if existing_results_dir is not None else None
     current_dataset_names = read_dataset_names_from_selection_summary(output_dir)
@@ -5907,6 +6027,11 @@ def merge_task_outputs(
                 "but merged task outputs are missing columns: "
                 f"{missing_normalized_columns}. Rerun the scoring tasks."
             )
+    if expect_t_peers and "mean_peer_baseline_spearman_t" not in condition_metric_summary.columns:
+        raise ValueError(
+            "t peers were requested in the saved prepare config, but merged task "
+            "outputs are missing mean_peer_baseline_spearman_t. Rerun the scoring tasks."
+        )
     condition_metric_summary_path = output_dir / "condition_metric_summary.tsv"
     condition_metric_summary.to_csv(condition_metric_summary_path, sep="\t", index=False)
     print(f"Saved condition-level metric summary to {condition_metric_summary_path}")
@@ -6104,7 +6229,8 @@ def merge_task_outputs(
 
 def _run_prepared_task_worker(payload: dict[str, object]) -> int:
     """Spawn-safe adapter for one atomic replicate task shard."""
-    global ACTIVE_DEG_DEFINITIONS, MAX_BASELINE_PEERS, PEER_SAMPLING_SEED
+    global ACTIVE_DEG_DEFINITIONS, MAX_BASELINE_PEERS, PEER_SAMPLING_SEED, DENSE_CACHED_LAYERS
+    DENSE_CACHED_LAYERS = dense_layers_for_run(bool(payload.get("compute_t_peers", False)))
     max_peers = payload["max_baseline_peers"]
     MAX_BASELINE_PEERS = (
         None if max_peers is None or int(max_peers) == 0 else int(max_peers)
@@ -6126,6 +6252,7 @@ def _run_prepared_task_worker(payload: dict[str, object]) -> int:
         compute_normalized_cosine=bool(payload["compute_normalized_cosine"]),
         compute_normalized_spearman=bool(payload["compute_normalized_spearman"]),
         compute_normalized_deg=bool(payload.get("compute_normalized_deg", False)),
+        compute_t_peers=bool(payload.get("compute_t_peers", False)),
         normalization_scales=str(payload["normalization_scales"]),
         population_stats_root=Path(str(payload["population_stats_root"])),
         min_retrieval_compounds_per_line_time=int(
@@ -6172,6 +6299,7 @@ def run_all(args: argparse.Namespace) -> None:
             "compute_normalized_cosine": bool(args.compute_normalized_cosine),
             "compute_normalized_spearman": bool(args.compute_normalized_spearman),
             "compute_normalized_deg": bool(args.compute_normalized_deg),
+            "compute_t_peers": bool(getattr(args, "compute_t_peers", False)),
             "normalization_scales": str(args.normalization_scales),
             "population_stats_root": str(
                 Path(args.population_stats_root).resolve()
@@ -6186,10 +6314,17 @@ def run_all(args: argparse.Namespace) -> None:
             ),
             "peer_sampling_seed": int(args.peer_sampling_seed),
         }
+        # A boolean flag added after a run was prepared is absent from its
+        # saved config; absent means it was off, not that it differs.
+        def saved_value(key: str, requested: object) -> object:
+            if key not in config and isinstance(requested, bool):
+                return False
+            return config.get(key)
+
         mismatches = {
-            key: (config.get(key), value)
+            key: (saved_value(key, value), value)
             for key, value in requested_config.items()
-            if config.get(key) != value
+            if saved_value(key, value) != value
         }
         if mismatches:
             mismatch_lines = "\n".join(
@@ -6219,6 +6354,7 @@ def run_all(args: argparse.Namespace) -> None:
             compute_normalized_cosine=args.compute_normalized_cosine,
             compute_normalized_spearman=args.compute_normalized_spearman,
             compute_normalized_deg=args.compute_normalized_deg,
+            compute_t_peers=getattr(args, "compute_t_peers", False),
             normalization_scales=args.normalization_scales,
             population_stats_root=args.population_stats_root,
             min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
@@ -6261,6 +6397,7 @@ def run_all(args: argparse.Namespace) -> None:
         "compute_normalized_cosine": bool(args.compute_normalized_cosine),
         "compute_normalized_spearman": bool(args.compute_normalized_spearman),
         "compute_normalized_deg": bool(args.compute_normalized_deg),
+        "compute_t_peers": bool(getattr(args, "compute_t_peers", False)),
         "normalization_scales": str(args.normalization_scales),
         "population_stats_root": str(Path(args.population_stats_root).resolve()),
         "min_retrieval_compounds_per_line_time": int(
@@ -6331,10 +6468,13 @@ RETRIEVAL_RETIRED_MESSAGE = (
 
 
 def main() -> None:
-    global ACTIVE_DEG_DEFINITIONS, MAX_BASELINE_PEERS, PEER_SAMPLING_SEED
+    global ACTIVE_DEG_DEFINITIONS, MAX_BASELINE_PEERS, PEER_SAMPLING_SEED, DENSE_CACHED_LAYERS
     args = parse_args()
     if getattr(args, "compute_retrieval_metrics", False):
         raise SystemExit(RETRIEVAL_RETIRED_MESSAGE)
+    if getattr(args, "compute_t_peers", False) and not getattr(args, "compute_baseline_metrics", False):
+        raise SystemExit("--compute-t-peers needs --compute-baseline-metrics, which selects the peers.")
+    DENSE_CACHED_LAYERS = dense_layers_for_run(bool(getattr(args, "compute_t_peers", False)))
     # Read at call time inside the scoring functions, so setting it here covers every command.
     requested_max_peers = getattr(args, "max_baseline_peers", None)
     if requested_max_peers is not None and int(requested_max_peers) < 0:
@@ -6369,6 +6509,7 @@ def main() -> None:
             compute_normalized_cosine=args.compute_normalized_cosine,
             compute_normalized_spearman=args.compute_normalized_spearman,
             compute_normalized_deg=args.compute_normalized_deg,
+            compute_t_peers=getattr(args, "compute_t_peers", False),
             normalization_scales=args.normalization_scales,
             population_stats_root=args.population_stats_root,
             min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
@@ -6396,6 +6537,7 @@ def main() -> None:
             compute_normalized_cosine=args.compute_normalized_cosine,
             compute_normalized_spearman=args.compute_normalized_spearman,
             compute_normalized_deg=args.compute_normalized_deg,
+            compute_t_peers=getattr(args, "compute_t_peers", False),
             normalization_scales=args.normalization_scales,
             population_stats_root=args.population_stats_root,
             min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
