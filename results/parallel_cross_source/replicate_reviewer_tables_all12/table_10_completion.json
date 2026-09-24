@@ -1,0 +1,23 @@
+{
+  "bootstrap_iterations": 2000,
+  "bootstrap_seed": 20260505,
+  "files": {
+    "ci": {
+      "sha256": "213ea191a953b2345dba0291bddcfc33b024d5a27f6f2373b6038932ab39fa46",
+      "size": 230407
+    },
+    "presentation": {
+      "sha256": "1342d0cba805bb99bb3bda7dd791914e9d58492efc418b3d189e1a8c72bbfe2b",
+      "size": 11144
+    },
+    "ranges": {
+      "sha256": "015c70542d309101ed2ff7240a54a5be68c16302c196833fceec10f135fa7684",
+      "size": 7438
+    }
+  },
+  "fingerprint": "a9228b69983ab8d14513b6c7c0a09d194102390ef5c2f2b0da52947f35e2dbb2",
+  "input_path": "/home/cirro/Chem-PerturBridge_analysis/results/replicate_all12_input/condition_metric_summary.tsv",
+  "n_ci_rows": 576,
+  "n_condition_rows": 84315,
+  "table": 10
+}
