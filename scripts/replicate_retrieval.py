@@ -12,6 +12,8 @@ definitions (``scripts/cross_source_scoring.py``):
 * AUROC of positives against negatives;
 * the exact null expectation of the rank, since queries have one or two
   positives and chance is therefore above 0.5;
+* similarities: cosine, Spearman, and negative Euclidean distance (``l2``),
+  as in Table 9;
 * a centroid baseline: the mean of same-dose, other-compound replicates,
   injected into the pool, as in the original replicate code.
 
@@ -91,7 +93,7 @@ for _path in (str(SCRIPT_DIR), str(REPO_ROOT)):
 
 import precompute_replicate_signature_similarity as scorer  # noqa: E402
 
-SIMILARITY_METRICS = ("cosine", "spearman")
+SIMILARITY_METRICS = ("cosine", "spearman", "l2")
 SCALE_VARIANTS = ("raw", "dataset", "dataset-cell-type")
 SCALE_LABELS = {
     "raw": "raw",
@@ -178,6 +180,24 @@ def similarity_ready_rows(matrix: np.ndarray, metric: str) -> tuple[np.ndarray, 
     return out, valid
 
 
+def negative_l2_scores(
+    query: np.ndarray,
+    candidates: np.ndarray,
+    query_square_norms: np.ndarray,
+    candidate_square_norms: np.ndarray,
+) -> np.ndarray:
+    """Negative Euclidean distance, ``-||q - c||``, for every query x candidate.
+
+    Table 9 computes this with ``cdist``, which is single-threaded; replicate
+    strata reach ~48,000 candidates x ~12,000 genes, so here it comes from
+    ``||q||^2 + ||c||^2 - 2 q.c`` with a threaded matrix product. The two agree
+    to floating-point roundoff (clipped at zero, where cancellation could dip
+    below it), so rankings match; the self-test checks this against cdist.
+    """
+    square = query_square_norms[:, None] + candidate_square_norms[None, :] - 2.0 * (query @ candidates.T)
+    return -np.sqrt(np.maximum(square, 0.0))
+
+
 # ---------------------------------------------------------------------------
 # One stratum
 # ---------------------------------------------------------------------------
@@ -254,7 +274,13 @@ def score_stratum(
     _, condition = np.unique(rows["condition_key"].astype(str).to_numpy(), return_inverse=True)
     compound = rows["pubchem_cid"].astype(str).to_numpy()
     dose = rows["dose_key"].astype(str).to_numpy()
-    unit, valid = similarity_ready_rows(values, metric)
+    if metric == "l2":
+        # Distance needs no normalization; any row with all values finite scores.
+        valid = np.isfinite(values).all(axis=1)
+        finite_values = np.where(valid[:, None], values, 0.0)
+        square_norms = np.einsum("ij,ij->i", finite_values, finite_values)
+    else:
+        unit, valid = similarity_ready_rows(values, metric)
 
     # Centroid baseline: mean of same-dose, other-compound replicates. Built
     # from per-dose and per-(dose, compound) sums, so each query's centroid is
@@ -273,7 +299,12 @@ def score_stratum(
     for start in range(0, n_rows, query_block):
         stop = min(start + query_block, n_rows)
         block = np.arange(start, stop)
-        similarity = unit[block] @ unit.T
+        if metric == "l2":
+            similarity = negative_l2_scores(
+                finite_values[block], finite_values, square_norms[block], square_norms
+            )
+        else:
+            similarity = unit[block] @ unit.T
         similarity[:, ~valid] = np.nan
 
         peer_counts = dose_counts[dose_index[block]] - group_counts[group_index[block]]
@@ -281,11 +312,17 @@ def score_stratum(
             centroids = (
                 dose_sums[dose_index[block]] - group_sums[group_index[block]]
             ) / peer_counts[:, None]
-        centroid_unit, centroid_valid = similarity_ready_rows(
-            np.where(peer_counts[:, None] > 0, centroids, 0.0), metric
-        )
-        centroid_valid &= peer_counts > 0
-        centroid_scores = np.einsum("ij,ij->i", unit[block], centroid_unit)
+        if metric == "l2":
+            centroid_valid = peer_counts > 0
+            safe_centroids = np.where(centroid_valid[:, None], centroids, 0.0)
+            centroid_valid &= np.isfinite(safe_centroids).all(axis=1)
+            centroid_scores = -np.linalg.norm(finite_values[block] - safe_centroids, axis=1)
+        else:
+            centroid_unit, centroid_valid = similarity_ready_rows(
+                np.where(peer_counts[:, None] > 0, centroids, 0.0), metric
+            )
+            centroid_valid &= peer_counts > 0
+            centroid_scores = np.einsum("ij,ij->i", unit[block], centroid_unit)
 
         for offset, query in enumerate(block):
             if not valid[query]:

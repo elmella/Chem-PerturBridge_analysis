@@ -68,40 +68,52 @@ echo "[jobs] $(date -u +%H:%M:%S) all replicate scoring jobs complete"
 # run's prepared inputs so the conditions match Tables 7/8/10. sci-Plex and
 # Tahoe appear in both scoring runs with identical conditions, so they are
 # retrieved once, from the first. Each run checkpoints per stratum and
-# refuses to resume under different settings.
+# refuses to resume under different settings. Negative L2 was added after
+# cosine and Spearman had finished, so it has its own output directories.
 RETRIEVAL_THREADS="${RETRIEVAL_THREADS:-16}"
+FULL_DATASETS=op3,dilimap_train_val,gdpx2,sciplex,tahoe,vcpi_0002,vcpi_0001,novartis_batch_2500
+L1000_CIGS_DATASETS=cigs_mce,cigs_tcm,l1000_phase1,l1000_phase2
 RETRIEVAL_JOBS=(
-  "results/replicate_full_v1|results/replicate_retrieval_v1|op3,dilimap_train_val,gdpx2,sciplex,tahoe,vcpi_0002,vcpi_0001,novartis_batch_2500"
-  "results/replicate_l1000_cigs_v1|results/replicate_retrieval_l1000_cigs_v1|cigs_mce,cigs_tcm,l1000_phase1,l1000_phase2"
+  "results/replicate_full_v1|results/replicate_retrieval_v1|$FULL_DATASETS|cosine,spearman"
+  "results/replicate_l1000_cigs_v1|results/replicate_retrieval_l1000_cigs_v1|$L1000_CIGS_DATASETS|cosine,spearman"
+  "results/replicate_full_v1|results/replicate_retrieval_l2_v1|$FULL_DATASETS|l2"
+  "results/replicate_l1000_cigs_v1|results/replicate_retrieval_l2_l1000_cigs_v1|$L1000_CIGS_DATASETS|l2"
 )
+RETRIEVAL_PARTS=()
 for job in "${RETRIEVAL_JOBS[@]}"; do
-  IFS="|" read -r prepared out datasets <<< "$job"
+  IFS="|" read -r prepared out datasets similarity <<< "$job"
+  RETRIEVAL_PARTS+=("$out")
   if [[ -f "$out/tables/replicate_retrieval_table.tsv" ]]; then
     echo "[jobs] $(date -u +%H:%M:%S) $out already complete; skipping"
     continue
   fi
-  echo "[jobs] $(date -u +%H:%M:%S) retrieval into $out ($datasets)"
+  echo "[jobs] $(date -u +%H:%M:%S) retrieval into $out ($datasets; $similarity)"
   if ! "$PY" scripts/replicate_retrieval.py --prepared-dir "$prepared" --output-dir "$out" \
-      --datasets "$datasets" --threads "$RETRIEVAL_THREADS"; then
+      --datasets "$datasets" --similarity "$similarity" --threads "$RETRIEVAL_THREADS"; then
     echo "[jobs] $(date -u +%H:%M:%S) $out stopped; rerun this script to continue"
     exit 1
   fi
 done
 
-# One table across all twelve datasets.
+# One table across all twelve datasets, rebuilt whenever its parts change.
 COMBINED=results/replicate_retrieval_all12
-if [[ ! -f "$COMBINED/tables/replicate_retrieval_table.tsv" ]]; then
+PARTS_FILE="$COMBINED/parts.txt"
+if [[ ! -f "$COMBINED/tables/replicate_retrieval_table.tsv" ]] \
+    || [[ "$(cat "$PARTS_FILE" 2>/dev/null)" != "$(printf '%s\n' "${RETRIEVAL_PARTS[@]}")" ]]; then
   mkdir -p "$COMBINED"
-  "$PY" - <<'PY'
+  "$PY" - "${RETRIEVAL_PARTS[@]}" <<'PY'
+import sys
 import pandas as pd
 parts = [pd.read_csv(f"{d}/condition_retrieval_summary.tsv", sep="\t", dtype={"pubchem_cid": str})
-         for d in ("results/replicate_retrieval_v1", "results/replicate_retrieval_l1000_cigs_v1")]
+         for d in sys.argv[1:]]
 merged = pd.concat(parts, ignore_index=True)
 assert not merged.duplicated(["dataset_name", "condition_key", "similarity_metric", "scale_variant"]).any()
 merged.to_csv("results/replicate_retrieval_all12/condition_retrieval_summary.tsv", sep="\t", index=False)
-print(f"[jobs] combined {merged.dataset_name.nunique()} datasets, {len(merged):,} rows")
+print(f"[jobs] combined {merged.dataset_name.nunique()} datasets, "
+      f"{sorted(merged.similarity_metric.unique())}, {len(merged):,} rows")
 PY
-  "$PY" scripts/replicate_retrieval.py --output-dir "$COMBINED" --tables-only --threads 8
+  "$PY" scripts/replicate_retrieval.py --output-dir "$COMBINED" --tables-only --threads 8 \
+    && printf '%s\n' "${RETRIEVAL_PARTS[@]}" > "$PARTS_FILE"
 fi
 
 # Individual-peer baseline for replicate Spearman on the moderated t-statistic
@@ -131,6 +143,36 @@ for job in "${TPEER_JOBS[@]}"; do
   else
     echo "[jobs] $(date -u +%H:%M:%S) starting $out ($datasets)"
     "$PY" "$SCORER" --datasets "$datasets" --output-dir "$out" "${TPEER_FLAGS[@]}" "${WORKER_FLAGS[@]}"
+  fi
+  if [[ ! -f "$out/condition_metric_summary.tsv" ]]; then
+    echo "[jobs] $(date -u +%H:%M:%S) $out stopped; rerun this script to continue"
+    exit 1
+  fi
+  echo "[jobs] $(date -u +%H:%M:%S) $out merged"
+done
+
+# Table 7 DEG-restricted Spearman and Table 10 cosine on the moderated t, with
+# centroid and individual peers. Same groupings, cap and seed again; the t-peer
+# columns these runs also carry must equal the t-peer runs' exactly, which
+# scripts/merge_replicate_t_columns.py checks when joining them.
+TDC_FLAGS=("${TPEER_FLAGS[@]}" --compute-t-deg-cosine)
+TDC_JOBS=(
+  "results/replicate_tdegcos_full_v1|op3,dilimap_train_val,gdpx2,sciplex,tahoe,vcpi_0002,vcpi_0001,novartis_batch_2500"
+  "results/replicate_tdegcos_l1000_cigs_v1|cigs_mce,cigs_tcm,sciplex,tahoe,l1000_phase1,l1000_phase2"
+)
+for job in "${TDC_JOBS[@]}"; do
+  out="${job%%|*}"
+  datasets="${job##*|}"
+  if [[ -f "$out/condition_metric_summary.tsv" ]]; then
+    echo "[jobs] $(date -u +%H:%M:%S) $out already merged; skipping"
+    continue
+  fi
+  if [[ -f "$out/task_inputs/task_config.json" && -f "$out/task_manifest.tsv" ]]; then
+    echo "[jobs] $(date -u +%H:%M:%S) resuming $out"
+    "$PY" scripts/resume_replicate_run.py --output-dir "$out" "${WORKER_FLAGS[@]}"
+  else
+    echo "[jobs] $(date -u +%H:%M:%S) starting $out ($datasets)"
+    "$PY" "$SCORER" --datasets "$datasets" --output-dir "$out" "${TDC_FLAGS[@]}" "${WORKER_FLAGS[@]}"
   fi
   if [[ ! -f "$out/condition_metric_summary.tsv" ]]; then
     echo "[jobs] $(date -u +%H:%M:%S) $out stopped; rerun this script to continue"

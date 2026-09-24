@@ -3,21 +3,21 @@
   "bootstrap_seed": 20260505,
   "files": {
     "ci": {
-      "sha256": "bacdf1c5985ea61013c3ecb69cd71367a031e40fb27e8fc8a81f303662f0dd76",
-      "size": 120451
+      "sha256": "29877174d599615dcc3768c563bf57f1310792975907c62df857d9ce15d09199",
+      "size": 157400
     },
     "presentation": {
-      "sha256": "ce9559dd8f85c1df26c6df888d153a4566850b0fc63c9f16e79e70a68901883a",
-      "size": 5896
+      "sha256": "995658e0a18b54cc5ffa433e9d23e55a4a35f4def360fe4241e32b7e6933f8d9",
+      "size": 7720
     },
     "ranges": {
-      "sha256": "80ece00d03fd8f5601ee8e2761eecc7fd6074c662bac04e8d61099aac95a7a10",
-      "size": 3982
+      "sha256": "5ee65c450356a327147cf56d4c0a3fcd88f1c4ac5d8c8a14853efc25fa551ca9",
+      "size": 5152
     }
   },
-  "fingerprint": "9a04d4b45aaa37b2ee9e92f3bcc2f76433e1b783962553399783baaa2003762b",
-  "input_path": "/home/cirro/Chem-PerturBridge_analysis/results/replicate_all12_input/condition_deg_metric_summary.tsv",
-  "n_ci_rows": 288,
+  "fingerprint": "cbd94e1db6580fa5bac6e28145edc227fff648f3686e1e560276d3674466bc85",
+  "input_path": "/home/cirro/Chem-PerturBridge_analysis/results/replicate_all12_t_input/condition_deg_metric_summary.tsv",
+  "n_ci_rows": 384,
   "n_condition_rows": 84315,
   "table": 7
 }

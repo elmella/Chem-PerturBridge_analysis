@@ -43,6 +43,8 @@ def synthetic_stratum(seed: int = 3, n_genes: int = 40) -> tuple[pd.DataFrame, n
 def naive_similarity(a: np.ndarray, b: np.ndarray, metric: str) -> float:
     if metric == "cosine":
         return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+    if metric == "l2":
+        return -float(np.linalg.norm(a - b))
     return float(spearmanr(a, b).correlation)
 
 
@@ -116,7 +118,7 @@ class StratumScoringTests(unittest.TestCase):
         # 1e-16 of rounding in any float implementation, the cross-source one
         # included. 400 genes puts the step near 1e-7, clear of ties; tie
         # handling itself is covered at the metric level above.
-        for metric, n_genes in (("cosine", 40), ("spearman", 400)):
+        for metric, n_genes in (("cosine", 40), ("spearman", 400), ("l2", 40)):
             rows, values = synthetic_stratum(n_genes=n_genes)
             # A small block forces the blocking path to be exercised.
             fast = {r["row"]: r for r in rr.score_stratum(rows, values, metric=metric, query_block=5)}
@@ -140,12 +142,35 @@ class StratumScoringTests(unittest.TestCase):
         rng = np.random.default_rng(7)
         rows, _ = synthetic_stratum()
         noise = rng.normal(size=(len(rows), 40))
-        records = rr.score_stratum(rows, noise, metric="cosine", query_block=64)
-        observed = np.mean([r["observed_normalized_rank"] for r in records])
-        null = np.mean([r["null_expected_normalized_rank"] for r in records])
-        self.assertLess(observed, 0.85)
-        self.assertAlmostEqual(observed, null, delta=0.08)
-        self.assertLess(np.mean([r["recall_at_1"] for r in records]), 0.3)
+        # Under L2 the query's own sample would sit at distance 0, rank 1.
+        for metric in ("cosine", "l2"):
+            records = rr.score_stratum(rows, noise, metric=metric, query_block=64)
+            observed = np.mean([r["observed_normalized_rank"] for r in records])
+            null = np.mean([r["null_expected_normalized_rank"] for r in records])
+            self.assertLess(observed, 0.85, metric)
+            self.assertAlmostEqual(observed, null, delta=0.08, msg=metric)
+            self.assertLess(np.mean([r["recall_at_1"] for r in records]), 0.3, metric)
+
+    def test_negative_l2_matches_table9_cdist_and_its_rankings(self) -> None:
+        import precompute_replicate_signature_similarity as scorer
+
+        rng = np.random.default_rng(9)
+        # Large-magnitude, near-duplicate rows stress cancellation in the
+        # expansion ||q||^2 + ||c||^2 - 2 q.c.
+        base = rng.normal(scale=5.0, size=(1, 300))
+        candidates = np.vstack([base + rng.normal(scale=s, size=(20, 300)) for s in (0.01, 0.5, 3.0)])
+        queries = candidates[:15]
+        fast = rr.negative_l2_scores(
+            queries, candidates, (queries**2).sum(axis=1), (candidates**2).sum(axis=1)
+        )
+        exact = scorer.negative_l2_similarity_matrix(queries, candidates)
+        # A query's distance to itself (0) is where the expansion cancels
+        # worst; it is never scored, since the query is not its own candidate.
+        off_diagonal = ~np.eye(15, candidates.shape[0], dtype=bool)
+        np.testing.assert_allclose(fast[off_diagonal], exact[off_diagonal], rtol=0, atol=1e-9)
+        for row in range(15):
+            keep = off_diagonal[row]
+            np.testing.assert_array_equal(np.argsort(-fast[row][keep]), np.argsort(-exact[row][keep]))
 
     def test_condition_level_averages_each_conditions_queries(self) -> None:
         rows, values = synthetic_stratum()

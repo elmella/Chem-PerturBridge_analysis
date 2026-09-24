@@ -54,12 +54,14 @@ TABLE_INPUT_FILES = {
 # Metric families that need an extra --compute-* flag, so an input without
 # them is normal rather than broken.
 OPTIONAL_METRIC_PREFIXES: dict[int, tuple[str, ...]] = {
-    7: ("dataset_normalized_", "dataset_cell_type_normalized_"),
+    # tstat_: Table 7 scored on the moderated t (--compute-t-deg-cosine).
+    7: ("dataset_normalized_", "dataset_cell_type_normalized_", "tstat_"),
     # Replicate Spearman on the moderated t-statistic. Observed and centroid
     # are computed by every baseline run; the peer family needs
     # --compute-t-peers, so they are separate families rather than one
-    # family that older runs would carry only half of.
-    10: ("tstat_", "tpeer_"),
+    # family that older runs would carry only half of. tcosine_ is cosine
+    # on t (--compute-t-deg-cosine).
+    10: ("tstat_", "tpeer_", "tcosine_"),
 }
 
 TABLE_METRICS: dict[int, dict[str, str]] = {
@@ -321,6 +323,42 @@ TABLE_METRICS[10].update(
     }
 )
 
+TABLE_METRICS[7].update(
+    {
+        "tstat_observed_deg_spearman_sym_p05": "mean_replicate_deg_t_spearman_sym_p05",
+        "tstat_centroid_baseline_deg_spearman_sym_p05": "mean_baseline_pair_deg_t_spearman_sym_p05",
+        "tstat_delta_vs_centroid_deg_spearman_sym_p05": "mean_delta_vs_baseline_pair_deg_t_spearman_sym_p05",
+        "tstat_individual_peer_mean_deg_spearman_sym_p05": "mean_peer_baseline_deg_t_spearman_sym_p05",
+        "tstat_individual_peer_sd_deg_spearman_sym_p05": "mean_peer_baseline_deg_t_spearman_sym_sd_p05",
+        "tstat_individual_peer_fraction_below_observed_deg_spearman_sym_p05": (
+            "mean_peer_baseline_deg_t_spearman_sym_fraction_below_observed_p05"
+        ),
+        "tstat_individual_peer_corrected_percentile_deg_spearman_sym_p05": (
+            "mean_peer_baseline_deg_t_spearman_sym_corrected_percentile_p05"
+        ),
+        "tstat_delta_vs_individual_peer_deg_spearman_sym_p05": (
+            "mean_delta_vs_peer_baseline_deg_t_spearman_sym_p05"
+        ),
+    }
+)
+
+TABLE_METRICS[10].update(
+    {
+        "tcosine_observed_replicate_cosine": "mean_replicate_cosine_t",
+        "tcosine_centroid_baseline_cosine": "mean_replicate_baseline_cosine_t",
+        "tcosine_delta_vs_centroid_cosine": "mean_replicate_minus_baseline_cosine_t",
+        "tcosine_individual_peer_mean_cosine": "mean_peer_baseline_cosine_t",
+        "tcosine_individual_peer_sd_cosine": "mean_peer_baseline_sd_cosine_t",
+        "tcosine_individual_peer_fraction_below_observed_cosine": (
+            "mean_peer_baseline_fraction_below_observed_cosine_t"
+        ),
+        "tcosine_individual_peer_corrected_percentile_cosine": (
+            "mean_peer_baseline_corrected_percentile_cosine_t"
+        ),
+        "tcosine_delta_vs_individual_peer_cosine": "mean_replicate_minus_peer_baseline_cosine_t",
+    }
+)
+
 TABLE_PRIMARY_METRICS = {
     7: (
         "observed_deg_lfc_spearman_sym_p05",
@@ -382,6 +420,28 @@ TABLE_PRIMARY_METRICS[7] += tuple(
     )
 )
 
+TABLE_PRIMARY_METRICS[7] += tuple(
+    f"tstat_{stat}_deg_spearman_sym_p05"
+    for stat in (
+        "observed",
+        "centroid_baseline",
+        "delta_vs_centroid",
+        "individual_peer_mean",
+        "delta_vs_individual_peer",
+        "individual_peer_corrected_percentile",
+    )
+)
+TABLE_PRIMARY_METRICS[10] += tuple(
+    f"tcosine_{stat}_cosine"
+    for stat in (
+        "observed_replicate",
+        "centroid_baseline",
+        "delta_vs_centroid",
+        "individual_peer_mean",
+        "delta_vs_individual_peer",
+        "individual_peer_corrected_percentile",
+    )
+)
 TABLE_PRIMARY_METRICS[10] += (
     "tstat_observed_replicate_spearman",
     "tstat_centroid_baseline_spearman",

@@ -173,6 +173,22 @@ T_PEER_FIELDS = (
     "mean_replicate_minus_peer_baseline_spearman_t",
 )
 
+# --compute-t-deg-cosine: Table 7's DEG-restricted Spearman and Table 10's
+# all-gene cosine, scored on the moderated t-statistic instead of logFC.
+# Direction agreement (Table 8) has no t variant: limma's moderated t is logFC
+# divided by a positive standard error, so its sign is logFC's sign.
+T_DEG_METRIC_NAME = "deg_t_spearman_sym"
+T_COSINE_FIELDS = (
+    "mean_replicate_cosine_t",
+    "mean_replicate_baseline_cosine_t",
+    "mean_replicate_minus_baseline_cosine_t",
+    "mean_peer_baseline_cosine_t",
+    "mean_peer_baseline_sd_cosine_t",
+    "mean_peer_baseline_fraction_below_observed_cosine_t",
+    "mean_peer_baseline_corrected_percentile_cosine_t",
+    "mean_replicate_minus_peer_baseline_cosine_t",
+)
+
 
 def default_worker_count(*, cap: int) -> int:
     """Spawned workers to use when nothing is requested.
@@ -407,6 +423,17 @@ def add_common_run_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--compute-t-deg-cosine",
+        action="store_true",
+        help=(
+            "Also score the moderated t-statistic for DEG-restricted replicate "
+            "Spearman (Table 7 on t) and all-gene replicate cosine (Table 10 "
+            "cosine on t), with centroid and individual-peer baselines. Uses the "
+            "same replicates, DEG masks, centroid and sampled peers as the logFC "
+            "versions. Requires --compute-t-peers and --compute-deg-metrics."
+        ),
+    )
+    parser.add_argument(
         "--compute-normalized-deg",
         action="store_true",
         help=(
@@ -638,6 +665,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--compute-t-peers",
         action="store_true",
         help="Add the individual-peer baseline for replicate Spearman on t.",
+    )
+    run_task_parser.add_argument(
+        "--compute-t-deg-cosine",
+        action="store_true",
+        help="Add DEG-restricted Spearman and all-gene cosine on t, with baselines.",
     )
     run_task_parser.add_argument(
         "--normalization-scales",
@@ -1816,6 +1848,44 @@ def replicate_pair_peer_summary(
     return summarize_peer_scores(observed_value, pair_peer_scores, prefix)
 
 
+def summarize_pair_peer_baselines(
+    pair_indices: list[tuple[int, int]],
+    observed_values: np.ndarray,
+    score_replicate,
+) -> dict[str, float | int]:
+    """Condition-level peer-baseline summary over replicate pairs.
+
+    ``score_replicate(idx)`` returns replicate ``idx``'s scores against every
+    peer; each pair is summarized with :func:`replicate_pair_peer_summary` and
+    the fields averaged over pairs, as the logFC peer blocks do inline.
+    """
+    fields: dict[str, list[float]] = defaultdict(list)
+    deltas: list[float] = []
+    cache: dict[int, np.ndarray] = {}
+    for position, (left_idx, right_idx) in enumerate(pair_indices):
+        for replicate_idx in (left_idx, right_idx):
+            if replicate_idx not in cache:
+                cache[replicate_idx] = score_replicate(replicate_idx)
+        observed = float(observed_values[position]) if position < len(observed_values) else float("nan")
+        summary = replicate_pair_peer_summary(cache[left_idx], cache[right_idx], observed, "peer")
+        for field_name, field_value in summary.items():
+            fields[field_name].append(float(field_value))
+        deltas.append(difference_if_both_defined(observed, float(summary["peer_mean_score"])))
+    peer_means = np.asarray(fields["peer_mean_score"], dtype=np.float64)
+    return {
+        "mean": mean_available(peer_means),
+        "sd": mean_available(np.asarray(fields["peer_sd_score"], dtype=np.float64)),
+        "fraction_below_observed": mean_available(
+            np.asarray(fields["peer_fraction_below_observed"], dtype=np.float64)
+        ),
+        "corrected_percentile": mean_available(
+            np.asarray(fields["peer_corrected_percentile"], dtype=np.float64)
+        ),
+        "delta": mean_available(np.asarray(deltas, dtype=np.float64)),
+        "n_valid": int(np.isfinite(peer_means).sum()),
+    }
+
+
 def build_sampled_replicate_domain_rows(context_frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     query_rows: list[dict[str, object]] = []
     target_rows: list[dict[str, object]] = []
@@ -2758,6 +2828,7 @@ def compute_condition_metric_record_from_rows(
     compute_normalized_spearman: bool = False,
     compute_normalized_deg: bool = False,
     compute_t_peers: bool = False,
+    compute_t_deg_cosine: bool = False,
     normalization_scopes: tuple[str, ...] = NORMALIZATION_SCOPES,
     population_stats_cache: Optional[ReplicatePopulationStatsCache] = None,
     baseline_source_frame: Optional[pd.DataFrame] = None,
@@ -2943,6 +3014,23 @@ def compute_condition_metric_record_from_rows(
         for field_name in T_PEER_FIELDS:
             record[field_name] = float("nan")
         record["n_valid_peer_baseline_t_pairs"] = 0
+    if compute_t_deg_cosine:
+        for field_name in T_COSINE_FIELDS:
+            record[field_name] = float("nan")
+        record["n_valid_replicate_cosine_t_pairs"] = 0
+        record["n_valid_peer_cosine_t_pairs"] = 0
+        for definition_key in ACTIVE_DEG_DEFINITIONS:
+            stem = f"{T_DEG_METRIC_NAME}_{definition_key}"
+            for prefix in (
+                "mean_replicate",
+                "mean_baseline_pair",
+                "mean_delta_vs_baseline_pair",
+                "mean_delta_vs_peer_baseline",
+            ):
+                record[f"{prefix}_{stem}"] = float("nan")
+            for record_suffix in ("", "_sd", "_fraction_below_observed", "_corrected_percentile"):
+                record[f"mean_peer_baseline_{T_DEG_METRIC_NAME}{record_suffix}_{definition_key}"] = float("nan")
+            record[f"n_valid_replicate_{stem}_pairs"] = 0
     if compute_normalized_deg:
         for scope in normalization_scopes:
             suffix = (
@@ -3082,6 +3170,8 @@ def compute_condition_metric_record_from_rows(
             record[f"n_valid_signed_overlap_t_top{top_k}_pairs_global"] = int(np.isfinite(overlap_values_global).sum())
 
     local_baseline_logfc: Optional[np.ndarray] = None
+    local_baseline_t: Optional[np.ndarray] = None
+    raw_local_baseline_t: Optional[np.ndarray] = None
     raw_local_baseline_logfc: Optional[np.ndarray] = None
     global_baseline_logfc: Optional[np.ndarray] = None
     local_peer_logfc_matrix: Optional[np.ndarray] = None
@@ -3144,6 +3234,8 @@ def compute_condition_metric_record_from_rows(
                         counts=local_context_aggregate.t_counts,
                         excluded_rows=raw_local_t_matrix,
                     )
+                    # Unfiltered, like raw_local_baseline_logfc, for cosine on t.
+                    raw_local_baseline_t = local_baseline_t
                 if raw_global_logfc_matrix is not None:
                     global_baseline_logfc = aggregate_mean_excluding_rows(
                         sums=global_context_aggregate.logfc_sums,
@@ -3645,6 +3737,54 @@ def compute_condition_metric_record_from_rows(
                     ).sum()
                 )
 
+    # Table 10 cosine on the moderated t-statistic, computed exactly as raw
+    # logFC cosine is: all shared genes (pairwise NaN-aware), the
+    # leave-compound-out centroid, and the same sampled peers.
+    if (
+        compute_t_deg_cosine
+        and raw_local_t_matrix is not None
+        and raw_local_t_matrix.shape[1] >= 2
+    ):
+        observed_t_cosine = np.asarray(
+            [
+                vector_cosine_similarity(raw_local_t_matrix[left_idx], raw_local_t_matrix[right_idx])
+                for left_idx, right_idx in pair_indices
+            ],
+            dtype=np.float64,
+        )
+        record["mean_replicate_cosine_t"] = mean_available(observed_t_cosine)
+        record["n_valid_replicate_cosine_t_pairs"] = int(np.isfinite(observed_t_cosine).sum())
+        if raw_local_baseline_t is not None and raw_local_baseline_t.size == raw_local_t_matrix.shape[1]:
+            centroid_t_cosine, _ = pairwise_replicate_baseline_values(
+                raw_local_t_matrix,
+                raw_local_baseline_t,
+                pair_indices=pair_indices,
+                scorer=vector_cosine_similarity,
+            )
+            record["mean_replicate_baseline_cosine_t"] = mean_available(centroid_t_cosine)
+            record["mean_replicate_minus_baseline_cosine_t"] = mean_available(
+                observed_t_cosine - centroid_t_cosine
+            )
+        if (
+            raw_local_peer_t_matrix is not None
+            and raw_local_peer_t_matrix.shape[0] > 0
+            and raw_local_peer_t_matrix.shape[1] == raw_local_t_matrix.shape[1]
+        ):
+            t_peer_norms = complete_row_norms(raw_local_peer_t_matrix)
+            summary = summarize_pair_peer_baselines(
+                pair_indices,
+                observed_t_cosine,
+                lambda idx: cosine_against_peers(
+                    raw_local_t_matrix[idx], raw_local_peer_t_matrix, peer_norms=t_peer_norms
+                ),
+            )
+            record["mean_peer_baseline_cosine_t"] = summary["mean"]
+            record["mean_peer_baseline_sd_cosine_t"] = summary["sd"]
+            record["mean_peer_baseline_fraction_below_observed_cosine_t"] = summary["fraction_below_observed"]
+            record["mean_peer_baseline_corrected_percentile_cosine_t"] = summary["corrected_percentile"]
+            record["mean_replicate_minus_peer_baseline_cosine_t"] = summary["delta"]
+            record["n_valid_peer_cosine_t_pairs"] = summary["n_valid"]
+
     if compute_normalized_spearman:
         if population_stats_cache is None:
             raise ValueError(
@@ -3950,6 +4090,103 @@ def compute_condition_metric_record_from_rows(
                 record[f"median_baseline_pair_{metric_name}_{definition_key}"] = median_available(baseline_array)
                 record[f"mean_delta_vs_baseline_pair_{metric_name}_{definition_key}"] = mean_available(delta_array)
                 record[f"median_delta_vs_baseline_pair_{metric_name}_{definition_key}"] = median_available(delta_array)
+
+    # Table 7 on the moderated t-statistic: the same raw adj.P.Value DEG masks
+    # (built from each replicate's own logFC and adjusted p-values, exactly as
+    # in Table 7), with t in place of logFC as the ranked values, against the
+    # same centroid and sampled peers.
+    if (
+        compute_t_deg_cosine
+        and compute_deg_metrics
+        and local_logfc_matrix is not None
+        and local_t_matrix is not None
+        and local_adj_p_matrix is not None
+        and local_t_matrix.shape[1] >= 2
+    ):
+        t_centroid = (
+            local_baseline_t
+            if local_baseline_t is not None and local_baseline_t.shape[0] == local_t_matrix.shape[1]
+            else None
+        )
+        t_peers = (
+            local_peer_t_matrix
+            if local_peer_t_matrix is not None
+            and local_peer_t_matrix.shape[0] > 0
+            and local_peer_t_matrix.shape[1] == local_t_matrix.shape[1]
+            else None
+        )
+        for definition_key in ACTIVE_DEG_DEFINITIONS:
+            masks = {
+                replicate_idx: deg_mask(
+                    local_logfc_matrix[replicate_idx],
+                    local_adj_p_matrix[replicate_idx],
+                    definition_key,
+                )
+                for pair in pair_indices
+                for replicate_idx in pair
+            }
+            observed_values = np.asarray(
+                [
+                    strict_mean_if_all_defined(
+                        np.asarray(
+                            [
+                                deg_restricted_lfc_spearman(
+                                    local_t_matrix[left_idx], local_t_matrix[right_idx], masks[left_idx]
+                                ),
+                                deg_restricted_lfc_spearman(
+                                    local_t_matrix[left_idx], local_t_matrix[right_idx], masks[right_idx]
+                                ),
+                            ],
+                            dtype=np.float64,
+                        )
+                    )
+                    for left_idx, right_idx in pair_indices
+                ],
+                dtype=np.float64,
+            )
+            stem = f"{T_DEG_METRIC_NAME}_{definition_key}"
+            record[f"mean_replicate_{stem}"] = mean_available(observed_values)
+            record[f"n_valid_replicate_{stem}_pairs"] = int(np.isfinite(observed_values).sum())
+            if t_centroid is not None:
+                centroid_values = np.asarray(
+                    [
+                        mean_available(
+                            np.asarray(
+                                [
+                                    deg_restricted_lfc_spearman(local_t_matrix[left_idx], t_centroid, masks[left_idx]),
+                                    deg_restricted_lfc_spearman(local_t_matrix[right_idx], t_centroid, masks[right_idx]),
+                                ],
+                                dtype=np.float64,
+                            )
+                        )
+                        for left_idx, right_idx in pair_indices
+                    ],
+                    dtype=np.float64,
+                )
+                record[f"mean_baseline_pair_{stem}"] = mean_available(centroid_values)
+                record[f"mean_delta_vs_baseline_pair_{stem}"] = mean_available(
+                    np.asarray(
+                        [
+                            difference_if_both_defined(float(o), float(c))
+                            for o, c in zip(observed_values, centroid_values)
+                        ],
+                        dtype=np.float64,
+                    )
+                )
+            if t_peers is not None:
+                summary = summarize_pair_peer_baselines(
+                    pair_indices,
+                    observed_values,
+                    lambda idx: spearman_against_peers(local_t_matrix[idx], t_peers, masks[idx]),
+                )
+                for record_suffix, key in (
+                    ("", "mean"),
+                    ("_sd", "sd"),
+                    ("_fraction_below_observed", "fraction_below_observed"),
+                    ("_corrected_percentile", "corrected_percentile"),
+                ):
+                    record[f"mean_peer_baseline_{T_DEG_METRIC_NAME}{record_suffix}_{definition_key}"] = summary[key]
+                record[f"mean_delta_vs_peer_baseline_{stem}"] = summary["delta"]
 
     # Table 7 under per-gene population standardization. DEG membership stays
     # on the raw adj.P.Value masks and only the ranked values are standardized,
@@ -4817,6 +5054,7 @@ def prepare(
     compute_normalized_spearman: bool = False,
     compute_normalized_deg: bool = False,
     compute_t_peers: bool = False,
+    compute_t_deg_cosine: bool = False,
     normalization_scales: str = "all",
     population_stats_root: Path = DEFAULT_POPULATION_STATS_ROOT,
     min_retrieval_compounds_per_line_time: int = DEFAULT_MIN_RETRIEVAL_COMPOUNDS_PER_LINE_TIME,
@@ -5110,6 +5348,7 @@ def prepare(
             "compute_normalized_spearman": bool(compute_normalized_spearman),
             "compute_normalized_deg": bool(compute_normalized_deg),
             "compute_t_peers": bool(compute_t_peers),
+            "compute_t_deg_cosine": bool(compute_t_deg_cosine),
             "normalization_scales": str(normalization_scales),
             "population_stats_root": str(Path(population_stats_root).resolve()),
             "min_retrieval_compounds_per_line_time": int(min_retrieval_compounds_per_line_time),
@@ -5207,6 +5446,7 @@ def run_task(
     compute_normalized_spearman: bool,
     compute_normalized_deg: bool,
     compute_t_peers: bool,
+    compute_t_deg_cosine: bool,
     normalization_scales: str,
     population_stats_root: Path,
     min_retrieval_compounds_per_line_time: int,
@@ -5363,6 +5603,7 @@ def run_task(
                     compute_normalized_spearman=compute_normalized_spearman,
                     compute_normalized_deg=compute_normalized_deg,
                     compute_t_peers=compute_t_peers,
+                    compute_t_deg_cosine=compute_t_deg_cosine,
                     normalization_scopes=normalization_scope_values,
                     population_stats_cache=population_stats_cache,
                     baseline_source_frame=baseline_source_frame,
@@ -5563,7 +5804,8 @@ def build_t_strength_relationship_summaries(
 
 
 def deg_metric_columns(frame: pd.DataFrame) -> list[str]:
-    deg_metric_name_tokens = tuple(deg_metric_names())
+    # T_DEG_METRIC_NAME routes Table 7's DEG-restricted Spearman on t here too.
+    deg_metric_name_tokens = (*deg_metric_names(), T_DEG_METRIC_NAME)
     allowed_prefixes = (
         "mean_replicate_",
         "median_replicate_",
@@ -5844,6 +6086,7 @@ def merge_task_outputs(
     )
     expect_normalized_deg = bool(config.get("compute_normalized_deg", False))
     expect_t_peers = bool(config.get("compute_t_peers", False))
+    expect_t_deg_cosine = bool(config.get("compute_t_deg_cosine", False))
     expected_peer_config_fingerprint = config_fingerprint(config) if config else None
     existing_results_dir = existing_results_dir.resolve() if existing_results_dir is not None else None
     current_dataset_names = read_dataset_names_from_selection_summary(output_dir)
@@ -6032,6 +6275,17 @@ def merge_task_outputs(
             "t peers were requested in the saved prepare config, but merged task "
             "outputs are missing mean_peer_baseline_spearman_t. Rerun the scoring tasks."
         )
+    if expect_t_deg_cosine:
+        missing_t_columns = [
+            column
+            for column in ("mean_peer_baseline_cosine_t", "mean_peer_baseline_deg_t_spearman_sym_p05")
+            if column not in condition_metric_summary.columns
+        ]
+        if missing_t_columns:
+            raise ValueError(
+                "t DEG/cosine metrics were requested in the saved prepare config, but merged "
+                f"task outputs are missing {missing_t_columns}. Rerun the scoring tasks."
+            )
     condition_metric_summary_path = output_dir / "condition_metric_summary.tsv"
     condition_metric_summary.to_csv(condition_metric_summary_path, sep="\t", index=False)
     print(f"Saved condition-level metric summary to {condition_metric_summary_path}")
@@ -6253,6 +6507,7 @@ def _run_prepared_task_worker(payload: dict[str, object]) -> int:
         compute_normalized_spearman=bool(payload["compute_normalized_spearman"]),
         compute_normalized_deg=bool(payload.get("compute_normalized_deg", False)),
         compute_t_peers=bool(payload.get("compute_t_peers", False)),
+        compute_t_deg_cosine=bool(payload.get("compute_t_deg_cosine", False)),
         normalization_scales=str(payload["normalization_scales"]),
         population_stats_root=Path(str(payload["population_stats_root"])),
         min_retrieval_compounds_per_line_time=int(
@@ -6300,6 +6555,7 @@ def run_all(args: argparse.Namespace) -> None:
             "compute_normalized_spearman": bool(args.compute_normalized_spearman),
             "compute_normalized_deg": bool(args.compute_normalized_deg),
             "compute_t_peers": bool(getattr(args, "compute_t_peers", False)),
+            "compute_t_deg_cosine": bool(getattr(args, "compute_t_deg_cosine", False)),
             "normalization_scales": str(args.normalization_scales),
             "population_stats_root": str(
                 Path(args.population_stats_root).resolve()
@@ -6355,6 +6611,7 @@ def run_all(args: argparse.Namespace) -> None:
             compute_normalized_spearman=args.compute_normalized_spearman,
             compute_normalized_deg=args.compute_normalized_deg,
             compute_t_peers=getattr(args, "compute_t_peers", False),
+            compute_t_deg_cosine=getattr(args, "compute_t_deg_cosine", False),
             normalization_scales=args.normalization_scales,
             population_stats_root=args.population_stats_root,
             min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
@@ -6398,6 +6655,7 @@ def run_all(args: argparse.Namespace) -> None:
         "compute_normalized_spearman": bool(args.compute_normalized_spearman),
         "compute_normalized_deg": bool(args.compute_normalized_deg),
         "compute_t_peers": bool(getattr(args, "compute_t_peers", False)),
+        "compute_t_deg_cosine": bool(getattr(args, "compute_t_deg_cosine", False)),
         "normalization_scales": str(args.normalization_scales),
         "population_stats_root": str(Path(args.population_stats_root).resolve()),
         "min_retrieval_compounds_per_line_time": int(
@@ -6474,6 +6732,13 @@ def main() -> None:
         raise SystemExit(RETRIEVAL_RETIRED_MESSAGE)
     if getattr(args, "compute_t_peers", False) and not getattr(args, "compute_baseline_metrics", False):
         raise SystemExit("--compute-t-peers needs --compute-baseline-metrics, which selects the peers.")
+    if getattr(args, "compute_t_deg_cosine", False) and not (
+        getattr(args, "compute_t_peers", False) and getattr(args, "compute_deg_metrics", False)
+    ):
+        raise SystemExit(
+            "--compute-t-deg-cosine needs --compute-t-peers (which loads the peer t rows) "
+            "and --compute-deg-metrics (which builds the DEG masks)."
+        )
     DENSE_CACHED_LAYERS = dense_layers_for_run(bool(getattr(args, "compute_t_peers", False)))
     # Read at call time inside the scoring functions, so setting it here covers every command.
     requested_max_peers = getattr(args, "max_baseline_peers", None)
@@ -6510,6 +6775,7 @@ def main() -> None:
             compute_normalized_spearman=args.compute_normalized_spearman,
             compute_normalized_deg=args.compute_normalized_deg,
             compute_t_peers=getattr(args, "compute_t_peers", False),
+            compute_t_deg_cosine=getattr(args, "compute_t_deg_cosine", False),
             normalization_scales=args.normalization_scales,
             population_stats_root=args.population_stats_root,
             min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,
@@ -6538,6 +6804,7 @@ def main() -> None:
             compute_normalized_spearman=args.compute_normalized_spearman,
             compute_normalized_deg=args.compute_normalized_deg,
             compute_t_peers=getattr(args, "compute_t_peers", False),
+            compute_t_deg_cosine=getattr(args, "compute_t_deg_cosine", False),
             normalization_scales=args.normalization_scales,
             population_stats_root=args.population_stats_root,
             min_retrieval_compounds_per_line_time=args.min_retrieval_compounds_per_line_time,

@@ -144,6 +144,14 @@ T_METRICS = ["tstat_observed_replicate_spearman", "tstat_centroid_baseline_spear
              "tpeer_delta_vs_individual_peer_spearman", "tpeer_individual_peer_corrected_percentile_spearman"]
 
 
+T7_T_METRICS = [f"tstat_{stat}_deg_spearman_sym_p05" for stat in (
+    "observed", "centroid_baseline", "delta_vs_centroid", "individual_peer_mean",
+    "delta_vs_individual_peer", "individual_peer_corrected_percentile")]
+T10_T_COSINE_METRICS = [f"tcosine_{stat}_cosine" for stat in (
+    "observed_replicate", "centroid_baseline", "delta_vs_centroid", "individual_peer_mean",
+    "delta_vs_individual_peer", "individual_peer_corrected_percentile")]
+
+
 def replicate_rows(ci, variants):
     """variants: (label, [six metric names in STAT_HEADERS order])."""
     rows = []
@@ -199,6 +207,7 @@ def main() -> int:
         ("raw logFC", metric_names("", "_deg_lfc_spearman_sym_p05")),
         ("z-score (dataset)", metric_names("dataset_normalized_", "_deg_lfc_spearman_sym_p05")),
         ("z-score (dataset x cell type)", metric_names("dataset_cell_type_normalized_", "_deg_lfc_spearman_sym_p05")),
+        ("moderated t", T7_T_METRICS),
     ])
     ws = wb.active
     ws.title = "Table 7 Replicates"
@@ -206,6 +215,7 @@ def main() -> int:
     write_notes(ws, end, [
         "DEG-restricted replicate logFC Spearman (DEGs: adj.P.Value < 0.05). Under the z-score representations DEG membership stays on the raw adj.P.Value masks; only the ranked values are standardized, as in cross-dataset Table 4.",
         "z-score (dataset) = (logFC - mean) / SD per gene across the whole dataset; z-score (dataset x cell type) = the same within each dataset x cell line.",
+        "Moderated t: the same DEG masks, centroid and sampled peers as the logFC rows, with the limma moderated t-statistic as the ranked values instead of logFC.",
         "Status: New = dataset added in this update; Rescored = previously reported dataset, rescored and checked against the published values (see Validation).",
     ], ncol=11)
 
@@ -216,6 +226,7 @@ def main() -> int:
     end = write_table(ws, REP_HEADERS, rows8, widths=REP_WIDTHS)
     write_notes(ws, end, [
         "Replicate direction agreement on DEGs (adj.P.Value < 0.05). Kept on raw logFC by design: a per-gene z-score subtracts a population mean, which can flip a sign, so 'agreement in direction' would no longer mean agreement in biological direction.",
+        "No moderated-t version: limma's moderated t is logFC divided by a positive standard error, so its sign always equals logFC's (checked: no disagreement in 271 million values across 72 source files), and direction agreement on t is identical to this table.",
         "VCPI-0002 observed direction agreement is exactly 1.000 for every scored pair, so its interval has no width. It rests on 343 of 8,825 conditions: most VCPI-0002 conditions have too few DEGs for direction agreement to be defined.",
     ], ncol=11)
 
@@ -225,6 +236,7 @@ def main() -> int:
         ("raw logFC, Spearman", metric_names("", "_spearman_logfc", "observed_replicate")),
         ("raw logFC, cosine", metric_names("raw_", "_cosine", "observed_replicate")),
         ("moderated t, Spearman", T_METRICS),
+        ("moderated t, cosine", T10_T_COSINE_METRICS),
         ("z-score (dataset), Spearman", metric_names("dataset_normalized_", "_spearman_logfc", "observed_replicate")),
         ("z-score (dataset), cosine", metric_names("dataset_normalized_", "_cosine", "observed_replicate")),
         ("z-score (dataset x cell type), Spearman", metric_names("dataset_cell_type_normalized_", "_spearman_logfc", "observed_replicate")),
@@ -233,8 +245,8 @@ def main() -> int:
     ws = wb.create_sheet("Table 10 Replicates")
     end = write_table(ws, REP_HEADERS, rows10, widths=[40] + REP_WIDTHS[1:])
     write_notes(ws, end, [
-        "All-gene replicate similarity: Spearman and cosine on raw logFC and both z-scores, and Spearman on the limma moderated t-statistic. New in this update: the z-score Spearman rows and the moderated-t individual-peer columns.",
-        "Moderated t: the individual peers are the same sampled peers as for logFC, scored on the same genes. A condition with no same-dose other-compound peer has neither centroid nor peers, so those columns count slightly fewer conditions than n conditions (e.g. 2,437 of 2,517 for L1000 Phase I); the per-metric counts are on the Numeric sheet.",
+        "All-gene replicate similarity: Spearman and cosine on raw logFC, on both z-scores and on the limma moderated t-statistic. New in this update: the z-score Spearman rows, the moderated-t cosine rows and the moderated-t individual-peer columns.",
+        "Moderated t: the individual peers are the same sampled peers as for logFC, scored on the same genes; t cosine is computed exactly as raw-logFC cosine. A condition with no same-dose other-compound peer has neither centroid nor peers, so those columns count slightly fewer conditions than n conditions (e.g. 2,437 of 2,517 for L1000 Phase I); the per-metric counts are on the Numeric sheet.",
         "L1000 observed replicate cosine (raw and both z-scores) now averages over every condition. The published value averaged only conditions with a centroid: raw cosine L1000 Phase I 0.1415 -> 0.1424, Phase II 0.1337 -> 0.1340; the z-score cosines move by at most 0.001. Restricted to the published conditions it reproduces 0.141544 exactly.",
     ], ncol=11)
 
@@ -252,14 +264,15 @@ def main() -> int:
                  ("Centroid rank [95% CI]", "centroid_normalized_rank", False),
                  ("Observed minus centroid [95% CI]", "delta_vs_centroid", True)]
     rrows = []
-    for sim in ("cosine", "spearman"):
+    sim_label = {"cosine": "Cosine", "spearman": "Spearman", "l2": "Negative L2"}
+    for sim in sim_label:
         for scale in scale_label:
             for ds in ORDER:
                 t = rtab[(rtab.dataset_name == ds) & (rtab.similarity_metric == sim) & (rtab.scale_variant == scale)]
                 if t.empty:
                     continue
                 t = t.iloc[0]
-                row = [sim.capitalize(), scale_label[scale], LABEL[ds], int(t.n_conditions), int(t.n_compounds),
+                row = [sim_label[sim], scale_label[scale], LABEL[ds], int(t.n_conditions), int(t.n_compounds),
                        int(round(t.mean_candidates))]
                 for _, m, signed in r_metrics:
                     r = rci.loc[(ds, sim, scale, m)]
@@ -274,6 +287,9 @@ def main() -> int:
         "Rank is the normalized best-positive rank, 1 - (best rank - 1) / (N - 1): 1 is best. Chance rank is its exact expectation with the positives placed at random; it exceeds 0.5 because queries have one or two positives. Recall@1 = a positive ranks first; AUROC = positives vs negatives.",
         "Centroid = mean of same-dose, other-compound replicates, injected into the candidate pool (rank among N + 1). No individual-peer baseline by design: within a dataset every other-compound replicate is already a candidate, so their mean rank is the middle of the pool by construction; the chance rank answers that question.",
         "The earlier replicate-retrieval code let a query retrieve its own sample (cyclic replicate pairing, no self-exclusion: 402 of 406 OP3 queries), which is why it reported ~0.997. It is retired; no earlier replicate-retrieval number should be reused.",
+        "Negative L2 ranks candidates by Euclidean distance (closest first), as in cross-dataset Table 9, so the retrieval metrics are comparable across datasets and representations even though distances themselves are not.",
+        "Negative L2 is above chance in 35 of 36 dataset x representation combinations (the exception is Tahoe-100M on raw logFC, whose interval touches zero) and weaker than cosine and Spearman in most datasets, as in cross-dataset Table 9.",
+        "Under negative L2 the centroid ranks near the top almost by construction: an average of many signatures has a small norm, so it lies close to every query. The L2 centroid columns are therefore not a meaningful baseline; read L2 against the chance rank instead.",
         "Strata need at least 10 compounds. 115 L1000 Phase II conditions sit in three 9-compound strata (CVCL_0031/6 h, CVCL_0332/3 h and 24 h) and are not scored.",
     ], ncol=13)
 
@@ -340,7 +356,7 @@ def main() -> int:
         "CIGS-MCE and CIGS-TCM reproduce exactly, peers included: the published CIGS rows also used 256 peers with the same seed.",
         "Tahoe-100M also reproduces exactly, peers included. L1000 and sci-Plex: observed and centroid reproduce exactly; the peer columns differ by at most 8e-4 because their published rows used 512 peers and this update uses 256 throughout.",
         "The one other difference: L1000 Table 10 observed replicate cosine, whose published average counted only conditions with a centroid (up to 9e-4; see the Table 10 notes). Differences at the 1e-16 level are floating-point rounding.",
-        "Moderated-t rows: no published values exist to compare with. The two independent scoring runs that both include sci-Plex and Tahoe give identical t-peer values for all 9,450 of their conditions, and every column the t-peer runs share with the main runs matches to within 1e-12.",
+        "Moderated-t rows (Tables 7 and 10): no published values exist to compare with. Unit tests check that with t set equal to logFC every t metric reproduces its logFC counterpart exactly, and that with t drawn independently the values match scipy computed by hand. The two independent scoring runs that both include sci-Plex and Tahoe give identical t-peer values for all 9,450 of their conditions, and every column the t-peer runs share with the main runs matches to within 1e-12.",
     ], ncol=9)
 
     # ------------------------------------------------------------ Validation (cross-dataset raw)
@@ -456,7 +472,9 @@ def main() -> int:
         ("Minimal changes: 2 z-score representations on centroids, and peer baselines for Figure 2, for 12 datasets",
          "Done", "Tables 7, 10; Numeric (for plotting)"),
         ("Replicate cosine retrieval", "Done (new)", "Replicate Retrieval"),
-        ("Peers on the moderated t-statistic (the deferred 'ideal variant')", "Done", "Table 10: moderated t rows"),
+        ("Negative L2 for replicates", "Done (retrieval)", "Replicate Retrieval: Negative L2 rows, all three representations. Not added to the similarity tables: raw distances are not comparable across datasets or representations."),
+        ("Peers on the moderated t-statistic (the deferred 'ideal variant')", "Done", "Table 10: moderated t, Spearman rows"),
+        ("Moderated t for the DEG-restricted and cosine results too", "Done", "Table 7: moderated t rows; Table 10: moderated t, cosine rows. Table 8 needs none (t and logFC signs are identical)."),
         ("L1000 Phase I/II condition counts differ from the published ones", "Resolved",
          "L1000 rescored with the published dataset set; counts reproduce exactly (2,517 / 2,729). See Validation."),
         ("Tables 4, 6 with the CIGS pairs: raw scale", "Done", "Table 4 Raw / Table 6 Raw (9 pairs)"),

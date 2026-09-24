@@ -128,8 +128,19 @@ can find its own condition. Each replicate is a query; its candidates are every
 other replicate in the same dataset x cell line x time stratum; its positives
 are the other replicates of its condition. It reports the Table 9 quantities --
 normalized best-positive rank, Recall@1, AUROC, the exact null expectation, and
-an injected same-dose centroid -- for cosine and Spearman on raw logFC and both
-per-gene population z-scores, with compound-clustered BCa intervals.
+an injected same-dose centroid -- for cosine, Spearman and negative Euclidean
+distance (`l2`, as in Table 9) on raw logFC and both per-gene population
+z-scores, with compound-clustered BCa intervals.
+
+Negative L2 is computed as `-sqrt(|q|^2 + |c|^2 - 2 q.c)` with a threaded matrix
+product rather than Table 9's single-threaded `cdist`; the two agree to 8e-12 on
+every scored pair (a query's distance to itself, where the expansion cancels
+worst, is never scored). Under L2 the injected centroid ranks near the top by
+construction -- an average of many signatures has a small norm, so it is close to
+every query -- so the L2 centroid columns are not a meaningful baseline; read L2
+against the exact null. L2 was run after cosine and Spearman, into
+`results/replicate_retrieval_l2_*`, and the combined 12-dataset table joins all
+four runs.
 
 It replaces the scorer's `--compute-retrieval-metrics`, which now refuses to
 run. That path paired replicates cyclically, so with three replicates a query's
@@ -165,8 +176,8 @@ four steps:
 # 1. Replicate Tables 7/8/10 for all twelve datasets. The input concatenates the
 #    condition summaries of replicate_full_v1 and replicate_l1000_cigs_v1, taking
 #    sci-Plex and Tahoe (scored in both) from replicate_full_v1.
-python scripts/merge_replicate_tpeers.py      # adds the t-peer columns -> results/replicate_all12_tpeers_input
-python scripts/replicate_reviewer_tables.py --input-dir results/replicate_all12_tpeers_input \
+python scripts/merge_replicate_t_columns.py   # adds the moderated-t columns -> results/replicate_all12_t_input
+python scripts/replicate_reviewer_tables.py --input-dir results/replicate_all12_t_input \
   --output-dir results/parallel_cross_source/replicate_reviewer_tables_all12 --workers 16
 # 2. Raw cross-source Tables 4/5/6 for all nine pairs, from the raw_cigs_v1 runs.
 python scripts/summarize_raw_cross_source_tables.py --workers 8
@@ -174,14 +185,26 @@ python scripts/summarize_raw_cross_source_tables.py --workers 8
 python scripts/build_reviewer_replicate_workbook.py
 ```
 
-`merge_replicate_tpeers.py` joins the moderated-t individual-peer columns from the
-`replicate_tpeers_*` runs onto the combined summary, and refuses unless the condition
-sets match one to one and every shared column agrees to within 1e-12. Two kinds of
-column are exempt, because they legitimately differ between runs and no table reads
-them: the `*_global` metrics, which depend on which other datasets share a run, and
-`signed_overlap_t_top50`, whose unstable top-50 sort resolves exact |t| ties
-differently on a handful of conditions. Adding the t families left every existing
-Table 10 interval bit-identical.
+`merge_replicate_t_columns.py` joins the moderated-t columns from the
+`replicate_tdegcos_*` runs onto both combined summaries: the individual-peer
+baseline for Table 10 Spearman on t, Table 7's DEG-restricted Spearman on t, and
+Table 10's cosine on t, each with centroid and peers. It refuses unless the
+condition sets match one to one and every shared column agrees to within 1e-12, and
+it checks the result against the earlier t-peer-only merge
+(`results/replicate_all12_tpeers_input`), so the t-peer numbers already reported
+cannot move. Two kinds of column are exempt, because they legitimately differ
+between runs and no table reads them: the `*_global` metrics, which depend on which
+other datasets share a run, and `signed_overlap_t_top50`, whose unstable top-50 sort
+resolves exact |t| ties differently on a handful of conditions.
+
+The t variants (`--compute-t-deg-cosine`, which needs `--compute-t-peers`) reuse
+exactly the replicates, DEG masks, centroid and sampled peers of their logFC
+counterparts; a unit test checks that with t set equal to logFC every t metric
+reproduces its logFC counterpart, and another checks the values against scipy with t
+drawn independently. Table 8 has no t variant: limma's moderated t is logFC over a
+positive standard error, so the signs are identical (checked on 271 million values
+across 72 source files: no disagreement), and direction agreement on t would equal
+Table 8.
 
 `summarize_raw_cross_source_tables.py` maps the raw scorers' `pb_*` peer columns onto
 the `w4_*` metric names so raw and normalized tables share one summary path. Raw rows

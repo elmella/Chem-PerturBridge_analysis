@@ -240,6 +240,168 @@ class ReplicateNormalizedCosineTests(unittest.TestCase):
                 self.assertEqual(with_t[key], value, key)
         self.assertNotIn("mean_peer_baseline_spearman_t", without_t)
 
+    def _score_t_deg_cosine(self, logfc, t_stat, adj_p, *, compute_t_deg_cosine: bool) -> dict:
+        """Score condition 1 (rows 0-1) against peers 2-4 with DEG, t-peer and raw cosine on."""
+        genes = np.asarray([f"g{i}" for i in range(logfc.shape[1])])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.h5ad"
+            source.touch()
+            rows = replicate_scoring.normalize_source_metadata_frame(
+                pd.DataFrame(
+                    {
+                        "dataset_name": ["dataset_a"] * 5,
+                        "cell_type": ["line_a"] * 5,
+                        "pubchem_cid": ["1", "1", "2", "3", "4"],
+                        "time_key": [24.0] * 5,
+                        "dose_key": [10.0] * 5,
+                        "source_path": [str(source)] * 5,
+                        "source_row_pos": np.arange(5),
+                        "condition_key": ["line_a|1|24|10"] * 2
+                        + ["line_a|2|24|10", "line_a|3|24|10", "line_a|4|24|10"],
+                        "perturbagen_display": ["one", "one", "two", "three", "four"],
+                    }
+                )
+            )
+
+            def load_block(block, *, gene_keys, open_adatas, load_t=True):
+                positions = block["source_row_pos"].astype(int).to_numpy()
+                return (
+                    [logfc[p].copy() for p in positions],
+                    [t_stat[p].copy() for p in positions] if load_t else [None] * len(positions),
+                )
+
+            def load_adj_p(block, *, gene_keys, open_adatas):
+                return [adj_p[p].copy() for p in block["source_row_pos"].astype(int).to_numpy()]
+
+            class StatsCache:
+                def get(self, **kwargs):
+                    raise AssertionError("raw scope only; no population statistics needed")
+
+            replicate_scoring.WORKER_CONTEXT_AGGREGATE_CACHE.clear()
+            with patch.object(replicate_scoring, "load_vectors_for_rows", side_effect=load_block), patch.object(
+                replicate_scoring, "load_adjusted_pvalue_vectors_for_rows", side_effect=load_adj_p
+            ), patch.object(replicate_scoring, "shared_gene_keys_for_paths", return_value=genes), patch.object(
+                replicate_scoring, "MAX_BASELINE_PEERS", None
+            ), patch.object(replicate_scoring, "ACTIVE_DEG_DEFINITIONS", ("p05",)):
+                return replicate_scoring.compute_condition_metric_record_from_rows(
+                    rows.iloc[0],
+                    rows.iloc[:2].copy(),
+                    output_dir=root,
+                    line_global_shared_gene_keys={"line_a": genes},
+                    top_k=2,
+                    compute_baseline_metrics=True,
+                    compute_deg_metrics=True,
+                    compute_normalized_cosine=True,
+                    normalization_scopes=(),
+                    population_stats_cache=StatsCache(),
+                    compute_t_peers=True,
+                    compute_t_deg_cosine=compute_t_deg_cosine,
+                    baseline_source_frame=rows.copy(),
+                    baseline_context_row_indexes={("line_a", "24", "10"): np.arange(5)},
+                    open_adatas={},
+                )
+
+    @staticmethod
+    def _t_deg_cosine_inputs(seed: int, *, t_equals_logfc: bool):
+        rng = np.random.default_rng(seed)
+        n_genes = 60
+        logfc = rng.normal(size=(5, n_genes))
+        logfc[1] = logfc[0] + 0.5 * rng.normal(size=n_genes)  # replicates agree, not perfectly
+        t_stat = logfc.copy() if t_equals_logfc else rng.normal(size=(5, n_genes))
+        adj_p = rng.uniform(0.0, 0.1, size=(5, n_genes))  # about half the genes are DEGs
+        return logfc, t_stat, adj_p
+
+    def test_t_deg_and_cosine_reproduce_logfc_metrics_when_t_equals_logfc(self) -> None:
+        logfc, t_stat, adj_p = self._t_deg_cosine_inputs(11, t_equals_logfc=True)
+        record = self._score_t_deg_cosine(logfc, t_stat, adj_p, compute_t_deg_cosine=True)
+        pairs = {
+            "mean_replicate_deg_t_spearman_sym_p05": "mean_replicate_deg_lfc_spearman_sym_p05",
+            "mean_baseline_pair_deg_t_spearman_sym_p05": "mean_baseline_pair_deg_lfc_spearman_sym_p05",
+            "mean_delta_vs_baseline_pair_deg_t_spearman_sym_p05": "mean_delta_vs_baseline_pair_deg_lfc_spearman_sym_p05",
+            "mean_peer_baseline_deg_t_spearman_sym_p05": "mean_peer_baseline_deg_lfc_spearman_sym_p05",
+            "mean_peer_baseline_deg_t_spearman_sym_sd_p05": "mean_peer_baseline_deg_lfc_spearman_sym_sd_p05",
+            "mean_peer_baseline_deg_t_spearman_sym_corrected_percentile_p05": (
+                "mean_peer_baseline_deg_lfc_spearman_sym_corrected_percentile_p05"
+            ),
+            "mean_delta_vs_peer_baseline_deg_t_spearman_sym_p05": "mean_delta_vs_peer_baseline_deg_lfc_spearman_sym_p05",
+            "mean_replicate_cosine_t": "mean_replicate_cosine_logfc_raw",
+            "mean_replicate_baseline_cosine_t": "mean_replicate_baseline_cosine_logfc_raw",
+            "mean_replicate_minus_baseline_cosine_t": "mean_replicate_minus_baseline_cosine_logfc_raw",
+            "mean_peer_baseline_cosine_t": "mean_peer_baseline_cosine_logfc_raw",
+            "mean_peer_baseline_sd_cosine_t": "mean_peer_baseline_sd_cosine_logfc_raw",
+            "mean_peer_baseline_corrected_percentile_cosine_t": "mean_peer_baseline_corrected_percentile_cosine_logfc_raw",
+            "mean_replicate_minus_peer_baseline_cosine_t": "mean_replicate_minus_peer_baseline_cosine_logfc_raw",
+        }
+        for t_name, logfc_name in pairs.items():
+            self.assertTrue(np.isfinite(record[logfc_name]), logfc_name)
+            self.assertAlmostEqual(record[t_name], record[logfc_name], places=12, msg=t_name)
+
+    def test_t_deg_and_cosine_score_t_by_hand_and_change_nothing_else(self) -> None:
+        from scipy.stats import spearmanr
+
+        # t drawn independently of logFC: a block that read logFC by mistake
+        # would disagree with the reference below.
+        logfc, t_stat, adj_p = self._t_deg_cosine_inputs(12, t_equals_logfc=False)
+        with_t = self._score_t_deg_cosine(logfc, t_stat, adj_p, compute_t_deg_cosine=True)
+        without_t = self._score_t_deg_cosine(logfc, t_stat, adj_p, compute_t_deg_cosine=False)
+
+        masks = [adj_p[r] < 0.05 for r in (0, 1)]
+        observed_deg = np.mean([spearmanr(t_stat[0][m], t_stat[1][m]).correlation for m in masks])
+        peer_deg = [
+            np.mean([spearmanr(t_stat[r][masks[r]], t_stat[p][masks[r]]).correlation for r in (0, 1)])
+            for p in (2, 3, 4)
+        ]
+        centroid_t = t_stat[2:].mean(axis=0)
+        centroid_deg = np.mean([spearmanr(t_stat[r][masks[r]], centroid_t[masks[r]]).correlation for r in (0, 1)])
+
+        def cos(a, b):
+            return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+        observed_cos = cos(t_stat[0], t_stat[1])
+        peer_cos = [np.mean([cos(t_stat[r], t_stat[p]) for r in (0, 1)]) for p in (2, 3, 4)]
+        centroid_cos = np.mean([cos(t_stat[r], centroid_t) for r in (0, 1)])
+
+        self.assertAlmostEqual(with_t["mean_replicate_deg_t_spearman_sym_p05"], observed_deg, places=12)
+        self.assertAlmostEqual(with_t["mean_baseline_pair_deg_t_spearman_sym_p05"], centroid_deg, places=12)
+        self.assertAlmostEqual(with_t["mean_peer_baseline_deg_t_spearman_sym_p05"], np.mean(peer_deg), places=12)
+        self.assertAlmostEqual(
+            with_t["mean_delta_vs_peer_baseline_deg_t_spearman_sym_p05"], observed_deg - np.mean(peer_deg), places=12
+        )
+        self.assertAlmostEqual(
+            with_t["mean_peer_baseline_deg_t_spearman_sym_corrected_percentile_p05"],
+            (sum(s < observed_deg for s in peer_deg) + 1) / (len(peer_deg) + 1),
+            places=12,
+        )
+        self.assertAlmostEqual(with_t["mean_replicate_cosine_t"], observed_cos, places=12)
+        # The centroid is summed from peer rows read as float32 (as the logFC
+        # centroid is), so it matches the float64 reference to float32
+        # precision; Spearman, rank-based, is unaffected.
+        self.assertAlmostEqual(with_t["mean_replicate_baseline_cosine_t"], centroid_cos, places=6)
+        self.assertAlmostEqual(with_t["mean_peer_baseline_cosine_t"], np.mean(peer_cos), places=12)
+        self.assertEqual(with_t["n_valid_peer_cosine_t_pairs"], 1)
+        # Enabling the flag changes nothing that was already computed.
+        for key, value in without_t.items():
+            if isinstance(value, float) and np.isnan(value):
+                self.assertTrue(np.isnan(with_t[key]), key)
+            else:
+                self.assertEqual(with_t[key], value, key)
+        self.assertNotIn("mean_replicate_cosine_t", without_t)
+
+    def test_t_deg_metrics_route_to_the_deg_summary(self) -> None:
+        frame = pd.DataFrame(
+            columns=[
+                "mean_replicate_deg_t_spearman_sym_p05",
+                "mean_peer_baseline_deg_t_spearman_sym_corrected_percentile_p05",
+                "mean_replicate_cosine_t",
+                "mean_replicate_deg_lfc_spearman_sym_p05",
+            ]
+        )
+        columns = replicate_scoring.deg_metric_columns(frame)
+        self.assertIn("mean_replicate_deg_t_spearman_sym_p05", columns)
+        self.assertIn("mean_peer_baseline_deg_t_spearman_sym_corrected_percentile_p05", columns)
+        self.assertNotIn("mean_replicate_cosine_t", columns)
+
     def test_context_aggregate_is_exact_and_reused_from_disk(self) -> None:
         logfc = np.asarray(
             [
