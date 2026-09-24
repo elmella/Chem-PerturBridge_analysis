@@ -156,6 +156,42 @@ python scripts/replicate_retrieval.py --prepared-dir results/replicate_full_v1 \
 `scripts/run_replicate_jobs.sh` runs it for all twelve datasets after scoring and
 writes one combined table to `results/replicate_retrieval_all12/tables/`.
 
+## Camera-ready assembly
+
+After `scripts/run_replicate_jobs.sh` finishes, the shared tables are assembled in
+four steps:
+
+```bash
+# 1. Replicate Tables 7/8/10 for all twelve datasets. The input concatenates the
+#    condition summaries of replicate_full_v1 and replicate_l1000_cigs_v1, taking
+#    sci-Plex and Tahoe (scored in both) from replicate_full_v1.
+python scripts/merge_replicate_tpeers.py      # adds the t-peer columns -> results/replicate_all12_tpeers_input
+python scripts/replicate_reviewer_tables.py --input-dir results/replicate_all12_tpeers_input \
+  --output-dir results/parallel_cross_source/replicate_reviewer_tables_all12 --workers 16
+# 2. Raw cross-source Tables 4/5/6 for all nine pairs, from the raw_cigs_v1 runs.
+python scripts/summarize_raw_cross_source_tables.py --workers 8
+# 3. The shareable workbook (needs openpyxl).
+python scripts/build_reviewer_replicate_workbook.py
+```
+
+`merge_replicate_tpeers.py` joins the moderated-t individual-peer columns from the
+`replicate_tpeers_*` runs onto the combined summary, and refuses unless the condition
+sets match one to one and every shared column agrees to within 1e-12. Two kinds of
+column are exempt, because they legitimately differ between runs and no table reads
+them: the `*_global` metrics, which depend on which other datasets share a run, and
+`signed_overlap_t_top50`, whose unstable top-50 sort resolves exact |t| ties
+differently on a handful of conditions. Adding the t families left every existing
+Table 10 interval bit-identical.
+
+`summarize_raw_cross_source_tables.py` maps the raw scorers' `pb_*` peer columns onto
+the `w4_*` metric names so raw and normalized tables share one summary path. Raw rows
+use the 512-peer cap of the published raw tables. It rebuilds Table 5 as a check: that
+table was already published for all nine pairs, and its observed and centroid values,
+intervals and counts reproduce exactly. For the six pairs in the published raw Tables
+4 and 6, every point estimate and count reproduces; CI bounds differ by bootstrap
+Monte Carlo variation (the per-group seed hashes the `summary_level` label, which
+differs from the original build).
+
 ## File map
 
 | Reviewer point | Tables | File | Relationship to the published code |
